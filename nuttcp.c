@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.0.1
+ *	N U T T C P . C						v5.0.2
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.0.2, Bill Fink, 4-Nov-03
+ *	Fix bug: some dummy wasn't big enough :-)
  * V5.0.1, Bill Fink, 3-Nov-03
  *	Add third party support
  *	Correct usage statement for "-xt" traceroute option
@@ -359,7 +361,7 @@ int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
 int vers_minor = 0;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1150,7 +1152,7 @@ optlen = sizeof(maxseg);
 	}
 
 	if (argc >= 1) {
-		uint32_t dummy;
+		struct sockaddr_storage dummy;
 
 		host = argv[0];
 
