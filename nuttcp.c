@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v4.1.1
+ *	N U T T C P . C						v5.0.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.0.1, Bill Fink, 3-Nov-03
+ *	Add third party support
+ *	Correct usage statement for "-xt" traceroute option
+ *	Improved error messages on failed options requiring client/server mode
  * V4.1.1, David Lapsley and Bill Fink, 24-Oct-03
  *	Added "-fparse" format option to generate key=value parsable output
  *	Fix bug: need to open data connection on abortconn to clear listen
@@ -166,7 +170,6 @@
  *	Forking for multiple streams
  *	Bidirectional option
  *	Graphical interface
- *	3rd party nuttcp
  *	OWD info
  *	RTT info
  *	Jitter info
@@ -354,8 +357,8 @@ int Nwrite( int fd, char *buf, int count );
 int delay( int us );
 int mread( int fd, char *bufp, unsigned n);
 
-int vers_major = 4;
-int vers_minor = 1;
+int vers_major = 5;
+int vers_minor = 0;
 int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
@@ -409,6 +412,11 @@ unsigned short port = 0;	/* TCP port number */
 unsigned short ctlport = 0;	/* control port for server connection */
 int tmpport;
 char *host;			/* ptr to name of host */
+char *host3 = NULL;		/* ptr to 3rd party host */
+int thirdparty = 0;		/* set to 1 indicates doing 3rd party nuttcp */
+int no3rd = 0;			/* set to 1 by server to disallow 3rd party */
+char *cmdargs[50];		/* command arguments array */
+char tmpargs[50][40];
 
 #ifndef AF_INET6
 #define ADDRSTRLEN 16
@@ -417,7 +425,10 @@ char *host;			/* ptr to name of host */
 int v4mapped = 0;		/* set to 1 to enable v4 mapping in v6 server */
 #endif
 
+#define HOSTNAMELEN	80
+
 char hostbuf[ADDRSTRLEN];	/* buffer to hold text of address */
+char host3buf[HOSTNAMELEN + 1];	/* buffer to hold 3rd party name or address */
 int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
 int nofork = 0;	 		/* set to 1 to not fork server */
@@ -429,6 +440,7 @@ int irate = 0;			/* instantaneous rate limit if set */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
 char intervalbuf[256+2];	/* buf for interval reporting */
+char linebuf[256+2];		/* line buffer */
 int do_poll = 0;		/* set to read interval reports (client xmit) */
 int got_done = 0;		/* set when read last of interval reports */
 int reverse = 0;		/* reverse direction of data connection open */
@@ -449,6 +461,7 @@ int intr = 0;
 int abortconn = 0;
 int braindead = 0;		/* for braindead Solaris 2.8 systems */
 int brief = 1;			/* set for brief output */
+int brief3 = 1;			/* for third party nuttcp */
 int done = 0;			/* don't output interval report if done */
 int got_begin = 0;		/* don't output interval report if not begun */
 int buflenopt = 0;		/* whether or not user specified buflen */
@@ -475,8 +488,8 @@ extern int errno;
 char Usage[] = "\
 Usage: nuttcp or nuttcp -h	prints this usage info\n\
 Usage: nuttcp -V		prints version info\n\
-Usage: nuttcp -xt		do traceroute back to client\n\
-Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
+Usage: nuttcp -xt host		forward and reverse traceroute to/from server\n\
+Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 	-4	Use IPv4\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
@@ -507,7 +520,7 @@ Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
 #endif
-"Usage (receiver): nuttcp -r [-options] [host] [ >out]\n\
+"Usage (receiver): nuttcp -r [-options] [host] [3rd-party] [ >out]\n\
 	-4	Use IPv4\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
@@ -550,7 +563,8 @@ Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
-"	--nofork dont fork server\n"
+"	--no3rdparty don't allow 3rd party capability\n"
+"	--nofork     don't fork server\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
@@ -772,7 +786,7 @@ main( int argc, char **argv )
 	int first_read;
 	int correction = 0;
 	int pollst;
-	int i;
+	int i, j;
 	char *cp1, *cp2;
 	char ch;
 	int error_num;
@@ -1056,9 +1070,15 @@ optlen = sizeof(maxseg);
 				}
 			}
 			break;
+		case '3':
+			thirdparty = 1;
+			break;
 		case '-':
 			if (strcmp(&argv[0][2], "nofork") == 0) {
 				nofork=1;
+			}
+			else if (strcmp(&argv[0][2], "no3rdparty") == 0) {
+				no3rd=1;
 			}
 #ifdef IPV6_V6ONLY
 			else if (strcmp(&argv[0][2], "disable-v4-mapped") == 0) {
@@ -1079,9 +1099,29 @@ optlen = sizeof(maxseg);
 		argv++; argc--;
 	}
 
-	if (argc > 1) goto usage;
-	if (trans && (argc != 1)) goto usage;
+	if (argc > 2) goto usage;
+	if (trans && (argc < 1)) goto usage;
 	if (clientserver && (argc != 0)) goto usage;
+
+	host3 = NULL;
+	if (argc == 2) {
+		host3 = argv[1];
+		if (strlen(host3) > HOSTNAMELEN) {
+			fprintf(stderr, "3rd party host '%s' too long\n", host3);
+			fflush(stderr);
+			exit(1);
+		}
+		cp1 = host3;
+		while (*cp1) {
+			if (!isalnum(*cp1) && (*cp1 != '-') && (*cp1 != '.')
+					   && (*cp1 != ':')) {
+				fprintf(stderr, "invalid 3rd party host '%s'\n", host3);
+				fflush(stderr);
+				exit(1);
+			}
+			cp1++;
+		}
+	}
 
 	bzero((char *)&frominet, sizeof(frominet));
 	bzero((char *)&clientaddr, sizeof(clientaddr));
@@ -1109,7 +1149,7 @@ optlen = sizeof(maxseg);
 		af = AF_INET;
 	}
 
-	if (argc == 1) {
+	if (argc >= 1) {
 		uint32_t dummy;
 
 		host = argv[0];
@@ -1261,7 +1301,7 @@ optlen = sizeof(maxseg);
 	}
 #endif
 
-	if (argc == 1) {
+	if (argc >= 1) {
 		start_idx = 0;
 		client = 1;
 		clientserver = 1;
@@ -1286,6 +1326,13 @@ optlen = sizeof(maxseg);
 		nstream = 1;
 		if (!clientserver) {
 			fprintf(stderr, "traceroute option only supported for client/server mode\n");
+			fflush(stderr);
+			exit(1);
+		}
+	}
+	if (host3) {
+		if (!clientserver) {
+			fprintf(stderr, "3rd party nuttcp only supported for client/server mode\n");
 			fflush(stderr);
 			exit(1);
 		}
@@ -1464,6 +1511,25 @@ doit:
 					format &= ~PARSE;
 					abortconn = 1;
 				}
+				if (irvers >= 50001) {
+					fprintf(ctlconn, ", thirdparty = %.*s", HOSTNAMELEN, host3 ? host3 : "_NULL_");
+					if (host3) {
+						skip_data = 1;
+						fprintf(ctlconn, " , brief3 = %d", brief);
+					}
+				}
+				else {
+					if (host3) {
+						fprintf(stdout, "nuttcp%s%s: 3rd party nuttcp not supported by server version %d.%d.%d, need >= 5.0.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						host3 = NULL;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -1566,6 +1632,45 @@ doit:
 				else {
 					traceroute = 0;
 					irate = 0;
+				}
+				if (irvers >= 50001) {
+					sprintf(fmt, "%%%ds", HOSTNAMELEN);
+					sscanf(strstr(buf, ", thirdparty =") + 15,
+						fmt, host3buf);
+					host3buf[HOSTNAMELEN] = '\0';
+					if (strcmp(host3buf, "_NULL_") == 0)
+						host3 = NULL;
+					else
+						host3 = host3buf;
+					if (host3) {
+						if (no3rd) {
+							fputs("KO\n", stdout);
+							fprintf(stdout, "doesn't allow 3rd party nuttcp\n");
+							fputs("KO\n", stdout);
+							goto cleanup;
+						}
+						cp1 = host3;
+						while (*cp1) {
+							if (!isalnum(*cp1)
+							     && (*cp1 != '-')
+							     && (*cp1 != '.')
+							     && (*cp1 != ':')) {
+								fputs("KO\n", stdout);
+								mes("invalid 3rd party host");
+								fprintf(stdout, "3rd party host = '%s'\n", host3);
+								fputs("KO\n", stdout);
+								goto cleanup;
+							}
+							cp1++;
+						}
+						skip_data = 1;
+						brief = 1;
+						sscanf(strstr(buf, ", brief3 =") + 11,
+							"%d", &brief3);
+					}
+				}
+				else {
+					host3 = NULL;
 				}
 				trans = !trans;
 				if (nbuflen != buflen) {
@@ -1938,18 +2043,33 @@ doit:
 				}
 				if (stream_idx == 0) {
 					clientserver = 0;
+					if (thirdparty) {
+						perror("3rd party connect failed");
+						fprintf(stderr, "3rd party nuttcp only supported for client/server mode\n");
+						fflush(stderr);
+						exit(1);
+					}
 					if (interval) {
+						perror("connect failed");
 						fprintf(stderr, "interval option only supported for client/server mode\n");
 						fflush(stderr);
 						exit(1);
 					}
 					if (reverse) {
+						perror("connect failed");
 						fprintf(stderr, "flip option only supported for client/server mode\n");
 						fflush(stderr);
 						exit(1);
 					}
 					if (traceroute) {
+						perror("connect failed");
 						fprintf(stderr, "traceroute option only supported for client/server mode\n");
+						fflush(stderr);
+						exit(1);
+					}
+					if (host3) {
+						perror("connect failed");
+						fprintf(stderr, "3rd party nuttcp only supported for client/server mode\n");
 						fflush(stderr);
 						exit(1);
 					}
@@ -2066,104 +2186,31 @@ doit:
 			origrcvwin = rcvwinval;
 		}
 	}
+
 	if (abortconn)
 		exit(1);
-	if (trans && timeout) {
-		itimer.it_value.tv_sec = timeout;
-		itimer.it_value.tv_usec =
-			(timeout - itimer.it_value.tv_sec)*1000000;
-		signal(SIGALRM, sigalarm);
-		setitimer(ITIMER_REAL, &itimer, 0);
-	}
-	else if (!trans && interval) {
-		sigact.sa_handler = &sigalarm;
-		sigemptyset(&sigact.sa_mask);
-		sigact.sa_flags = SA_RESTART;
-		sigaction(SIGALRM, &sigact, 0);
-		itimer.it_value.tv_sec = interval;
-		itimer.it_value.tv_usec =
-			(interval - itimer.it_value.tv_sec)*1000000;
-		itimer.it_interval.tv_sec = interval;
-		itimer.it_interval.tv_usec =
-			(interval - itimer.it_interval.tv_sec)*1000000;
-		setitimer(ITIMER_REAL, &itimer, 0);
-	}
 
-	if (interval && clientserver && client && trans)
-		do_poll = 1;
-
-	if (traceroute && clientserver) {
+	if (host3 && clientserver) {
 		char path[64];
 		char *cmd;
 
 		fflush(stdout);
 		fflush(stderr);
-		cmd = "traceroute";
-#ifdef AF_INET6
-		if (af == AF_INET6)
-			cmd = "traceroute6";
-#endif
-		if (client) {
-			if ((pid = fork()) == (pid_t)-1)
-				err("can't fork");
-			if (pid != 0) {
-				while ((wait_pid = wait(&pidstat)) != pid) {
-					if (wait_pid == (pid_t)-1) {
-						if (errno == ECHILD)
-							break;
-						err("wait failed");
-					}
-				}
-				fflush(stdout);
-			}
-			else {
-				signal(SIGINT, SIG_DFL);
-				close(2);
-				dup(1);
-				execlp(cmd, cmd, host, NULL);
-				if (errno == ENOENT) {
-					strcpy(path, "/usr/local/bin/");
-					strcat(path, cmd);
-					execlp(path, cmd, host, NULL);
-				}
-				if (errno == ENOENT) {
-					strcpy(path, "/usr/sbin/");
-					strcat(path, cmd);
-					execlp(path, cmd, host, NULL);
-				}
-				if (errno == ENOENT) {
-					strcpy(path, "/sbin/");
-					strcat(path, cmd);
-					execlp(path, cmd, host, NULL);
-				}
-				perror("execlp failed");
-				fprintf(stderr, "failed to execute %s\n", cmd);
-				fflush(stdout);
-				fflush(stderr);
-				exit(0);
-			}
-		}
-		fprintf(stdout, "\n");
-		if (intr) {
-			intr = 0;
-			fprintf(stdout, "\n");
-			signal(SIGINT, sigint);
-		}
-		if (!skip_data) {
-			for ( stream_idx = 1; stream_idx <= nstream;
-					      stream_idx++ )
-				close(fd[stream_idx]);
-		}
+		cmd = "nuttcp";
+
 		if (client) {
 			if ((pid = fork()) == (pid_t)-1)
 				err("can't fork");
 			if (pid == 0) {
-				while (fgets(intervalbuf, sizeof(intervalbuf),
+				while (fgets(linebuf, sizeof(linebuf),
 					     stdin) && !intr) {
-					if (strncmp(intervalbuf, "DONE", 4)
+					if (strncmp(linebuf, "DONE", 4)
 							== 0)
 						exit(0);
-					fputs(intervalbuf, stdout);
+					if (*ident && (*linebuf != '\n'))
+						fprintf(stdout, "%s: ",
+							ident + 1);
+					fputs(linebuf, stdout);
 					fflush(stdout);
 				}
 				exit(0);
@@ -2198,23 +2245,89 @@ doit:
 			}
 			close(2);
 			dup(1);
-			execlp(cmd, cmd, host, NULL);
+			i = 0;
+			j = 0;
+			cmdargs[i++] = cmd;
+			cmdargs[i++] = "-3";
+			if ((udp && (buflen != DEFAULTUDPBUFLEN)) ||
+			    (!udp && (buflen != 65536))) {
+				sprintf(tmpargs[j], "-l%d", buflen);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (nbuf != INT_MAX) {
+				sprintf(tmpargs[j], "-n%d", nbuf);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (brief3 != 1) {
+				sprintf(tmpargs[j], "-b%d", brief3);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (sendwin) {
+				sprintf(tmpargs[j], "-w%d", sendwin/1024);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (nstream != 1) {
+				sprintf(tmpargs[j], "-N%d", nstream);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (rate != MAXRATE) {
+				sprintf(tmpargs[j], "-R%s%lu",
+					irate ? "i" : "", rate);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (port != DEFAULT_PORT) {
+				sprintf(tmpargs[j], "-p%hu", port);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (trans)
+				cmdargs[i++] = "-r";
+			if (braindead)
+				cmdargs[i++] = "-wb";
+			if (timeout && (timeout != DEFAULT_TIMEOUT)) {
+				sprintf(tmpargs[j], "-T%lf", timeout);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (udp)
+				cmdargs[i++] = "-u";
+			if (interval) {
+				sprintf(tmpargs[j], "-i%f", interval);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (reverse)
+				cmdargs[i++] = "-F";
+			if (format) {
+				if (format & XMITSTATS)
+					cmdargs[i++] = "-fxmitstats";
+				if (format & RUNNINGTOTAL)
+					cmdargs[i++] = "-frunningtotal";
+				if (format & NOPERCENTLOSS)
+					cmdargs[i++] = "-f-percentloss";
+				if (format & NODROPS)
+					cmdargs[i++] = "-f-drops";
+				if (format & PARSE)
+					cmdargs[i++] = "-fparse";
+			}
+			if (traceroute)
+				cmdargs[i++] = "-xt";
+			cmdargs[i++] = host3;
+			cmdargs[i] = NULL;
+			execvp(cmd, cmdargs);
 			if (errno == ENOENT) {
 				strcpy(path, "/usr/local/bin/");
 				strcat(path, cmd);
-				execlp(path, cmd, host, NULL);
+				execv(path, cmdargs);
 			}
 			if (errno == ENOENT) {
 				strcpy(path, "/usr/sbin/");
 				strcat(path, cmd);
-				execlp(path, cmd, host, NULL);
+				execv(path, cmdargs);
 			}
 			if (errno == ENOENT) {
 				strcpy(path, "/sbin/");
 				strcat(path, cmd);
-				execlp(path, cmd, host, NULL);
+				execv(path, cmdargs);
 			}
-			perror("execlp failed");
+			perror("execvp failed");
 			fprintf(stderr, "failed to execute %s\n", cmd);
 			fflush(stdout);
 			fflush(stderr);
@@ -2223,6 +2336,170 @@ doit:
 			goto cleanup;
 		}
 	}
+
+	if (traceroute && clientserver) {
+		char path[64];
+		char *cmd;
+
+		fflush(stdout);
+		fflush(stderr);
+		cmd = "traceroute";
+#ifdef AF_INET6
+		if (af == AF_INET6)
+			cmd = "traceroute6";
+#endif
+		if (client) {
+			if ((pid = fork()) == (pid_t)-1)
+				err("can't fork");
+			if (pid != 0) {
+				while ((wait_pid = wait(&pidstat)) != pid) {
+					if (wait_pid == (pid_t)-1) {
+						if (errno == ECHILD)
+							break;
+						err("wait failed");
+					}
+				}
+				fflush(stdout);
+			}
+			else {
+				signal(SIGINT, SIG_DFL);
+				close(2);
+				dup(1);
+				i = 0;
+				cmdargs[i++] = cmd;
+				cmdargs[i++] = host;
+				cmdargs[i] = NULL;
+				execvp(cmd, cmdargs);
+				if (errno == ENOENT) {
+					strcpy(path, "/usr/local/bin/");
+					strcat(path, cmd);
+					execv(path, cmdargs);
+				}
+				if (errno == ENOENT) {
+					strcpy(path, "/usr/sbin/");
+					strcat(path, cmd);
+					execv(path, cmdargs);
+				}
+				if (errno == ENOENT) {
+					strcpy(path, "/sbin/");
+					strcat(path, cmd);
+					execv(path, cmdargs);
+				}
+				perror("execvp failed");
+				fprintf(stderr, "failed to execute %s\n", cmd);
+				fflush(stdout);
+				fflush(stderr);
+				exit(0);
+			}
+		}
+		fprintf(stdout, "\n");
+		if (intr) {
+			intr = 0;
+			fprintf(stdout, "\n");
+			signal(SIGINT, sigint);
+		}
+		if (!skip_data) {
+			for ( stream_idx = 1; stream_idx <= nstream;
+					      stream_idx++ )
+				close(fd[stream_idx]);
+		}
+		if (client) {
+			if ((pid = fork()) == (pid_t)-1)
+				err("can't fork");
+			if (pid == 0) {
+				while (fgets(linebuf, sizeof(linebuf),
+					     stdin) && !intr) {
+					if (strncmp(linebuf, "DONE", 4)
+							== 0)
+						exit(0);
+					fputs(linebuf, stdout);
+					fflush(stdout);
+				}
+				exit(0);
+			}
+			signal(SIGINT, SIG_IGN);
+			while ((wait_pid = wait(&pidstat)) != pid) {
+				if (wait_pid == (pid_t)-1) {
+					if (errno == ECHILD)
+						break;
+					err("wait failed");
+				}
+			}
+			exit(0);
+		}
+		else {
+			if (!inetd) {
+				if ((pid = fork()) == (pid_t)-1)
+					err("can't fork");
+				if (pid != 0) {
+					while ((wait_pid = wait(&pidstat))
+							!= pid) {
+						if (wait_pid == (pid_t)-1) {
+							if (errno == ECHILD)
+								break;
+							err("wait failed");
+						}
+					}
+					fprintf(stdout, "DONE\n");
+					fflush(stdout);
+					goto cleanup;
+				}
+			}
+			close(2);
+			dup(1);
+			i = 0;
+			cmdargs[i++] = cmd;
+			cmdargs[i++] = host;
+			cmdargs[i] = NULL;
+			execvp(cmd, cmdargs);
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/local/bin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			perror("execvp failed");
+			fprintf(stderr, "failed to execute %s\n", cmd);
+			fflush(stdout);
+			fflush(stderr);
+			if (!inetd)
+				exit(0);
+			goto cleanup;
+		}
+	}
+
+	if (trans && timeout) {
+		itimer.it_value.tv_sec = timeout;
+		itimer.it_value.tv_usec =
+			(timeout - itimer.it_value.tv_sec)*1000000;
+		signal(SIGALRM, sigalarm);
+		setitimer(ITIMER_REAL, &itimer, 0);
+	}
+	else if (!trans && interval) {
+		sigact.sa_handler = &sigalarm;
+		sigemptyset(&sigact.sa_mask);
+		sigact.sa_flags = SA_RESTART;
+		sigaction(SIGALRM, &sigact, 0);
+		itimer.it_value.tv_sec = interval;
+		itimer.it_value.tv_usec =
+			(interval - itimer.it_value.tv_sec)*1000000;
+		itimer.it_interval.tv_sec = interval;
+		itimer.it_interval.tv_usec =
+			(interval - itimer.it_interval.tv_sec)*1000000;
+		setitimer(ITIMER_REAL, &itimer, 0);
+	}
+
+	if (interval && clientserver && client && trans)
+		do_poll = 1;
 
 	prep_timer();
 	errno = 0;
@@ -2844,6 +3121,8 @@ cleanup:
 		format = 0;
 		traceroute = 0;
 		skip_data = 0;
+		host3 = NULL;
+		thirdparty = 0;
 
 #ifdef HAVE_SETPRIO
 		priority = 0;
