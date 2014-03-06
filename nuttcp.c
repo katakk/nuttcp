@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v3.6.2
+ *	N U T T C P . C						v4.0.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -9,20 +9,43 @@
  *
  * Based on nttcp
  * Developed by Bill Fink, billfink@mindspring.com
+ *          and Rob Scott, rob@hpcmo.hpc.mil
  * Latest version available at:
- *	ftp://ftp.lcp.nrl.navy.mil/u/bill/beta/nuttcp/
+ *	ftp://ftp.lcp.nrl.navy.mil/pub/nuttcp/
  *
  * Test TCP connection.  Makes a connection on port 5001
  * and transfers fabricated buffers or data copied from stdin.
  *
  * Run nuttcp with no arguments to get a usage statement
  *
- * SYSV sections are here but intended to be removed
- *
  * Modified for operation under 4.2BSD, 18 Dec 84
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V4.0.3, Rob Scott, 13-Oct-03
+ *	Minor tweaks to output format for alignment
+ *	Interval option "-i" with no explicit value sets interval to 1.0
+ * V4.0.2, Bill Fink, 10-Oct-03
+ *	Changed "-xt" option to do both forward and reverse traceroute
+ *	Changed to use brief output by default ("-v" for old default behavior)
+ * V4.0.1, Rob Scott, 10-Oct-03
+ *	Added IPv6 code 
+ *	Changed inet get functions to protocol independent versions
+ *	Added fakepoll for hosts without poll() (macosx)
+ *	Added ifdefs to only include setprio if os supports it (non-win)
+ *	Added bits to handle systems without new inet functions (solaris < 2.8)
+ *	Removed SYSV obsolete code
+ *	Added ifdefs and code to handle cygwin and beginning of windows support
+ *	Window size can now be in meg (m|M) and gig (g|G)
+ *	Added additional directories to search for traceroute
+ *	Changed default to transmit, time limit of 10 seconds, no buffer limit
+ *	Added (h|H) as option to specify time in hours
+ *	Added getservbyname calls for port, if all fails use old defaults
+ *	Changed sockaddr to sockaddr_storage to handle v6 addresses
+ * v3.7.1, Bill Fink, 10-Aug-03
+ *	Add "-fdebugpoll" option to help debug polling for interval reporting
+ *	Fix Solaris compiler warning
+ *	Use poll instead of separate process for interval reports
  * v3.6.2, Rob Scott, 18-Mar-03
  *	Allow setting server window to use default value
  *	Cleaned out BSD42 old code
@@ -137,11 +160,10 @@
  *	Network interface interrupts (for Linux only)
  *	netstat -i info
  *	Man page
- *	Forking for multiple streams (or using select)
+ *	Forking for multiple streams
  *	Bidirectional option
  *	Graphical interface
  *	3rd party nuttcp
- *	IPv6 support
  *	OWD info
  *	RTT info
  *	Jitter info
@@ -157,7 +179,10 @@
  *	nuttcp network idle time
  *
  * Distribution Status -
- *      Public Domain.  Distribution Unlimited.
+ *	Public Domain.  Distribution Unlimited.
+ *	OpenSource(tm)
+ *	Derivative works must be sent to authors and redistributed with 
+ *	a modified source and executable name.
  */
 
 /*
@@ -171,27 +196,70 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <ctype.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/time.h>		/* struct timeval */
+
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <netdb.h>
-#include <sys/time.h>		/* struct timeval */
+#include <sys/resource.h>
+#else
+#include "win32nuttcp.h"			/* from win32 */
+#endif /* _WIN32 */
+
 #include <limits.h>
 #include <string.h>
+#include <fcntl.h>
 
-#if defined(SYSV)
-#include <sys/times.h>
-#include <sys/param.h>
-struct rusage {
-    struct timeval ru_utime, ru_stime;
-};
-#define RUSAGE_SELF 0
-#else
-#include <sys/resource.h>
+#define MAXRATE 0xffffffffUL
+
+#if !defined(__CYGWIN__) && !defined(_WIN32)
+#define HAVE_SETPRIO
+#endif
+
+#if !defined(__MACH__) && !defined(_WIN32)
+#define HAVE_POLL
 #endif
 
 #if defined(__APPLE__) && defined(__MACH__)
 #define uint64_t u_int64_t
+#define uint32_t u_int32_t
+#endif
+
+#ifdef HAVE_POLL
+#include <sys/poll.h>
+#else
+#include "fakepoll.h"			/* from missing */
+#endif
+
+/*
+ * EAI_NONAME has nothing to do with socklen, but on sparc without it tells
+ * us it's an old enough solaris to need the typedef
+ */
+#if (defined(__APPLE__) && defined(__MACH__)) || (defined(sparc) && !defined(EAI_NONAME))
+typedef int socklen_t;
+#endif
+
+#if defined(sparc)
+#if !defined(EAI_NONAME) /* old sparc */
+#define sockaddr_storage sockaddr
+#define ss_family sa_family
+#else /* new sparc */
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <strings.h>
+#endif /* new sparc */
+#endif /* sparc */
+
+#if defined(_AIX)
+#define ss_family __ss_family
+#endif
+
+#if !defined(EAI_NONAME)
+#include "addrinfo.h"			/* from missing */
 #endif
 
 static struct	timeval time0;	/* Time at which timing started */
@@ -201,21 +269,16 @@ static struct	rusage ru0;	/* Resource utilization at the start */
 
 static struct	sigaction sigact;	/* signal handler for alarm */
 
-static void prusage();
-static void tvadd();
-static void tvsub();
-static void psecs();
-
-#define PERF_FMT_OUT	  "%.3f MB in %.2f real seconds = %.2f KB/sec" \
-			  " = %.4f Mb/s\n"
-#define PERF_FMT_BRIEF	  "%.3f MB / %.2f sec = %.4f Mbps %d %%TX %d %%RX"
-#define PERF_FMT_BRIEF2	  "%.3f MB / %.2f sec = %.4f Mbps %d %%%s"
+#define PERF_FMT_OUT	  "%.4f MB in %.2f real seconds = %.2f KB/sec" \
+			  " = %.4f Mbps\n"
+#define PERF_FMT_BRIEF	  "%10.4f MB / %6.2f sec = %9.4f Mbps %d %%TX %d %%RX"
+#define PERF_FMT_BRIEF2	  "%10.4f MB / %6.2f sec = %9.4f Mbps %d %%%s"
 #define PERF_FMT_BRIEF3	  " Trans: %.3f MB"
-#define PERF_FMT_INTERVAL  "%.4f MB / %5.2f sec = %9.4f Mbps"
-#define PERF_FMT_INTERVAL2 " Tot: %.4f MB / %5.2f sec = %9.4f Mbps"
-#define PERF_FMT_INTERVAL3 " Trans: %.4f MB"
-#define PERF_FMT_INTERVAL4 " Tot: %.4f MB"
-#define PERF_FMT_IN	  "%lf MB in %lf real seconds = %lf KB/sec = %lf Mb/s\n"
+#define PERF_FMT_INTERVAL  "%10.4f MB / %6.2f sec = %9.4f Mbps"
+#define PERF_FMT_INTERVAL2 " Tot: %10.4f MB / %6.2f sec = %9.4f Mbps"
+#define PERF_FMT_INTERVAL3 " Trans: %10.4f MB"
+#define PERF_FMT_INTERVAL4 " Tot: %10.4f MB"
+#define PERF_FMT_IN	  "%lf MB in %lf real seconds = %lf KB/sec = %lf Mbps\n"
 #define CPU_STATS_FMT_IN  "%*fuser %*fsys %*d:%*dreal %d%%"
 #define CPU_STATS_FMT_IN2 "%*fuser %*fsys %*d:%*d:%*dreal %d%%"
 
@@ -232,6 +295,7 @@ static void psecs();
 #define MAXSTREAM		128
 #endif
 #define DEFAULT_NBUF		2048
+#define DEFAULT_TIMEOUT		10.0
 #define DEFAULTUDPBUFLEN	8192
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
@@ -242,17 +306,29 @@ static void psecs();
 #define	RUNNINGTOTAL		0x4	/* give cumulative stats for "-i" */
 #define	NODROPS			0x8	/* give packet drop stats for "-i" */
 #define	NOPERCENTLOSS		0x10	/* don't give percent loss for "-i" */
+#define DEBUGPOLL		0x20	/* add info to assist with debugging
+					 * polling for interval reports */
 
-void mes(char *s);
-void err(char *s);
-void pattern(char *cp, int cnt);
-#if defined(SYSV)
-static void getrusage(int ignored, struct rusage *ru);
-#endif
+void sigpipe( int signum );
+void sigint( int signum );
+void sigalarm( int signum );
+void err( char *s );
+void mes( char *s );
+void pattern( char *cp, int cnt );
+void prep_timer();
+double read_timer( char *str, int len );
+static void prusage( struct rusage *r0,  struct rusage *r1, struct timeval *e, struct timeval *b, char *outp );
+static void tvadd( struct timeval *tsum, struct timeval *t0, struct timeval *t1 );
+static void tvsub( struct timeval *tdiff, struct timeval *t1, struct timeval *t0 );
+static void psecs( long l, char *cp );
+int Nread( int fd, char *buf, int count );
+int Nwrite( int fd, char *buf, int count );
+int delay( int us );
+int mread( int fd, char *bufp, unsigned n);
 
-int vers_major = 3;
-int vers_minor = 6;
-int vers_delta = 2;
+int vers_major = 4;
+int vers_minor = 0;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -261,11 +337,23 @@ int irvers;
 
 struct sockaddr_in sinme[MAXSTREAM + 1];
 struct sockaddr_in sinhim[MAXSTREAM + 1];
-struct sockaddr_in frominet;
 
-int domain, fromlen;
+#ifdef AF_INET6
+struct sockaddr_in6 sinme6[MAXSTREAM + 1];
+struct sockaddr_in6 sinhim6[MAXSTREAM + 1];
+#endif
+
+struct sockaddr_storage frominet;
+
+int domain = PF_UNSPEC;
+int af = AF_UNSPEC;
+int explicitaf = 0;		/* address family explicit specified (-4|-6) */
+int numeric4addr = 0;		/* IPv4 address specified on command line */
+int numeric6addr = 0;		/* IPv6 address specified on command line */
 int fd[MAXSTREAM + 1];		/* fd array of network sockets */
 int nfd;			/* fd for accept call */
+struct pollfd pollfds[MAXSTREAM + 4];	/* used for reading interval reports */
+socklen_t fromlen;
 
 int buflen = 64 * 1024;		/* length of buffer */
 int nbuflen;
@@ -274,9 +362,10 @@ char *buf;			/* ptr to dynamic buffer */
 int nbuf = 0;			/* number of buffers to send in sinkmode */
 
 /*  nick code  */
-int sendwin, sendwinval, origsendwin, optlen;
-int rcvwin, rcvwinval, origrcvwin, maxseg;
-int srvrwin;
+int sendwin=0, sendwinval=0, origsendwin=0;
+socklen_t optlen;
+int rcvwin=0, rcvwinval=0, origrcvwin=0, maxseg;
+int srvrwin=0;
 /*  end nick code  */
 
 int udp = 0;			/* 0 = tcp, !0 = udp */
@@ -285,25 +374,44 @@ int udplossinfo = 0;		/* set to 1 to give UDP loss info for
 int need_swap;			/* client and server are different endian */
 int options = 0;		/* socket options */
 int one = 1;                    /* for 4.3 BSD style setsockopt() */
-unsigned short port = 5001;	/* TCP port number */
-unsigned short ctlport = 5000;	/* control port for server connection */
+/* default port numbers if command arg or getserv doesn't get a port # */
+#define DEFAULT_PORT	5001
+#define DEFAULT_CTLPORT	5000
+unsigned short port = 0;	/* TCP port number */
+unsigned short ctlport = 0;	/* control port for server connection */
 int tmpport;
 char *host;			/* ptr to name of host */
-int trans = 0;			/* 0=receive, !0=transmit mode */
+
+#ifndef AF_INET6
+#define ADDRSTRLEN 16
+#else
+#define ADDRSTRLEN INET6_ADDRSTRLEN
+int v4mapped = 0;		/* set to 1 to enable v4 mapping in v6 server */
+#endif
+
+char hostbuf[ADDRSTRLEN];	/* buffer to hold text of address */
+int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
+int nofork = 0;	 		/* set to 1 to not fork server */
 int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 				 * resource usage. */
 int nodelay = 0;		/* set TCP_NODELAY socket option */
-unsigned long rate = ~0;	/* transmit rate limit in Kbps */
+unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
 int irate = 0;			/* instantaneous rate limit if set */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
 char intervalbuf[256+2];	/* buf for interval reporting */
+int do_poll = 0;		/* set to read interval reports (client xmit) */
+int got_done = 0;		/* set when read last of interval reports */
 int reverse = 0;		/* reverse direction of data connection open */
 int format = 0;			/* controls formatting of output */
 int traceroute = 0;		/* do traceroute back to client if set */
 int skip_data = 0;		/* skip opening of data channel */
+
+#ifdef HAVE_SETPRIO
 int priority = 0;		/* nuttcp process priority */
+#endif
+
 long timeout_sec = 0;
 struct itimerval itimer;	/* for setitimer */
 int srvr_helo = 1;		/* set to 0 if server doesn't send HELO */
@@ -311,7 +419,7 @@ char *ident = "";		/* identifier for nuttcp output */
 int intr = 0;
 int abortconn = 0;
 int braindead = 0;		/* for braindead Solaris 2.8 systems */
-int brief = 0;			/* set for brief output */
+int brief = 1;			/* set for brief output */
 int done = 0;			/* don't output interval report if done */
 int got_begin = 0;		/* don't output interval report if not begun */
 int buflenopt = 0;		/* whether or not user specified buflen */
@@ -328,6 +436,10 @@ int realstdout;			/* used for "-s" output to real standard out */
 int firsttime = 1;		/* flag for first pass through server */
 struct in_addr clientaddr;	/* IP address of client connecting to server */
 
+#ifdef AF_INET6
+struct in6_addr clientaddr6;	/* IP address of client connecting to server */
+#endif
+
 struct hostent *addr;
 extern int errno;
 
@@ -336,11 +448,15 @@ Usage: nuttcp or nuttcp -h	prints this usage info\n\
 Usage: nuttcp -V		prints version info\n\
 Usage: nuttcp -xt		do traceroute back to client\n\
 Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
-	-l##	length of network write buf (default 8192/udp, 65536/tcp)\n\
+	-4	Use IPv4\n"
+#ifdef AF_INET6
+"	-6	Use IPv6\n"
+#endif
+"	-l##	length of network write buf (default 8192/udp, 65536/tcp)\n\
 	-s	don't source a pattern to network, use stdin\n\
 	-n##	number of source bufs written to network (default 2048)\n\
-	-w##	transmitter window size in KB\n\
-	-ws##	server receive window size in KB\n\
+	-w##	transmitter window size in KB (or (m|M)B or (g|G)B)\n\
+	-ws##	server receive window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
 	-p##	port number to send to (default 5001)\n\
 	-P##	port number for control connection (default 5000)\n\
@@ -348,20 +464,30 @@ Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
 	-D	don't buffer TCP writes (sets TCP_NODELAY socket option)\n\
 	-N##	number of streams (starting at port number)\n\
 	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
-	-T##	transmit timeout interval in seconds (or (m|M)inutes)\n\
+	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
 	-i##	server interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
-	-F	flip option to reverse direction of data connection open\n\
-	-xP##	set nuttcp process priority (must be root)\n\
-	-d	set TCP SO_DEBUG option on data socket\n\
-	-v	verbose output\n\
-	-b	brief output\n\
-Usage (receiver): nuttcp -r [-options] [host] [ >out]\n\
-	-l##	length of network read buf (default 8192/udp, 65536/tcp)\n\
+	-F	flip option to reverse direction of data connection open\n"
+#ifdef HAVE_SETPRIO
+"	-xP##	set nuttcp process priority (must be root)\n"
+#endif
+"	-d	set TCP SO_DEBUG option on data socket\n\
+	-v[v]	verbose [or very verbose] output\n\
+	-b	brief output (default)\n"
+#ifdef IPV6_V6ONLY
+"	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
+"	--enable-v4-mapped enable v4 mapping in v6 server\n"
+#endif
+"Usage (receiver): nuttcp -r [-options] [host] [ >out]\n\
+	-4	Use IPv4\n"
+#ifdef AF_INET6
+"	-6	Use IPv6\n"
+#endif
+"	-l##	length of network read buf (default 8192/udp, 65536/tcp)\n\
 	-s	don't sink (discard): prints all data from network to stdout\n\
 	-n##	number of bufs for server to write to network (default 2048)\n\
-	-w##	receiver window size in KB\n\
-	-ws##	server transmit window size in KB\n\
+	-w##	receiver window size in KB (or (m|M)B or (g|G)B)\n\
+	-ws##	server transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
 	-p##	port number to listen at (default 5001)\n\
 	-P##	port number for control connection (default 5000)\n\
@@ -369,21 +495,38 @@ Usage (receiver): nuttcp -r [-options] [host] [ >out]\n\
 	-u	use UDP instead of TCP\n\
 	-N##	number of streams (starting at port number), implies -B\n\
 	-R##	server transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
-	-T##	server transmit timeout interval in seconds (or (m|M)inutes)\n\
+	-T##	server transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
 	-i##	client interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
-	-F	flip option to reverse direction of data connection open\n\
-	-xP##	set nuttcp process priority (must be root)\n\
-	-d	set TCP SO_DEBUG option on data socket\n\
-	-v	verbose output\n\
-	-b	brief output\n\
-Usage (server): nuttcp -S [-options]\n\
+	-F	flip option to reverse direction of data connection open\n"
+#ifdef HAVE_SETPRIO
+"	-xP##	set nuttcp process priority (must be root)\n"
+#endif
+"	-d	set TCP SO_DEBUG option on data socket\n\
+	-v[v]	verbose [or very verbose] output\n\
+	-b	brief output (default)\n"
+#ifdef IPV6_V6ONLY
+"	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
+"	--enable-v4-mapped enable v4 mapping in v6 server\n"
+#endif
+"Usage (server): nuttcp -S [-options]\n\
 		note server mode excludes use of -s\n\
-	-1	oneshot server mode (implied with inetd/xinetd), implies -S\n\
+	-4	Use IPv4 (default)\n"
+#ifdef AF_INET6
+"	-6	Use IPv6\n"
+#endif
+"	-1	oneshot server mode (implied with inetd/xinetd), implies -S\n\
 	-P##	port number for server connection (default 5000)\n\
-		note don't use with inetd/xinetd (use services file instead)\n\
-	-xP##	set nuttcp process priority (must be root)\n\
-Format options:\n\
+		note don't use with inetd/xinetd (use services file instead)\n"
+#ifdef HAVE_SETPRIO
+"	-xP##	set nuttcp process priority (must be root)\n"
+#endif
+"	--nofork dont fork server\n"
+#ifdef IPV6_V6ONLY
+"	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
+"	--enable-v4-mapped enable v4 mapping in v6 server\n"
+#endif
+"Format options:\n\
 	-fxmitstats	also give transmitter stats (MB) with -i (UDP only)\n\
 	-frunningtotal	also give cumulative stats on interval reports\n\
 	-f-drops	don't give packet drop info on brief output (UDP)\n\
@@ -411,19 +554,19 @@ double srvr_KBps;
 double srvr_Mbps;
 int srvr_cpu_util;
 
-void prep_timer();
-double read_timer();
 double cput = 0.000001, realt = 0.000001;	/* user, real time (seconds) */
 double realtd = 0.000001;	/* real time delta - for interval reporting */
 
+#ifdef SIGPIPE
 void
-sigpipe()
+sigpipe( int signum )
 {
 	signal(SIGPIPE, sigpipe);
 }
+#endif
 
 void
-sigint()
+sigint( int signum )
 {
 	signal(SIGINT, SIG_DFL);
 	fputs("\n*** transfer interrupted ***\n", stdout);
@@ -433,11 +576,12 @@ sigint()
 }
 
 void
-sigalarm()
+sigalarm( int signum )
 {
 	struct	timeval timec;	/* Current time */
 	struct	timeval timed;	/* Delta time */
-	struct	timeval timet;	/* Transmitter time */
+/*	beginnings of timestamps - not ready for prime time */
+/*	struct	timeval timet; */	/* Transmitter time */
 	uint64_t nrbytes;
 	int i;
 	char *cp1, *cp2;
@@ -445,7 +589,7 @@ sigalarm()
 	if (interval && !trans) {
 		if ((udp && !got_begin) || done)
 			return;
-		if (clientserver && !trans) {
+		if (clientserver) {
 			/* Get real time */
 			gettimeofday(&timec, (struct timezone *)0);
 			tvsub( &timed, &timec, &timep );
@@ -549,25 +693,20 @@ sigalarm()
 	return;
 }
 
-void
-sigterm()
+int
+main( int argc, char **argv )
 {
-	return;
-}
-
-main(argc,argv)
-int argc;
-char **argv;
-
-{
-	unsigned long addr_tmp;
 	double MB;
 	int cpu_util;
 	int first_read;
-	int correction;
+	int correction = 0;
+	int pollst;
 	int i;
 	char *cp1, *cp2;
 	char ch;
+	int error_num;
+	struct servent *sp = 0;
+	struct addrinfo hints, *res = NULL;
 
 /*  nick code  */
 optlen = sizeof(maxseg);
@@ -583,6 +722,18 @@ optlen = sizeof(maxseg);
 	while( argc>0 && argv[0][0] == '-' )  {
 		switch (argv[0][1]) {
 
+		case '4':
+			domain = PF_INET;
+			af = AF_INET;
+			explicitaf = 1;
+			break;
+#ifdef AF_INET6
+		case '6':
+			domain = PF_INET6;
+			af = AF_INET6;
+			explicitaf = 1;
+			break;
+#endif
 		case 'B':
 			b_flag = 1;
 			break;
@@ -605,6 +756,8 @@ optlen = sizeof(maxseg);
 				fflush(stderr);
 				exit(1);
 			}
+			else if (nbuf == 0)
+				nbuf = DEFAULT_NBUF;
 			break;
 		case 'l':
 			buflen = atoi(&argv[0][2]);
@@ -618,6 +771,11 @@ optlen = sizeof(maxseg);
 		case 'w':
 			if (argv[0][2] == 's') {
 				srvrwin = 1024 * atoi(&argv[0][3]);
+				ch = argv[0][strlen(argv[0]) - 1];
+				if ((ch == 'm') || (ch == 'M'))
+					srvrwin *= 1024;
+				else if ((ch == 'g') || (ch == 'G'))
+					srvrwin *= 1048576;
 				if (srvrwin < 0) {
 					fprintf(stderr, "invalid srvrwin = %d\n", srvrwin);
 					fflush(stderr);
@@ -636,6 +794,11 @@ optlen = sizeof(maxseg);
 				else
 					sendwin = 1024 * atoi(&argv[0][2]);
 
+				ch = argv[0][strlen(argv[0]) - 1];
+				if ((ch == 'm') || (ch == 'M'))
+					sendwin *= 1024;
+				else if ((ch == 'g') || (ch == 'G'))
+					sendwin *= 1048576;
 				rcvwin = sendwin;
 				if (sendwin < 0) {
 					fprintf(stderr, "invalid sendwin = %d\n", sendwin);
@@ -673,7 +836,9 @@ optlen = sizeof(maxseg);
 			if (!buflenopt) buflen = DEFAULTUDPBUFLEN;
 			break;
 		case 'v':
-			verbose = 1;
+			brief = 0;
+			if (argv[0][2] == 'v')
+				verbose = 1;
 			break;
 		case 'N':
 			nstream = atoi(&argv[0][2]);
@@ -696,13 +861,13 @@ optlen = sizeof(maxseg);
 			}
 			else
 				rate = atoi(&argv[0][2]);
-			if (rate == 0)
-				rate = ~0;
 			ch = argv[0][strlen(argv[0]) - 1];
 			if ((ch == 'm') || (ch == 'M'))
 				rate *= 1000;
 			else if ((ch == 'g') || (ch == 'G'))
 				rate *= 1000000;
+			if (rate == 0)
+				rate = MAXRATE;
 			break;
 		case 'T':
 			sscanf(&argv[0][2], "%lf", &timeout);
@@ -711,9 +876,13 @@ optlen = sizeof(maxseg);
 				fflush(stderr);
 				exit(1);
 			}
+			else if (timeout == 0.0)
+				timeout = DEFAULT_TIMEOUT;
 			ch = argv[0][strlen(argv[0]) - 1];
 			if ((ch == 'm') || (ch == 'M'))
-				timeout *= 60;
+				timeout *= 60.0;
+			else if ((ch == 'h') || (ch == 'H'))
+				timeout *= 3600.0;
 			itimer.it_value.tv_sec = timeout;
 			itimer.it_value.tv_usec =
 				(timeout - itimer.it_value.tv_sec)*1000000;
@@ -722,14 +891,16 @@ optlen = sizeof(maxseg);
 			break;
 		case 'i':
 			sscanf(&argv[0][2], "%lf", &interval);
-			if (interval < 0) {
+			if (interval < 0.0) {
 				fprintf(stderr, "invalid interval = %f\n", interval);
 				fflush(stderr);
 				exit(1);
 			}
+			else if (interval == 0.0) 
+				interval = 1.0;
 			ch = argv[0][strlen(argv[0]) - 1];
 			if ((ch == 'm') || (ch == 'M'))
-				interval *= 60;
+				interval *= 60.0;
 			break;
 		case 'I':
 			ident = &argv[0][1];
@@ -747,12 +918,16 @@ optlen = sizeof(maxseg);
 				brief = 1;
 			break;
 		case 'S':
+			trans = 0;
 			clientserver = 1;
+			brief = 0;
 			verbose = 1;
 			break;
 		case '1':
 			oneshot = 1;
+			trans = 0;
 			clientserver = 1;
+			brief = 0;
 			verbose = 1;
 			break;
 		case 'V':
@@ -770,6 +945,8 @@ optlen = sizeof(maxseg);
 				format |= NOPERCENTLOSS;
 			else if (strcmp(&argv[0][2], "-drops") == 0)
 				format |= NODROPS;
+			else if (strcmp(&argv[0][2], "debugpoll") == 0)
+				format |= DEBUGPOLL;
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid format option \"%s\"\n", &argv[0][2]);
@@ -789,8 +966,10 @@ optlen = sizeof(maxseg);
 				traceroute = 1;
 				brief = 1;
 			}
+#ifdef HAVE_SETPRIO
 			else if (argv[0][2] == 'P')
 				priority = atoi(&argv[0][3]);
+#endif
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid x option \"%s\"\n", &argv[0][2]);
@@ -802,6 +981,22 @@ optlen = sizeof(maxseg);
 					fflush(stderr);
 					exit(1);
 				}
+			}
+			break;
+		case '-':
+			if (strcmp(&argv[0][2], "nofork") == 0) {
+				nofork=1;
+			}
+#ifdef IPV6_V6ONLY
+			else if (strcmp(&argv[0][2], "disable-v4-mapped") == 0) {
+				v4mapped=0;
+			}
+			else if (strcmp(&argv[0][2], "enable-v4-mapped") == 0) {
+				v4mapped=1;
+			}
+#endif
+			else {
+				goto usage;
 			}
 			break;
 		case 'h':
@@ -818,8 +1013,116 @@ optlen = sizeof(maxseg);
 	bzero((char *)&frominet, sizeof(frominet));
 	bzero((char *)&clientaddr, sizeof(clientaddr));
 
-	if (!nbuf)
-		nbuf = DEFAULT_NBUF;
+#ifdef AF_INET6
+	bzero((char *)&clientaddr6, sizeof(clientaddr6));
+#endif
+
+	if (!nbuf) {
+		if (timeout == 0.0) {
+			timeout = DEFAULT_TIMEOUT;
+			itimer.it_value.tv_sec = timeout;
+			itimer.it_value.tv_usec =
+				(timeout - itimer.it_value.tv_sec)*1000000;
+			nbuf = INT_MAX;
+		}
+	}
+
+	if (srvrwin == -1) {
+		srvrwin = sendwin;
+	}
+
+	if ((argc == 0) && !explicitaf) {
+		domain = PF_INET;
+		af = AF_INET;
+	}
+
+	if (argc == 1) {
+		uint32_t dummy;
+
+		host = argv[0];
+
+		if (inet_pton(AF_INET,  host, &dummy) > 0) numeric4addr = 1;
+#ifdef AF_INET6
+		if (inet_pton(AF_INET6, host, &dummy) > 0) numeric6addr = 1;
+#endif
+		if (!(numeric4addr || numeric6addr)) {
+			bzero(&hints, sizeof(hints));
+			res = NULL;
+			if (explicitaf) hints.ai_family = af;
+			if (error_num = getaddrinfo(host, NULL, &hints, &res)) {
+				fprintf(stderr, "bad hostname: %s\n", gai_strerror(error_num));
+				exit(1);
+			}
+			af = res->ai_family;
+/*
+ * At the moment PF_ matches AF_ but are maintained seperate and the socket
+ * call is supposed to be PF_
+ *
+ * For now we set domain from the address family we looked up, but if these
+ * ever get changed to not match some code will have to go here to find the
+ * domain appropriate for the family
+ */
+			domain = af;
+		}
+
+		if (!explicitaf)
+			if (numeric4addr) {
+				domain = PF_INET;
+				af = AF_INET;
+			}
+#ifdef AF_INET6
+			else if (numeric6addr) {
+				domain = PF_INET6;
+				af = AF_INET6;
+			}
+#endif
+	}
+
+	if (!port) {
+		if (af == AF_INET) {
+			if (sp = getservbyname( "nuttcp-data", "tcp" ))
+				port = ntohs(sp->s_port);
+			else
+				port = DEFAULT_PORT;
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+			if (sp = getservbyname( "nuttcp6-data", "tcp" ))
+				port = ntohs(sp->s_port);
+			else {
+				if (sp = getservbyname( "nuttcp-data", "tcp" ))
+					port = ntohs(sp->s_port);
+				else
+					port = DEFAULT_PORT;
+			}
+		}
+#endif
+		else
+			err("unsupported AF");
+	}
+
+	if (!ctlport) {
+		if (af == AF_INET) {
+			if (sp = getservbyname( "nuttcp", "tcp" ))
+				ctlport = ntohs(sp->s_port);
+			else
+				ctlport = DEFAULT_CTLPORT;
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+			if (sp = getservbyname( "nuttcp6", "tcp" ))
+				ctlport = ntohs(sp->s_port);
+			else {
+				if (sp = getservbyname( "nuttcp", "tcp" ))
+					ctlport = ntohs(sp->s_port);
+				else
+					ctlport = DEFAULT_CTLPORT;
+			}
+		}
+#endif
+		else
+			err("unsupported AF");
+	}
 
 	if ((port < 5000) || ((port + nstream - 1) > 65535)) {
 		fprintf(stderr, "invalid port/nstream = %d/%d\n", port, nstream);
@@ -833,10 +1136,6 @@ optlen = sizeof(maxseg);
 		exit(1);
 	}
 
-	if (srvrwin == -1) {
-		srvrwin = sendwin;
-	}
-
 	if (clientserver) {
 		if (trans) {
 			fprintf(stderr, "server mode only allowed for receiver\n");
@@ -846,8 +1145,9 @@ optlen = sizeof(maxseg);
 		sinkmode = 1;
 		start_idx = 0;
 		ident = "";
-		{ struct sockaddr_in peer;
-		  int peerlen = sizeof(peer);
+		if (af == AF_INET) {
+		  struct sockaddr_in peer;
+		  socklen_t peerlen = sizeof(peer);
 		  if (getpeername(0, (struct sockaddr *) &peer, 
 				&peerlen) == 0) {
 			clientaddr = peer.sin_addr;
@@ -856,27 +1156,43 @@ optlen = sizeof(maxseg);
 			start_idx = 1;
 		  }
 		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+		  struct sockaddr_in6 peer;
+		  socklen_t peerlen = sizeof(peer);
+		  if (getpeername(0, (struct sockaddr *) &peer, 
+				&peerlen) == 0) {
+			clientaddr6 = peer.sin6_addr;
+			inetd = 1;
+			oneshot = 1;
+			start_idx = 1;
+		  }
+		}
+#endif
+		else {
+			err("unsupported AF");
+		}
 	}
 
-	if (clientserver && !inetd) {
+	if (clientserver && !inetd && !nofork) {
 		if ((pid = fork()) == (pid_t)-1)
 			err("can't fork");
 		if (pid != 0)
 			exit(0);
 	}
 
+#ifdef HAVE_SETPRIO
 	if (priority) {
 		if (setpriority(PRIO_PROCESS, 0, priority) != 0)
 			err("couldn't change priority");
 	}
+#endif
 
 	if (argc == 1) {
 		start_idx = 0;
 		client = 1;
 		clientserver = 1;
 	}
-
-	if (argc == 1) host = argv[0];
 
 	if (interval && !clientserver) {
 		fprintf(stderr, "interval option only supported for client/server mode\n");
@@ -913,8 +1229,11 @@ optlen = sizeof(maxseg);
 	    buflen = MAXUDPBUFLEN;
 	}
 
-	if (udp && interval && (buflen >= 32))
-		udplossinfo = 1;
+	if (udp && interval)
+		if (buflen >= 32)
+			udplossinfo = 1;
+		else
+			fprintf(stderr, "Unable to print interval loss information if UDP buflen < 32\n");
 
 	ivers = vers_major*10000 + vers_minor*100 + vers_delta;
 
@@ -925,7 +1244,10 @@ optlen = sizeof(maxseg);
 
 	pattern( buf, buflen );
 
+#ifdef SIGPIPE
 	signal(SIGPIPE, sigpipe);
+#endif
+
 	signal(SIGINT, sigint);
 
 doit:
@@ -1202,7 +1524,7 @@ doit:
 				}
 				if (nstream > 1) b_flag = 1;
 				if (rate == 0)
-					rate = ~0;
+					rate = MAXRATE;
 				if (timeout < 0) {
 					fputs("KO\n", stdout);
 					mes("invalid timeout");
@@ -1246,64 +1568,110 @@ doit:
 			}
 		}
 
-		if (!client)
-			host = (char *)inet_ntoa(clientaddr);
+		if (!client) {
+		    if (af == AF_INET) {
+			inet_ntop(af, &clientaddr.s_addr, hostbuf, sizeof(hostbuf));
+		    }
+#ifdef AF_INET6
+		    else if (af == AF_INET6) {
+			inet_ntop(af, clientaddr6.s6_addr, hostbuf, sizeof(hostbuf));
+		    }
+#endif
+		    host = hostbuf;
+		}
 
 		if ((stream_idx > 0) && skip_data)
 			break;
 
 		bzero((char *)&sinme[stream_idx], sizeof(sinme[stream_idx]));
 		bzero((char *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
+
+#ifdef AF_INET6
+		bzero((char *)&sinme6[stream_idx], sizeof(sinme6[stream_idx]));
+		bzero((char *)&sinhim6[stream_idx], sizeof(sinhim6[stream_idx]));
+#endif
+
 		if (((trans && !reverse) && (stream_idx > 0)) ||
 		    ((!trans && reverse) && (stream_idx > 0)) ||
 		    (client && (stream_idx == 0))) {
 			/* xmitr initiates connections (unless reversed) */
 			if (client) {
-				if (atoi(host) > 0 )  {
-					/* Numeric */
-					sinhim[stream_idx].sin_family = AF_INET;
-#ifdef cray
-					addr_tmp = inet_addr(host);
-					sinhim[stream_idx].sin_addr = addr_tmp;
-#else
-					sinhim[stream_idx].sin_addr.s_addr = inet_addr(host);
+				if (numeric4addr || numeric6addr)  {
+					if (af == AF_INET) {
+						sinhim[stream_idx].sin_family = af;
+						inet_pton(af, host, &sinhim[stream_idx].sin_addr.s_addr);
+					}
+#ifdef AF_INET6
+					else if (af == AF_INET6) {
+						sinhim6[stream_idx].sin6_family = af;
+						inet_pton(af, host, sinhim6[stream_idx].sin6_addr.s6_addr);
+					}
 #endif
+					else {
+						err("unsupported AF");
+					}
 				} else {
-					if ((addr=gethostbyname(host)) == NULL)
-						err("bad hostname");
-					sinhim[stream_idx].sin_family = addr->h_addrtype;
-					bcopy(addr->h_addr,(char*)&addr_tmp, addr->h_length);
-#ifdef cray
-					sinhim[stream_idx].sin_addr = addr_tmp;
-#else
-#if _MIPS_SZLONG==64
-					bcopy((char *)&addr_tmp,(char *)&sinhim[stream_idx].sin_addr.s_addr,
-						sizeof(sinhim[stream_idx].sin_addr.s_addr));
-#else
-					sinhim[stream_idx].sin_addr.s_addr = addr_tmp;
-#endif /* _MIPS_SZ_LONG==64 */
-#endif /* cray */
+					if (af == AF_INET) {
+					    sinhim[stream_idx].sin_family = af;
+					    bcopy((char *)&(((struct sockaddr_in *)res->ai_addr)->sin_addr),
+					          (char *)&sinhim[stream_idx].sin_addr.s_addr,
+						  sizeof(sinhim[stream_idx].sin_addr.s_addr));
+					}
+#ifdef AF_INET6
+					else if (af == AF_INET6) {
+					    sinhim6[stream_idx].sin6_family = af;
+					    bcopy((char *)&(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr),
+					          (char *)&sinhim6[stream_idx].sin6_addr.s6_addr,
+						  sizeof(sinhim6[stream_idx].sin6_addr.s6_addr));
+					}
+#endif
+					else {
+						err("unsupported AF");
+					}
 				}
-			}
-			else {
-				sinhim[stream_idx].sin_family = AF_INET;
+			} else {
+				sinhim[stream_idx].sin_family = af;
 				sinhim[stream_idx].sin_addr = clientaddr;
+#ifdef AF_INET6
+				sinhim6[stream_idx].sin6_family = af;
+				sinhim6[stream_idx].sin6_addr = clientaddr6;
+#endif
 			}
-			if (stream_idx == 0)
+			if (stream_idx == 0) {
 				sinhim[stream_idx].sin_port = htons(ctlport);
-			else
+#ifdef AF_INET6
+				sinhim6[stream_idx].sin6_port = htons(ctlport);
+#endif
+			} else {
 				sinhim[stream_idx].sin_port = htons(port + stream_idx - 1);
+#ifdef AF_INET6
+				sinhim6[stream_idx].sin6_port = htons(port + stream_idx - 1);
+#endif
+			}
 			sinme[stream_idx].sin_port = 0;		/* free choice */
+#ifdef AF_INET6
+			sinme6[stream_idx].sin6_port = 0;	/* free choice */
+#endif
 		} else {
 			/* rcvr listens for connections (unless reversed) */
-			if (stream_idx == 0)
-				sinme[stream_idx].sin_port =  htons(ctlport);
-			else
-				sinme[stream_idx].sin_port =  htons(port + stream_idx - 1);
+			if (stream_idx == 0) {
+				sinme[stream_idx].sin_port =   htons(ctlport);
+#ifdef AF_INET6
+				sinme6[stream_idx].sin6_port = htons(ctlport);
+#endif
+			} else {
+				sinme[stream_idx].sin_port =   htons(port + stream_idx - 1);
+#ifdef AF_INET6
+				sinme6[stream_idx].sin6_port = htons(port + stream_idx - 1);
+#endif
+			}
 		}
-		sinme[stream_idx].sin_family = AF_INET;
+		sinme[stream_idx].sin_family = af;
+#ifdef AF_INET6
+		sinme6[stream_idx].sin6_family = af;
+#endif
 
-		if ((fd[stream_idx] = socket(AF_INET, (udp && (stream_idx != 0))?SOCK_DGRAM:SOCK_STREAM, 0)) < 0)
+		if ((fd[stream_idx] = socket(domain, (udp && (stream_idx != 0))?SOCK_DGRAM:SOCK_STREAM, 0)) < 0)
 			err("socket");
 
 		if (stream_idx == nstream) {
@@ -1314,6 +1682,7 @@ doit:
 			}
 			if (brief <= 0)
 				mes("socket");
+#ifdef HAVE_SETPRIO
 			if (priority && (brief <= 0)) {
 				errno = 0;
 				priority = getpriority(PRIO_PROCESS, 0);
@@ -1325,6 +1694,7 @@ doit:
 						trans ? "-t" : "-r", ident,
 						priority);
 			}
+#endif
 			if (trans) {
 			    if (brief <= 0) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
@@ -1339,8 +1709,8 @@ doit:
 				    fprintf(stdout,"nuttcp-t%s: time limit = %.2f second%s\n",
 					ident, timeout,
 					(timeout == 1.0)?"":"s");
-				if (rate != ~0)
-				    fprintf(stdout,"nuttcp-t%s: rate limit = %.3f Mb/s (%s)\n",
+				if (rate != MAXRATE)
+				    fprintf(stdout,"nuttcp-t%s: rate limit = %.3f Mbps (%s)\n",
 					ident, (double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 			    }
@@ -1361,12 +1731,30 @@ doit:
 			}
 		}
 
-		if( setsockopt(fd[stream_idx], SOL_SOCKET, SO_REUSEADDR,
-			(void *)&one, sizeof(one)) < 0)
+		if (setsockopt(fd[stream_idx], SOL_SOCKET, SO_REUSEADDR, (void *)&one, sizeof(one)) < 0)
 				err("setsockopt: so_reuseaddr");
 
-		if (bind(fd[stream_idx], (struct sockaddr *)&sinme[stream_idx], sizeof(sinme[stream_idx])) < 0)
+#ifdef IPV6_V6ONLY
+		if ((af == AF_INET6) && !v4mapped) {
+			if (setsockopt(fd[stream_idx], IPPROTO_IPV6, IPV6_V6ONLY, (void *)&one, sizeof(int)) < 0) {
+				err("setsockopt: ipv6_only");
+			}
+		}
+#endif
+
+		if (af == AF_INET) {
+		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme[stream_idx], sizeof(sinme[stream_idx])) < 0)
 			err("bind");
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme6[stream_idx], sizeof(sinme6[stream_idx])) < 0)
+			err("bind");
+		}
+#endif
+		else {
+		    err("unsupported AF");
+		}
 
 		if (stream_idx > 0)  {
 		    if (trans) {
@@ -1408,11 +1796,22 @@ doit:
 			 * (unless reversed by the flip option)
 			 */
 			if (options && (stream_idx > 0))  {
-				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, &one, sizeof(one)) < 0)
+				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
 					err("setsockopt");
 			}
 			usleep(20000);
-			if(connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]) ) < 0) {
+			if (af == AF_INET) {
+				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
+			}
+#ifdef AF_INET6
+			else if (af == AF_INET6) {
+				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim6[stream_idx], sizeof(sinhim6[stream_idx]));
+			}
+#endif
+			else {
+			    err("unsupported AF");
+			}
+			if(error_num < 0) {
 				if (!trans && (stream_idx == 0))
 					err("connect");
 				if (stream_idx > 0) {
@@ -1444,9 +1843,23 @@ doit:
 				}
 			}
 			if ((stream_idx == nstream) && (brief <= 0)) {
+				char tmphost[ADDRSTRLEN] = "\0";
+				if (af == AF_INET) {
+				    inet_ntop(af, &sinhim[stream_idx].sin_addr.s_addr,
+					      tmphost, sizeof(tmphost));
+				}
+#ifdef AF_INET6
+				else if (af == AF_INET6) {
+				    inet_ntop(af, sinhim6[stream_idx].sin6_addr.s6_addr,
+					      tmphost, sizeof(tmphost));
+				}
+#endif
+				else {
+				    err("unsupported AF");
+				}
 				fprintf(stdout,"nuttcp%s%s: connect to %s\n", 
 					trans?"-t":"-r", ident,
-					(char *)inet_ntoa(sinhim[stream_idx].sin_addr));
+					tmphost);
 			}
 		    } else {
 			/* The receiver listens for the connection
@@ -1458,22 +1871,49 @@ doit:
 					err("setsockopt");
 			}
 			fromlen = sizeof(frominet);
-			domain = AF_INET;
 			if((nfd=accept(fd[stream_idx], (struct sockaddr *)&frominet, &fromlen) ) < 0)
 				err("accept");
+			af = frominet.ss_family;
 			close(fd[stream_idx]);
 			fd[stream_idx]=nfd;
-			{ struct sockaddr_in peer;
-			  int peerlen = sizeof(peer);
-			  if (getpeername(fd[stream_idx], (struct sockaddr *) &peer, 
+			if (af == AF_INET) {
+			    struct sockaddr_in peer;
+			    socklen_t peerlen = sizeof(peer);
+			    if (getpeername(fd[stream_idx], (struct sockaddr *) &peer, 
 					&peerlen) < 0) {
 				err("getpeername");
-			  }
-			if ((stream_idx == nstream) && (brief <= 0))
+			    }
+			    if ((stream_idx == nstream) && (brief <= 0)) {
+				char tmphost[ADDRSTRLEN] = "\0";
+				inet_ntop(af, &peer.sin_addr.s_addr,
+					  tmphost, sizeof(tmphost));
 				fprintf(stdout,"nuttcp%s%s: accept from %s\n", 
 					trans?"-t":"-r", ident,
-					(char *)inet_ntoa(peer.sin_addr));
-			if (stream_idx == 0) clientaddr = peer.sin_addr;
+					tmphost);
+			    }
+			    if (stream_idx == 0) clientaddr = peer.sin_addr;
+			}
+#ifdef AF_INET6
+			else if (af == AF_INET6) {
+			    struct sockaddr_in6 peer;
+			    socklen_t peerlen = sizeof(peer);
+			    if (getpeername(fd[stream_idx], (struct sockaddr *) &peer, 
+					&peerlen) < 0) {
+				err("getpeername");
+			    }
+			    if ((stream_idx == nstream) && (brief <= 0)) {
+				char tmphost[ADDRSTRLEN] = "\0";
+				inet_ntop(af, peer.sin6_addr.s6_addr,
+					  tmphost, sizeof(tmphost));
+				fprintf(stdout,"nuttcp%s%s: accept from %s\n", 
+					trans?"-t":"-r", ident,
+					tmphost);
+			    }
+			    if (stream_idx == 0) clientaddr6 = peer.sin6_addr;
+			}
+#endif
+			else {
+			    err("unsupported AF");
 			}
 		    }
 		}
@@ -1514,65 +1954,66 @@ doit:
 		setitimer(ITIMER_REAL, &itimer, 0);
 	}
 
-	if (interval && clientserver && client && trans) {
-		if ((pid = fork()) == (pid_t)-1)
-			err("can't fork");
-		if (pid == 0) {
-			signal(SIGALRM, SIG_IGN);
-			signal(SIGINT, SIG_DFL);
-			signal(SIGTERM, sigterm);
-
-			/* don't gobble up parent's input too
-			 * set stdin unbuffered */
-			setbuf(stdin, NULL);
-
-			for ( stream_idx = 1; stream_idx <= nstream;
-					      stream_idx++ )
-				close(fd[stream_idx]);
-
-			*srvrbuf = '\0';
-			while (fgets(intervalbuf, sizeof(intervalbuf),
-				     stdin)) {
-				if (strncmp(intervalbuf, "nuttcp-r", 8) == 0) {
-					if (brief <= 0) {
-						if (strlen(intervalbuf) +
-							strlen(ident) >
-							  sizeof(srvrbuf) -
-							    strlen(srvrbuf) - 1)
-							break;
-						if (*ident) {
-							cp1 = srvrbuf;
-							strcat(cp1, "nuttcp-r");
-							cp1 += 8;
-							strcat(cp1, ident);
-							cp1 += strlen(ident);
-							strcat(cp1,
-							       intervalbuf + 8);
-						}
-						else
-							strcat(srvrbuf,
-							       intervalbuf);
-					}
-					continue;
-				}
-				if (strncmp(intervalbuf, "DONE", 4) == 0)
-					break;
-				if (*ident)
-					fprintf(stdout, "%s: ", ident + 1);
-				fputs(intervalbuf, stdout);
-				fflush(stdout);
-			}
-			sleep(INT_MAX);
-			if (brief <= 0) {
-				fputs(srvrbuf, stdout);
-			}
-			exit(0);
-		}
-	}
+	if (interval && clientserver && client && trans)
+		do_poll = 1;
 
 	if (traceroute && clientserver) {
+		char path[64];
+		char *cmd;
+
 		fflush(stdout);
 		fflush(stderr);
+		cmd = "traceroute";
+#ifdef AF_INET6
+		if (af == AF_INET6)
+			cmd = "traceroute6";
+#endif
+		if (client) {
+			if ((pid = fork()) == (pid_t)-1)
+				err("can't fork");
+			if (pid != 0) {
+				while ((wait_pid = wait(&pidstat)) != pid) {
+					if (wait_pid == (pid_t)-1) {
+						if (errno == ECHILD)
+							break;
+						err("wait failed");
+					}
+				}
+				fflush(stdout);
+			}
+			else {
+				signal(SIGINT, SIG_DFL);
+				close(2);
+				dup(1);
+				execlp(cmd, cmd, host, NULL);
+				if (errno == ENOENT) {
+					strcpy(path, "/usr/local/bin/");
+					strcat(path, cmd);
+					execlp(path, cmd, host, NULL);
+				}
+				if (errno == ENOENT) {
+					strcpy(path, "/usr/sbin/");
+					strcat(path, cmd);
+					execlp(path, cmd, host, NULL);
+				}
+				if (errno == ENOENT) {
+					strcpy(path, "/sbin/");
+					strcat(path, cmd);
+					execlp(path, cmd, host, NULL);
+				}
+				perror("execlp failed");
+				fprintf(stderr, "failed to execute %s\n", cmd);
+				fflush(stdout);
+				fflush(stderr);
+				exit(0);
+			}
+		}
+		fprintf(stdout, "\n");
+		if (intr) {
+			intr = 0;
+			fprintf(stdout, "\n");
+			signal(SIGINT, sigint);
+		}
 		if (!skip_data) {
 			for ( stream_idx = 1; stream_idx <= nstream;
 					      stream_idx++ )
@@ -1622,11 +2063,24 @@ doit:
 			}
 			close(2);
 			dup(1);
-			execlp("/usr/local/bin/traceroute", "traceroute",
-				host, NULL);
-			if (errno == ENOENT)
-				execlp("traceroute", "traceroute", host, NULL);
-			perror("failed to execute traceroute");
+			execlp(cmd, cmd, host, NULL);
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/local/bin/");
+				strcat(path, cmd);
+				execlp(path, cmd, host, NULL);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/sbin/");
+				strcat(path, cmd);
+				execlp(path, cmd, host, NULL);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/sbin/");
+				strcat(path, cmd);
+				execlp(path, cmd, host, NULL);
+			}
+			perror("execlp failed");
+			fprintf(stderr, "failed to execute %s\n", cmd);
 			fflush(stdout);
 			fflush(stderr);
 			if (!inetd)
@@ -1638,6 +2092,24 @@ doit:
 	prep_timer();
 	errno = 0;
 	stream_idx = 0;
+	if (do_poll) {
+		long flags;
+
+		pollfds[0].fd = 0;
+		pollfds[0].events = POLLIN | POLLPRI;
+		pollfds[0].revents = 0;
+		for ( i = 1; i <= nstream; i++ ) {
+			pollfds[i].fd = fd[i];
+			pollfds[i].events = POLLOUT;
+			pollfds[i].revents = 0;
+		}
+		flags = fcntl(0, F_GETFL, 0);
+		if (flags < 0)
+			err("fcntl 1");
+		flags |= O_NONBLOCK;
+		if (fcntl(0, F_SETFL, flags) < 0)
+			err("fcntl 2");
+	}
 	if (sinkmode) {      
 		register int cnt;
 		if (trans)  {
@@ -1650,6 +2122,10 @@ doit:
 /*			bzero(buf + 8, 4);				*/
 /*			bzero(buf + 12, 4);				*/
 			nbytes += buflen;
+			if (do_poll && (format & DEBUGPOLL)) {
+				fprintf(stdout, "do_poll is set\n");
+				fflush(stdout);
+			}
 			if (udplossinfo)
 				bcopy(&nbytes, buf + 24, 8);
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
@@ -1657,6 +2133,83 @@ doit:
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
 				stream_idx = ++stream_idx % nstream;
+				if (do_poll &&
+				       ((pollst = poll(pollfds, nstream + 1, 5000))
+						> 0) &&
+				       (pollfds[0].revents & (POLLIN | POLLPRI)) && !intr) {
+					/* check for server output */
+#ifdef DEBUG
+					if (format & DEBUGPOLL) {
+						fprintf(stdout, "got something %d: ", i);
+				    for ( i = 0; i < nstream + 1; i++ ) {
+					if (pollfds[i].revents & POLLIN) {
+						fprintf(stdout, " rfd %d",
+							pollfds[i].fd);
+					}
+					if (pollfds[i].revents & POLLPRI) {
+						fprintf(stdout, " pfd %d",
+							pollfds[i].fd);
+					}
+					if (pollfds[i].revents & POLLOUT) {
+						fprintf(stdout, " wfd %d",
+							pollfds[i].fd);
+					}
+					if (pollfds[i].revents & POLLERR) {
+						fprintf(stdout, " xfd %d",
+							pollfds[i].fd);
+					}
+					if (pollfds[i].revents & POLLHUP) {
+						fprintf(stdout, " hfd %d",
+							pollfds[i].fd);
+					}
+					if (pollfds[i].revents & POLLNVAL) {
+						fprintf(stdout, " nfd %d",
+							pollfds[i].fd);
+					}
+				    }
+						fprintf(stdout, "\n");
+						fflush(stdout);
+				    }
+					if (format & DEBUGPOLL) {
+						fprintf(stdout, "got server output: %s", intervalbuf);
+						fflush(stdout);
+					}
+#endif
+					while (fgets(intervalbuf, sizeof(intervalbuf), stdin))
+					{
+					if (strncmp(intervalbuf, "DONE", 4) == 0) {
+						if (format & DEBUGPOLL) {
+							fprintf(stdout, "got DONE\n");
+							fflush(stdout);
+						}
+						got_done = 1;
+						do_poll = 0;
+					}
+					else if (strncmp(intervalbuf, "nuttcp-r", 8) == 0) {
+						if (brief <= 0) {
+							if (*ident) {
+								fputs("nuttcp-r", stdout);
+								fputs(ident, stdout);
+								fputs(intervalbuf + 8, stdout);
+							}
+							else
+								fputs(intervalbuf, stdout);
+							fflush(stdout);
+						}
+					}
+					else {
+						if (*ident)
+							fprintf(stdout, "%s: ", ident + 1);
+						fputs(intervalbuf, stdout);
+						fflush(stdout);
+					}
+					}
+				}
+				if (do_poll && (pollst < 0)) {
+					if (errno == EINTR)
+						break;
+					err("poll");
+				}
 			}
 			nbytes -= buflen;
 			if (intr)
@@ -1697,7 +2250,7 @@ doit:
 						    bcopy(buf + 24, &ntbytesc,
 								8);
 						    first_read = 0;
-						    if (ntbytesc > 0x100000000)
+						    if (ntbytesc > 0x100000000ull)
 							    need_swap = 1;
 						    if (!need_swap)
 							    continue;
@@ -1741,7 +2294,7 @@ doit:
 			}
 		}
 	}
-	if (errno) {
+	if (errno && (errno != EAGAIN)) {
 		if ((errno != EINTR) && (!clientserver || client)) err("IO");
 	}
 	itimer.it_value.tv_sec = 0;
@@ -1781,12 +2334,38 @@ doit:
 	if (udp && !trans)
 		realt -= correction * 0.5;
 
-	sprintf(srvrbuf, "%.3f", (double)nbytes/1024/1024);
+	sprintf(srvrbuf, "%.4f", (double)nbytes/1024/1024);
 	sscanf(srvrbuf, "%lf", &MB);
 
+	if (interval && clientserver && client && trans && !got_done) {
+		long flags;
+
+		if (format & DEBUGPOLL) {
+			fprintf(stdout, "getting rest of server output\n");
+			fflush(stdout);
+		}
+		flags = fcntl(0, F_GETFL, 0);
+		if (flags < 0)
+			err("fcntl 3");
+		flags &= ~O_NONBLOCK;
+		if (fcntl(0, F_SETFL, flags) < 0)
+			err("fcntl 4");
+		while (fgets(intervalbuf, sizeof(intervalbuf), stdin)) {
+			if (strncmp(intervalbuf, "DONE", 4) == 0) {
+				if (format & DEBUGPOLL) {
+					fprintf(stdout, "got DONE\n");
+					fflush(stdout);
+				}
+				break;
+			}
+			if (*ident)
+				fprintf(stdout, "%s: ", ident + 1);
+			fputs(intervalbuf, stdout);
+			fflush(stdout);
+		}
+	}
+
 	if (clientserver && client) {
-		/* set stdin unbuffered just to be safe */
-		setbuf(stdin, NULL);
 		cp1 = srvrbuf;
 		while (fgets(cp1, sizeof(srvrbuf) - (cp1 - srvrbuf), stdin)) {
 			if (*(cp1 + strlen(cp1) - 1) != '\n') {
@@ -1841,19 +2420,6 @@ doit:
 		got_srvr_output = 1;
 	}
 
-	if (interval && clientserver && !client && !trans) {
-		if (udp)
-			/* sleep longer for weird case where high rate
-			 * UDP data effectively prevents interval reports
-			 * on TCP control channel from being received
-			 * until transmission is complete - gives time
-			 * for interval reports to be output before
-			 * processing final server output */
-			usleep(500000);
-		else
-			usleep(200000);
-	}
-
 	if (brief <= 0) {
 		fprintf(stdout, "nuttcp%s%s: " PERF_FMT_OUT,
 			trans?"-t":"-r", ident,
@@ -1891,7 +2457,7 @@ doit:
 		sscanf(stats, CPU_STATS_FMT_IN, &cpu_util);
 
 	if (brief && clientserver && client) {
-		if (brief < 0)
+		if ((brief < 0) || interval)
 			fprintf(stdout, "\n");
 		if (udp) {
 			if (trans) {
@@ -1968,16 +2534,6 @@ cleanup:
 		if (client) {
 			if (brief <= 0)
 				fputs("\n", stdout);
-			if (interval && trans) {
-				kill(pid, SIGTERM);
-				while ((wait_pid = wait(&pidstat)) != pid) {
-					if (wait_pid == (pid_t)-1) {
-						if (errno == ECHILD)
-							break;
-						err("wait failed");
-					}
-				}
-			}
 			if (brief <= 0) {
 				if (got_srvr_output) {
 					fputs(srvrbuf, stdout);
@@ -2009,6 +2565,9 @@ cleanup:
 		signal(SIGALRM, SIG_DFL);
 		bzero((char *)&frominet, sizeof(frominet));
 		bzero((char *)&clientaddr, sizeof(clientaddr));
+#ifdef AF_INET6
+		bzero((char *)&clientaddr6, sizeof(clientaddr));
+#endif
 		cput = 0.000001;
 		realt = 0.000001;
 		nbytes = 0;
@@ -2022,10 +2581,11 @@ cleanup:
 		rcvwin = origrcvwin;
 		nstream = 1;
 		b_flag = 0;
-		rate = ~0;
+		rate = MAXRATE;
 		irate = 0;
 		timeout = 0.0;
 		interval = 0.0;
+		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
 		ident = "";
@@ -2041,15 +2601,22 @@ cleanup:
 		format = 0;
 		traceroute = 0;
 		skip_data = 0;
+
+#ifdef HAVE_SETPRIO
 		priority = 0;
+#endif
+
 		brief = 0;
 		done = 0;
 		got_begin = 0;
+		res = NULL;
 		if (!oneshot)
 			goto doit;
 	}
 	if (!sinkmode && !trans)
 		close(realstdout);
+	if (res)
+		freeaddrinfo(res);
 	exit(0);
 
 usage:
@@ -2058,8 +2625,7 @@ usage:
 }
 
 void
-err(s)
-char *s;
+err( char *s )
 {
 	fprintf(stderr,"nuttcp%s%s: ", trans?"-t":"-r", ident);
 	perror(s);
@@ -2068,17 +2634,14 @@ char *s;
 }
 
 void
-mes(s)
-char *s;
+mes( char *s )
 {
 	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d: %s\n", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta, s);
 }
 
 void
-pattern( cp, cnt )
-register char *cp;
-register int cnt;
+pattern( register char *cp, register int cnt )
 {
 	register char c;
 	c = 0;
@@ -2087,36 +2650,6 @@ register int cnt;
 		*cp++ = (c++&0x7F);
 	}
 }
-
-
-#if defined(SYSV)
-static void
-getrusage(ignored, ru)
-    int ignored;
-    register struct rusage *ru;
-{
-    struct tms buf;
-
-    times(&buf);
-
-    ru->ru_stime.tv_sec  = buf.tms_stime / HZ;
-    ru->ru_stime.tv_usec = (buf.tms_stime % HZ) * (1000000/HZ);
-    ru->ru_utime.tv_sec  = buf.tms_utime / HZ;
-    ru->ru_utime.tv_usec = (buf.tms_utime % HZ) * (1000000/HZ);
-}
-
-#ifndef sgi	/* it's a real system call */
-/*ARGSUSED*/
-static 
-gettimeofday(tp, zp)
-    struct timeval *tp;
-    struct timezone *zp;
-{
-    tp->tv_sec = time(0);
-    tp->tv_usec = 0;
-}
-#endif
-#endif /* SYSV */
 
 /*
  *			P R E P _ T I M E R
@@ -2135,8 +2668,7 @@ prep_timer()
  * 
  */
 double
-read_timer(str,len)
-char *str;
+read_timer( char *str, int len )
 {
 	struct timeval timedol;
 	struct rusage ru1;
@@ -2163,17 +2695,12 @@ char *str;
 }
 
 static void
-prusage(r0, r1, e, b, outp)
-	register struct rusage *r0, *r1;
-	struct timeval *e, *b;
-	char *outp;
+prusage( register struct rusage *r0, register struct rusage *r1, struct timeval *e, struct timeval *b, char *outp )
 {
 	struct timeval tdiff;
 	register time_t t;
 	register char *cp;
-#if !defined(SYSV)
 	register int i;
-#endif
 	int ms;
 
 	t = (r1->ru_utime.tv_sec-r0->ru_utime.tv_sec)*100+
@@ -2183,11 +2710,7 @@ prusage(r0, r1, e, b, outp)
 	ms =  (e->tv_sec-b->tv_sec)*100 + (e->tv_usec-b->tv_usec)/10000;
 
 #define END(x)	{while(*x) x++;}
-#if defined(SYSV)
-	cp = "%Uuser %Ssys %Ereal %P";
-#else
 	cp = "%Uuser %Ssys %Ereal %P %Xi+%Dd %Mmaxrss %F+%Rpf %Ccsw";
-#endif
 	for (; *cp; cp++)  {
 		if (*cp != '%')
 			*outp++ = *cp;
@@ -2215,7 +2738,6 @@ prusage(r0, r1, e, b, outp)
 			END(outp);
 			break;
 
-#if !defined(SYSV)
 		case 'W':
 			i = r1->ru_nswap - r0->ru_nswap;
 			sprintf(outp,"%d", i);
@@ -2269,15 +2791,13 @@ prusage(r0, r1, e, b, outp)
 				r1->ru_nivcsw-r0->ru_nivcsw );
 			END(outp);
 			break;
-#endif /* !SYSV */
 		}
 	}
 	*outp = '\0';
 }
 
 static void
-tvadd(tsum, t0, t1)
-	struct timeval *tsum, *t0, *t1;
+tvadd( struct timeval *tsum, struct timeval *t0, struct timeval *t1 )
 {
 
 	tsum->tv_sec = t0->tv_sec + t1->tv_sec;
@@ -2287,8 +2807,7 @@ tvadd(tsum, t0, t1)
 }
 
 static void
-tvsub(tdiff, t1, t0)
-	struct timeval *tdiff, *t1, *t0;
+tvsub( struct timeval *tdiff, struct timeval *t1, struct timeval *t0 )
 {
 
 	tdiff->tv_sec = t1->tv_sec - t0->tv_sec;
@@ -2298,9 +2817,7 @@ tvsub(tdiff, t1, t0)
 }
 
 static void
-psecs(l,cp)
-long l;
-register char *cp;
+psecs( long l, register char *cp )
 {
 	register int i;
 
@@ -2324,11 +2841,11 @@ register char *cp;
 /*
  *			N R E A D
  */
-Nread( fd, buf, count )
-	char* buf;
+int
+Nread( int fd, char *buf, int count )
 {
-	struct sockaddr_in from;
-	int len = sizeof(from);
+	struct sockaddr_storage from;
+	socklen_t len = sizeof(from);
 	register int cnt;
 	if( udp )  {
 		cnt = recvfrom( fd, buf, count, 0, (struct sockaddr *)&from, &len );
@@ -2347,8 +2864,8 @@ Nread( fd, buf, count )
 /*
  *			N W R I T E
  */
-Nwrite( fd, buf, count )
-	char* buf;
+int
+Nwrite( int fd, char *buf, int count )
 {
 	struct timeval timedol;
 	struct timeval td;
@@ -2381,7 +2898,17 @@ Nwrite( fd, buf, count )
 /*	bcopy(&timedol.tv_usec, buf + 12, 4);				*/
 	if( udp )  {
 again:
-		cnt = sendto( fd, buf, count, 0, (struct sockaddr *)&sinhim[stream_idx + 1], sizeof(sinhim[stream_idx + 1]) );
+		if (af == AF_INET) {
+			cnt = sendto( fd, buf, count, 0, (struct sockaddr *)&sinhim[stream_idx + 1], sizeof(sinhim[stream_idx + 1]) );
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+			cnt = sendto( fd, buf, count, 0, (struct sockaddr *)&sinhim6[stream_idx + 1], sizeof(sinhim6[stream_idx + 1]) );
+		}
+#endif
+		else {
+			err("unsupported AF");
+		}
 		numCalls++;
 		if( cnt<0 && errno == ENOBUFS )  {
 			delay(18000);
@@ -2395,7 +2922,8 @@ again:
 	return(cnt);
 }
 
-delay(us)
+int
+delay( int us )
 {
 	struct timeval tv;
 
@@ -2415,10 +2943,7 @@ delay(us)
  * grouping as it is written with.  Written by Robert S. Miles, BRL.
  */
 int
-mread(fd, bufp, n)
-int fd;
-register char	*bufp;
-unsigned	n;
+mread( int fd, register char *bufp, unsigned n )
 {
 	register unsigned	count = 0;
 	register int		nread;
