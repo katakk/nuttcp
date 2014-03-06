@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.0.2
+ *	N U T T C P . C						v5.0.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.0.3, Bill Fink, 6-Nov-03
+ *	Kill server transmission if control connection goes away
+ *	Kill 3rd party nuttcp if control connection goes away
  * V5.0.2, Bill Fink, 4-Nov-03
  *	Fix bug: some dummy wasn't big enough :-)
  * V5.0.1, Bill Fink, 3-Nov-03
@@ -361,7 +364,7 @@ int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
 int vers_minor = 0;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -632,6 +635,9 @@ sigalarm( int signum )
 	int i;
 	char *cp1, *cp2;
 
+	if (host3 && clientserver && !client)
+		return;
+
 	if (interval && !trans) {
 		if ((udp && !got_begin) || done)
 			return;
@@ -794,6 +800,7 @@ main( int argc, char **argv )
 	int error_num;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res = NULL;
+	short save_events;
 
 /*  nick code  */
 optlen = sizeof(maxseg);
@@ -2228,22 +2235,51 @@ doit:
 			exit(0);
 		}
 		else {
-			if (!inetd) {
-				if ((pid = fork()) == (pid_t)-1)
-					err("can't fork");
-				if (pid != 0) {
-					while ((wait_pid = wait(&pidstat))
-							!= pid) {
-						if (wait_pid == (pid_t)-1) {
-							if (errno == ECHILD)
-								break;
-							err("wait failed");
+			if ((pid = fork()) == (pid_t)-1)
+				err("can't fork");
+			if (pid != 0) {
+				sigact.sa_handler = &sigalarm;
+				sigemptyset(&sigact.sa_mask);
+				sigact.sa_flags = 0;
+				sigaction(SIGALRM, &sigact, 0);
+				alarm(10);
+				while ((wait_pid = wait(&pidstat))
+						!= pid) {
+					if (wait_pid == (pid_t)-1) {
+						if (errno == ECHILD)
+							break;
+						if (errno == EINTR) {
+							pollfds[0].fd =
+							    fileno(ctlconn);
+							pollfds[0].events =
+							    POLLIN | POLLPRI;
+							pollfds[0].revents = 0;
+							if ((poll(pollfds, 1, 0)
+									> 0)
+								&& (pollfds[0].revents &
+									(POLLIN | POLLPRI))) {
+								kill(pid,
+								     SIGINT);
+								sleep(1);
+								kill(pid,
+								     SIGINT);
+								continue;
+							}
+							sigact.sa_handler =
+								&sigalarm;
+							sigemptyset(&sigact.sa_mask);
+							sigact.sa_flags = 0;
+							sigaction(SIGALRM,
+								  &sigact, 0);
+							alarm(10);
+							continue;
 						}
+						err("wait failed");
 					}
-					fprintf(stdout, "DONE\n");
-					fflush(stdout);
-					goto cleanup;
 				}
+				fprintf(stdout, "DONE\n");
+				fflush(stdout);
+				goto cleanup;
 			}
 			close(2);
 			dup(1);
@@ -2543,6 +2579,18 @@ doit:
 			if (udplossinfo)
 				bcopy(&nbytes, buf + 24, 8);
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
+				if (clientserver && !client
+						 && ((nbuf & 0x3FF) == 0)) {
+					pollfds[0].fd = 0;
+					save_events = pollfds[0].events;
+					pollfds[0].events = POLLIN | POLLPRI;
+					pollfds[0].revents = 0;
+					if ((poll(pollfds, 1, 0) > 0)
+						&& (pollfds[0].revents &
+							(POLLIN | POLLPRI)))
+						break;
+					pollfds[0].events = save_events;
+				}
 				nbytes += buflen;
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
