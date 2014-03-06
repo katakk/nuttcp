@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v4.0.3
+ *	N U T T C P . C						v4.1.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V4.1.1, David Lapsley and Bill Fink, 24-Oct-03
+ *	Added "-fparse" format option to generate key=value parsable output
+ *	Fix bug: need to open data connection on abortconn to clear listen
  * V4.0.3, Rob Scott, 13-Oct-03
  *	Minor tweaks to output format for alignment
  *	Interval option "-i" with no explicit value sets interval to 1.0
@@ -273,7 +276,7 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 			  " = %.4f Mbps\n"
 #define PERF_FMT_BRIEF	  "%10.4f MB / %6.2f sec = %9.4f Mbps %d %%TX %d %%RX"
 #define PERF_FMT_BRIEF2	  "%10.4f MB / %6.2f sec = %9.4f Mbps %d %%%s"
-#define PERF_FMT_BRIEF3	  " Trans: %.3f MB"
+#define PERF_FMT_BRIEF3	  " Trans: %.4f MB"
 #define PERF_FMT_INTERVAL  "%10.4f MB / %6.2f sec = %9.4f Mbps"
 #define PERF_FMT_INTERVAL2 " Tot: %10.4f MB / %6.2f sec = %9.4f Mbps"
 #define PERF_FMT_INTERVAL3 " Trans: %10.4f MB"
@@ -288,6 +291,30 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #define DROP_FMT	" %lld / %lld drop/pkt"
 #define DROP_FMT_BRIEF	" %lld / %lld drop/pkt"
 #define DROP_FMT_INTERVAL " %5lld / %5lld ~drop/pkt"
+
+/* Parsable output formats */
+
+#define P_PERF_FMT_OUT	  "megabytes=%.4f real_seconds=%.2f " \
+                          "rate_KBps=%.2f rate_Mbps=%.4f\n"
+#define P_PERF_FMT_BRIEF  "megabytes=%.4f real_seconds=%.2f rate_Mbps=%.4f " \
+			  "tx_cpu=%d rx_cpu=%d"
+#define P_PERF_FMT_BRIEF3 " tx_megabytes=%.4f"
+#define P_PERF_FMT_INTERVAL  "megabytes=%.4f real_sec=%.2f rate_Mbps=%.4f"
+#define P_PERF_FMT_INTERVAL2 " total_megabytes=%.4f total_real_sec=%.2f" \
+			     " total_rate_Mbps=%.4f"
+#define P_PERF_FMT_INTERVAL3 " tx_megabytes=%.4f"
+#define P_PERF_FMT_INTERVAL4 " tx_total_megabytes=%.4f"
+#define P_PERF_FMT_IN	  "megabytes=%lf real_seconds=%lf rate_KBps=%lf " \
+			  "rate_Mbps=%lf\n"
+#define P_CPU_STATS_FMT_IN  "user=%*f system=%*f elapsed=%*d:%*d cpu=%d%%"
+#define P_CPU_STATS_FMT_IN2 "user=%*f system=%*f elapsed=%*d:%*d:%*d cpu=%d%%"
+
+#define P_LOSS_FMT		" data_loss=%.2f"
+#define P_LOSS_FMT_BRIEF	" data_loss=%.2f"
+#define P_LOSS_FMT_INTERVAL	" data_loss=%.2f" 
+#define P_DROP_FMT		" drop=%lld pkt=%lld"
+#define P_DROP_FMT_BRIEF	" drop=%lld pkt=%lld"
+#define P_DROP_FMT_INTERVAL	" drop=%lld pkt=%lld"
 
 #define HELO_FMT	"HELO nuttcp v%d.%d.%d\n"
 
@@ -308,6 +335,7 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #define	NOPERCENTLOSS		0x10	/* don't give percent loss for "-i" */
 #define DEBUGPOLL		0x20	/* add info to assist with debugging
 					 * polling for interval reports */
+#define PARSE			0x40	/* generate key=value parsable output */
 
 void sigpipe( int signum );
 void sigint( int signum );
@@ -327,8 +355,8 @@ int delay( int us );
 int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 4;
-int vers_minor = 0;
-int vers_delta = 3;
+int vers_minor = 1;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -405,6 +433,7 @@ int do_poll = 0;		/* set to read interval reports (client xmit) */
 int got_done = 0;		/* set when read last of interval reports */
 int reverse = 0;		/* reverse direction of data connection open */
 int format = 0;			/* controls formatting of output */
+char fmt[257];
 int traceroute = 0;		/* do traceroute back to client if set */
 int skip_data = 0;		/* skip opening of data channel */
 
@@ -531,6 +560,7 @@ Usage (transmitter): nuttcp -t [-options] host [ <in ]\n\
 	-frunningtotal	also give cumulative stats on interval reports\n\
 	-f-drops	don't give packet drop info on brief output (UDP)\n\
 	-f-percentloss	don't give %%loss info on brief output (UDP)\n\
+	-fparse		generate key=value parsable output\n\
 ";	
 
 char stats[128];
@@ -619,48 +649,89 @@ sigalarm( int signum )
 			}
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
-			fprintf(stdout, PERF_FMT_INTERVAL,
+			if (format & PARSE)
+				strcpy(fmt, P_PERF_FMT_INTERVAL);
+			else
+				strcpy(fmt, PERF_FMT_INTERVAL);
+			fprintf(stdout, fmt,
 				(double)(nrbytes - pbytes)/(1024*1024), realtd,
 				(double)(nrbytes - pbytes)/realtd/125000);
 			if (udplossinfo) {
-				if (!(format & NODROPS))
-					fprintf(stdout, DROP_FMT_INTERVAL,
+				if (!(format & NODROPS)) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_DROP_FMT_INTERVAL);
+					else
+						strcpy(fmt, DROP_FMT_INTERVAL);
+					fprintf(stdout, fmt,
 						((ntbytes - ptbytes)
 							- (nrbytes - pbytes))
 								/buflen,
 						(ntbytes - ptbytes)/buflen);
-				if (!(format & NOPERCENTLOSS))
-					fprintf(stdout, LOSS_FMT_INTERVAL,
+				}
+				if (!(format & NOPERCENTLOSS)) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_LOSS_FMT_INTERVAL);
+					else
+						strcpy(fmt, LOSS_FMT_INTERVAL);
+					fprintf(stdout, fmt,
 						ntbytes == ptbytes ? 0.0 :
 						((1 - (double)(nrbytes - pbytes)
 						  /(double)(ntbytes - ptbytes))
 							*100));
+				}
 			}
 			if (format & RUNNINGTOTAL) {
-				fprintf(stdout, PERF_FMT_INTERVAL2,
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_INTERVAL2);
+				else
+					strcpy(fmt, PERF_FMT_INTERVAL2);
+				fprintf(stdout, fmt,
 					(double)nrbytes/(1024*1024), realt,
 					(double)nrbytes/realt/125000 );
 				if (udplossinfo) {
-					if (!(format & NODROPS))
-						fprintf(stdout,
-							DROP_FMT_INTERVAL,
+					if (!(format & NODROPS)) {
+						if (format & PARSE)
+							strcpy(fmt,
+							  P_DROP_FMT_INTERVAL);
+						else
+							strcpy(fmt,
+							  DROP_FMT_INTERVAL);
+						fprintf(stdout, fmt,
 							(ntbytes - nrbytes)
 								/buflen,
 							ntbytes/buflen);
-					if (!(format & NOPERCENTLOSS))
-						fprintf(stdout,
-							LOSS_FMT_INTERVAL,
+					}
+					if (!(format & NOPERCENTLOSS)) {
+						if (format & PARSE)
+							strcpy(fmt,
+							  P_LOSS_FMT_INTERVAL);
+						else
+							strcpy(fmt,
+							  LOSS_FMT_INTERVAL);
+						fprintf(stdout, fmt,
 							ntbytes == 0 ? 0.0 :
 							((1 - (double)nrbytes
 							  /(double)ntbytes)
 								*100));
+					}
 				}
 			}
 			if (udplossinfo && (format & XMITSTATS)) {
-				fprintf(stdout, PERF_FMT_INTERVAL3,
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_INTERVAL3);
+				else
+					strcpy(fmt, PERF_FMT_INTERVAL3);
+				fprintf(stdout, fmt,
 					(double)(ntbytes - ptbytes)/1024/1024);
 				if (format & RUNNINGTOTAL) {
-					fprintf(stdout, PERF_FMT_INTERVAL4,
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_PERF_FMT_INTERVAL4);
+					else
+						strcpy(fmt, PERF_FMT_INTERVAL4);
+					fprintf(stdout, fmt,
 						(double)ntbytes/1024/1024);
 					if (format & DEBUGINTERVAL)
 						fprintf(stdout, " Pre: %.4f MB",
@@ -947,6 +1018,8 @@ optlen = sizeof(maxseg);
 				format |= NODROPS;
 			else if (strcmp(&argv[0][2], "debugpoll") == 0)
 				format |= DEBUGPOLL;
+			else if (strcmp(&argv[0][2], "parse") == 0)
+				format |= PARSE;
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid format option \"%s\"\n", &argv[0][2]);
@@ -1381,11 +1454,22 @@ doit:
 						rvers_delta);
 					fflush(stdout);
 				}
+				if ((irvers < 40101) && (format & PARSE)) {
+					fprintf(stdout, "nuttcp%s%s: \"-fparse\" option not supported by server version %d.%d.%d, need >= 4.1.1\n",
+						trans?"-t":"-r",
+						ident, rvers_major,
+						rvers_minor,
+						rvers_delta);
+					fflush(stdout);
+					format &= ~PARSE;
+					abortconn = 1;
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
 					brief = 1;
-					if (irvers >= 30601)
+					if ((!trans && !reverse) ||
+					    (trans && reverse))
 						skip_data = 1;
 				}
 				if (!fgets(buf, mallocsize, stdin)) {
@@ -1696,7 +1780,24 @@ doit:
 			}
 #endif
 			if (trans) {
-			    if (brief <= 0) {
+			    if ((brief <= 0) && (format & PARSE)) {
+				fprintf(stdout,"nuttcp-t%s: buflen=%d ",
+					ident, buflen);
+				if (nbuf != INT_MAX)
+				    fprintf(stdout,"nbuf=%d ", nbuf);
+				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s\n",
+				    nstream, port,
+				    udp?"udp":"tcp",
+				    host);
+				if (timeout)
+				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n", 
+				    ident, timeout);
+				if (rate != MAXRATE)
+				    fprintf(stdout,"nuttcp-t%s: rate_limit = %.3f rate_unit=Mbps rate_mode=%s\n",
+					ident, (double)rate/1000,
+					irate ? "instantaneous" : "aggregate");
+			    }
+			    else if (brief <= 0) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
@@ -1715,7 +1816,19 @@ doit:
 					irate ? "instantaneous" : "aggregate");
 			    }
 			} else {
-			    if (brief <= 0) {
+			    if ((brief <= 0) && (format & PARSE)) {
+				fprintf(stdout,"nuttcp-r%s: buflen=%d ",
+					ident, buflen);
+				if (nbuf != INT_MAX)
+				    fprintf(stdout,"nbuf=%d ", nbuf);
+				fprintf(stdout,"nstream=%d port=%d mode=%s\n",
+				    nstream, port,
+				    udp?"udp":"tcp");
+				if (interval)
+				    fprintf(stdout,"nuttcp-r%s: reporting_interval=%.2f\n",
+					ident, interval);
+			    }
+			    else if (brief <= 0) {
 				fprintf(stdout,"nuttcp-r%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
@@ -1857,9 +1970,17 @@ doit:
 				else {
 				    err("unsupported AF");
 				}
-				fprintf(stdout,"nuttcp%s%s: connect to %s\n", 
-					trans?"-t":"-r", ident,
-					tmphost);
+
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: connect=%s\n", 
+						trans?"-t":"-r", ident,
+						tmphost);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: connect to %s\n", 
+						trans?"-t":"-r", ident,
+						tmphost);
 			}
 		    } else {
 			/* The receiver listens for the connection
@@ -1887,9 +2008,17 @@ doit:
 				char tmphost[ADDRSTRLEN] = "\0";
 				inet_ntop(af, &peer.sin_addr.s_addr,
 					  tmphost, sizeof(tmphost));
-				fprintf(stdout,"nuttcp%s%s: accept from %s\n", 
-					trans?"-t":"-r", ident,
-					tmphost);
+
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: accept=%s\n", 
+						trans?"-t":"-r", ident,
+						tmphost);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: accept from %s\n", 
+						trans?"-t":"-r", ident,
+						tmphost);
 			    }
 			    if (stream_idx == 0) clientaddr = peer.sin_addr;
 			}
@@ -1923,8 +2052,14 @@ doit:
 		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,  (void *)&rcvwinval,
 			 &optlen) < 0)
 				err("Get recv. window size didn't work\n");
-		if ((stream_idx == nstream) && (brief <= 0))
-			fprintf(stdout,"nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+
+		if ((stream_idx == nstream) && (brief <= 0)) {
+			if (format & PARSE)
+				fprintf(stdout,"nuttcp%s%s: send_window_size=%d receive_window_size=%d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+			else
+				fprintf(stdout,"nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+		}
+
 		if (firsttime) {
 			firsttime = 0;
 			origsendwin = sendwinval;
@@ -2372,8 +2507,13 @@ doit:
 				*cp1 = '\0';
 				break;
 			}
-			if (strstr(cp1, "real seconds")) {
-				sscanf(cp1, "nuttcp-%*c: " PERF_FMT_IN,
+			if (strstr(cp1, "real") && strstr(cp1, "seconds")) {
+				strcpy(fmt, "nuttcp-%*c: ");
+				if (format & PARSE)
+					strcat(fmt, P_PERF_FMT_IN);
+				else
+					strcat(fmt, PERF_FMT_IN);
+				sscanf(cp1, fmt,
 				       &srvr_MB, &srvr_realt, &srvr_KBps,
 				       &srvr_Mbps);
 				if (trans && udp) {
@@ -2387,26 +2527,48 @@ doit:
 					cp2 = cp1;
 					sprintf(cp2, "nuttcp-r:");
 					cp2 += 9;
-					sprintf(cp2, DROP_FMT,
+					if (format & PARSE)
+						strcpy(fmt, P_DROP_FMT);
+					else
+						strcpy(fmt, DROP_FMT);
+					sprintf(cp2, fmt,
 						(uint64_t)(((MB - srvr_MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((MB*1024*1024)
 							/buflen + 0.5));
 					cp2 += strlen(cp2);
-					sprintf(cp2, LOSS_FMT,
+					if (format & PARSE)
+						strcpy(fmt, P_LOSS_FMT);
+					else
+						strcpy(fmt, LOSS_FMT);
+					sprintf(cp2, fmt,
 						((1 - srvr_MB/MB)*100));
 					cp2 += strlen(cp2);
 					sprintf(cp2, "\n");
 				}
 			}
 			else if (strstr(cp1, "sys")) {
-				if (sscanf(cp1,
-					   "nuttcp-%*c: " CPU_STATS_FMT_IN2,
-					   &srvr_cpu_util) != 7)
-					sscanf(cp1,
-					       "nuttcp-%*c: " CPU_STATS_FMT_IN,
+				strcpy(fmt, "nuttcp-%*c: ");
+				if (format & PARSE) {
+					strcat(fmt, "stats=cpu ");
+					strcat(fmt, P_CPU_STATS_FMT_IN2);
+				}
+				else
+					strcat(fmt, CPU_STATS_FMT_IN2);
+				if (sscanf(cp1, fmt,
+					   &srvr_cpu_util) != 7) {
+					strcpy(fmt, "nuttcp-%*c: ");
+					if (format & PARSE) {
+						strcat(fmt, "stats=cpu ");
+						strcat(fmt,
+						       P_CPU_STATS_FMT_IN);
+					}
+					else
+						strcat(fmt, CPU_STATS_FMT_IN);
+					sscanf(cp1, fmt,
 					       &srvr_cpu_util);
+				}
 			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
 				continue;
@@ -2421,40 +2583,74 @@ doit:
 	}
 
 	if (brief <= 0) {
-		fprintf(stdout, "nuttcp%s%s: " PERF_FMT_OUT,
-			trans?"-t":"-r", ident,
+		strcpy(fmt, "nuttcp%s%s: ");
+		if (format & PARSE)
+			strcat(fmt, P_PERF_FMT_OUT);
+		else
+			strcat(fmt, PERF_FMT_OUT);
+		fprintf(stdout, fmt, trans?"-t":"-r", ident,
 			(double)nbytes/(1024*1024), realt,
 			(double)nbytes/realt/1024,
 			(double)nbytes/realt/125000 );
 		if (clientserver && client && !trans && udp) {
 			fprintf(stdout, "nuttcp-r%s:", ident);
-			fprintf(stdout, DROP_FMT,
+			if (format & PARSE)
+				strcpy(fmt, P_DROP_FMT);
+			else
+				strcpy(fmt, DROP_FMT);
+			fprintf(stdout, fmt,
 				(uint64_t)(((srvr_MB - MB)*1024*1024)
 					/buflen + 0.5),
 				(uint64_t)((srvr_MB*1024*1024)/buflen + 0.5));
-			fprintf(stdout, LOSS_FMT, ((1 - MB/srvr_MB)*100));
+			if (format & PARSE)
+				strcpy(fmt, P_LOSS_FMT);
+			else
+				strcpy(fmt, LOSS_FMT);
+			fprintf(stdout, fmt, ((1 - MB/srvr_MB)*100));
 			fprintf(stdout, "\n");
 		}
 		if (verbose) {
-			fprintf(stdout,
-				"nuttcp%s%s: %.3f MB in %.2f CPU seconds = %.2f KB/cpu sec\n",
+			strcpy(fmt, "nuttcp%s%s: ");
+			if (format & PARSE)
+				strcat(fmt, "megabytes=%.4f cpu_seconds=%.2f KB_per_cpu_second=%.2f\n");
+			else
+				strcat(fmt, "%.4f MB in %.2f CPU seconds = %.2f KB/cpu sec\n");
+			fprintf(stdout, fmt,
 				trans?"-t":"-r", ident,
 				(double)nbytes/(1024*1024), cput,
 				(double)nbytes/cput/1024 );
 		}
-		fprintf(stdout,
-			"nuttcp%s%s: %d I/O calls, msec/call = %.2f, calls/sec = %.2f\n",
+
+		strcpy(fmt, "nuttcp%s%s: ");
+		if (format & PARSE)
+			strcat(fmt, "io_calls=%d msec_per_call=%.2f calls_per_sec=%.2f\n");
+		else
+			strcat(fmt, "%d I/O calls, msec/call = %.2f, calls/sec = %.2f\n");
+		fprintf(stdout, fmt,
 			trans?"-t":"-r", ident,
 			numCalls,
 			1024.0 * realt/((double)numCalls),
 			((double)numCalls)/realt);
 
-		fprintf(stdout,"nuttcp%s%s: %s\n", trans?"-t":"-r",
-			ident, stats);
+		strcpy(fmt, "nuttcp%s%s: ");
+		if (format & PARSE)
+			strcat(fmt, "stats=cpu %s\n");
+		else
+			strcat(fmt, "%s\n");
+		fprintf(stdout, fmt, trans?"-t":"-r", ident, stats);
 	}
 
-	if (sscanf(stats, CPU_STATS_FMT_IN2, &cpu_util) != 6)
-		sscanf(stats, CPU_STATS_FMT_IN, &cpu_util);
+	if (format & PARSE)
+		strcpy(fmt, P_CPU_STATS_FMT_IN2);
+	else
+		strcpy(fmt, CPU_STATS_FMT_IN2);
+	if (sscanf(stats, fmt, &cpu_util) != 6) {
+		if (format & PARSE)
+			strcpy(fmt, P_CPU_STATS_FMT_IN);
+		else
+			strcpy(fmt, CPU_STATS_FMT_IN);
+		sscanf(stats, fmt, &cpu_util);
+	}
 
 	if (brief && clientserver && client) {
 		if ((brief < 0) || interval)
@@ -2463,41 +2659,78 @@ doit:
 			if (trans) {
 				if (*ident)
 					fprintf(stdout, "%s: ", ident + 1);
-				fprintf(stdout, PERF_FMT_BRIEF,
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_BRIEF);
+				else
+					strcpy(fmt, PERF_FMT_BRIEF);
+				fprintf(stdout, fmt,
 					srvr_MB, srvr_realt, srvr_Mbps,
 					cpu_util, srvr_cpu_util);
-				if (!(format & NODROPS))
-					fprintf(stdout, DROP_FMT_BRIEF,
+				if (!(format & NODROPS)) {
+					if (format & PARSE)
+						strcpy(fmt, P_DROP_FMT_BRIEF);
+					else
+						strcpy(fmt, DROP_FMT_BRIEF);
+					fprintf(stdout, fmt,
 						(uint64_t)(((MB - srvr_MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((MB*1024*1024)
 							/buflen + 0.5));
-				if (!(format & NOPERCENTLOSS))
-					fprintf(stdout, LOSS_FMT_BRIEF,
+				}
+				if (!(format & NOPERCENTLOSS)) {
+					if (format & PARSE)
+						strcpy(fmt, P_LOSS_FMT_BRIEF);
+					else
+						strcpy(fmt, LOSS_FMT_BRIEF);
+					fprintf(stdout, fmt,
 						(1 - srvr_MB/MB)*100);
-				if (format & XMITSTATS)
-					fprintf(stdout, PERF_FMT_BRIEF3, MB);
+				}
+				if (format & XMITSTATS) {
+					if (format & PARSE)
+						strcpy(fmt, P_PERF_FMT_BRIEF3);
+					else
+						strcpy(fmt, PERF_FMT_BRIEF3);
+					fprintf(stdout, fmt, MB);
+				}
 			}
 			else {
 				if (*ident)
 					fprintf(stdout, "%s: ", ident + 1);
-				fprintf(stdout, PERF_FMT_BRIEF,
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_BRIEF);
+				else
+					strcpy(fmt, PERF_FMT_BRIEF);
+				fprintf(stdout, fmt,
 					MB, realt, (double)nbytes/realt/125000,
 					srvr_cpu_util, cpu_util);
-				if (!(format & NODROPS))
-					fprintf(stdout, DROP_FMT_BRIEF,
+				if (!(format & NODROPS)) {
+					if (format & PARSE)
+						strcpy(fmt, P_DROP_FMT_BRIEF);
+					else
+						strcpy(fmt, DROP_FMT_BRIEF);
+					fprintf(stdout, fmt,
 						(uint64_t)(((srvr_MB - MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((srvr_MB*1024*1024)
 							/buflen + 0.5));
-				if (!(format & NOPERCENTLOSS))
-					fprintf(stdout, LOSS_FMT_BRIEF,
+				}
+				if (!(format & NOPERCENTLOSS)) {
+					if (format & PARSE)
+						strcpy(fmt, P_LOSS_FMT_BRIEF);
+					else
+						strcpy(fmt, LOSS_FMT_BRIEF);
+					fprintf(stdout, fmt,
 						(1 - MB/srvr_MB)*100);
-				if (format & XMITSTATS)
-					fprintf(stdout, PERF_FMT_BRIEF3,
-						srvr_MB);
+				}
+				if (format & XMITSTATS) {
+					if (format & PARSE)
+						strcpy(fmt, P_PERF_FMT_BRIEF3);
+					else
+						strcpy(fmt, PERF_FMT_BRIEF3);
+					fprintf(stdout, fmt, srvr_MB);
+				}
 			}
 			fprintf(stdout, "\n");
 		}
@@ -2505,14 +2738,24 @@ doit:
 			if (trans) {
 				if (*ident)
 					fprintf(stdout, "%s: ", ident + 1);
-				fprintf(stdout, PERF_FMT_BRIEF "\n",
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_BRIEF);
+				else
+					strcpy(fmt, PERF_FMT_BRIEF);
+				strcat(fmt, "\n");
+				fprintf(stdout, fmt,
 					srvr_MB, srvr_realt, srvr_Mbps,
 					cpu_util, srvr_cpu_util );
 			}
 			else {
 				if (*ident)
 					fprintf(stdout, "%s: ", ident + 1);
-				fprintf(stdout, PERF_FMT_BRIEF "\n",
+				if (format & PARSE)
+					strcpy(fmt, P_PERF_FMT_BRIEF);
+				else
+					strcpy(fmt, PERF_FMT_BRIEF);
+				strcat(fmt, "\n");
+				fprintf(stdout, fmt,
 					MB, realt, (double)nbytes/realt/125000,
 					srvr_cpu_util, cpu_util );
 			}
@@ -2710,7 +2953,12 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 	ms =  (e->tv_sec-b->tv_sec)*100 + (e->tv_usec-b->tv_usec)/10000;
 
 #define END(x)	{while(*x) x++;}
-	cp = "%Uuser %Ssys %Ereal %P %Xi+%Dd %Mmaxrss %F+%Rpf %Ccsw";
+
+	if (format & PARSE)
+		cp = "user=%U system=%S elapsed=%E cpu=%P memory=%Xi+%Dd-%Mmaxrss io=%F+%Rpf swaps=%Ccsw";
+	else
+		cp = "%Uuser %Ssys %Ereal %P %Xi+%Dd %Mmaxrss %F+%Rpf %Ccsw";
+
 	for (; *cp; cp++)  {
 		if (*cp != '%')
 			*outp++ = *cp;
