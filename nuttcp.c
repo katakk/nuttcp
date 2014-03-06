@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.1
+ *	N U T T C P . C						v5.1.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,17 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.3, Bill Fink, 9-Apr-04
+ *	Add "-Sf" force server mode (useful for starting server via rsh/ssh)
+ *	Allow non-root user to find nuttcp binary in "."
+ *	Fix bug with receives terminating early with manual server mode
+ *	Fix bug with UDP receives not terminating with "-Ri" option
+ *	Clean up output formatting of nbuf (from "%d" to "%llu")
+ *	Add "-SP" to have 3rd party use same outgoing control port as incoming
+ * V5.1.2, Bill Fink & Rob Scott, 18-Mar-04
+ *	Fix bug with nbuf wrapping on really long transfers (int -> uint64_t)
+ *	Fix multicast address to be unsigned long to allow shift
+ *	Add MacOS uint8_t definition for new use of uint8_t
  * V5.1.1, Bill Fink, 8-Nov-03
  *	Add IPv4 multicast support
  *	Delay receiver EOD until EOD1 (for out of order last data packet)
@@ -211,6 +222,7 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/time.h>		/* struct timeval */
+#include <stdlib.h>
 
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -227,6 +239,10 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <string.h>
 #include <fcntl.h>
 
+#ifndef ULLONG_MAX
+#define ULLONG_MAX	18446744073709551615ULL
+#endif
+
 #define MAXRATE 0xffffffffUL
 
 #if !defined(__CYGWIN__) && !defined(_WIN32)
@@ -240,6 +256,8 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #if defined(__APPLE__) && defined(__MACH__)
 #define uint64_t u_int64_t
 #define uint32_t u_int32_t
+#define uint16_t u_int16_t
+#define uint8_t u_int8_t
 #endif
 
 #ifdef HAVE_POLL
@@ -252,6 +270,11 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
  * EAI_NONAME has nothing to do with socklen, but on sparc without it tells
  * us it's an old enough solaris to need the typedef
  */
+
+/*
+ * the nice gentlemen at Apple fixed their includes to typedef this now, but
+ * there is no obvious way of differentiating the need for this.  FIX later...
+ */
 #if (defined(__APPLE__) && defined(__MACH__)) || (defined(sparc) && !defined(EAI_NONAME))
 typedef int socklen_t;
 #endif
@@ -261,7 +284,6 @@ typedef int socklen_t;
 #define sockaddr_storage sockaddr
 #define ss_family sa_family
 #else /* new sparc */
-#include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <strings.h>
@@ -339,7 +361,7 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #define DEFAULT_MC_UDPBUFLEN	1024
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
-#define HI_MC			231
+#define HI_MC			231ul
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -370,7 +392,7 @@ int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 1;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -402,7 +424,7 @@ int buflen = 64 * 1024;		/* length of buffer */
 int nbuflen;
 int mallocsize;
 char *buf;			/* ptr to dynamic buffer */
-int nbuf = 0;			/* number of buffers to send in sinkmode */
+uint64_t nbuf = 0;		/* number of buffers to send in sinkmode */
 
 /*  nick code  */
 int sendwin=0, sendwinval=0, origsendwin=0;
@@ -427,6 +449,9 @@ char *host;			/* ptr to name of host */
 char *host3 = NULL;		/* ptr to 3rd party host */
 int thirdparty = 0;		/* set to 1 indicates doing 3rd party nuttcp */
 int no3rd = 0;			/* set to 1 by server to disallow 3rd party */
+int force_server = 0;		/* set to 1 to force server mode (for rsh) */
+int pass_ctlport = 0;		/* set to 1 to use same outgoing control port
+				   as incoming with 3rd party usage */
 char *cmdargs[50];		/* command arguments array */
 char tmpargs[50][40];
 
@@ -572,8 +597,10 @@ Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
 #endif
-"Usage (server): nuttcp -S [-options]\n\
+"Usage (server): nuttcp -S[f][P] [-options]\n\
 		note server mode excludes use of -s\n\
+		'f' suboption forces server mode (useful with rsh/ssh)\n\
+		'P' suboption makes 3rd party {in,out}bound control ports same\n\
 	-4	Use IPv4 (default)\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
@@ -860,14 +887,17 @@ optlen = sizeof(maxseg);
 			nodelay = 1;
 			break;
 		case 'n':
-			nbuf = atoi(&argv[0][2]);
-			if (nbuf < 0) {
-				fprintf(stderr, "invalid nbuf = %d\n", nbuf);
-				fflush(stderr);
-				exit(1);
+			nbuf = strtoull(&argv[0][2], NULL, 0);
+			if (nbuf == 0) {
+				if (errno == EINVAL) {
+					fprintf(stderr, "invalid nbuf = %s\n",
+						&argv[0][2]);
+					fflush(stderr);
+					exit(1);
+				}
+				else
+					nbuf = DEFAULT_NBUF;
 			}
-			else if (nbuf == 0)
-				nbuf = DEFAULT_NBUF;
 			break;
 		case 'l':
 			buflen = atoi(&argv[0][2]);
@@ -1028,6 +1058,10 @@ optlen = sizeof(maxseg);
 				brief = 1;
 			break;
 		case 'S':
+			if (strchr(&argv[0][2], 'f'))
+				force_server = 1;
+			if (strchr(&argv[0][2], 'P'))
+				pass_ctlport = 1;
 			trans = 0;
 			clientserver = 1;
 			brief = 0;
@@ -1311,10 +1345,18 @@ optlen = sizeof(maxseg);
 		sinkmode = 1;
 		start_idx = 0;
 		ident = "";
+		if (force_server) {
+			close(0);
+			close(1);
+			close(2);
+			open("/dev/null", O_RDWR);
+			dup(0);
+			dup(0);
+		}
 		if (af == AF_INET) {
 		  struct sockaddr_in peer;
 		  socklen_t peerlen = sizeof(peer);
-		  if (getpeername(0, (struct sockaddr *) &peer, 
+		  if (!force_server && getpeername(0, (struct sockaddr *) &peer,
 				&peerlen) == 0) {
 			clientaddr = peer.sin_addr;
 			inetd = 1;
@@ -1326,7 +1368,7 @@ optlen = sizeof(maxseg);
 		else if (af == AF_INET6) {
 		  struct sockaddr_in6 peer;
 		  socklen_t peerlen = sizeof(peer);
-		  if (getpeername(0, (struct sockaddr *) &peer, 
+		  if (!force_server && getpeername(0, (struct sockaddr *) &peer,
 				&peerlen) == 0) {
 			clientaddr6 = peer.sin6_addr;
 			inetd = 1;
@@ -1462,7 +1504,7 @@ doit:
 							+ rvers_minor*100
 							+ rvers_delta;
 				}
-				fprintf(ctlconn, "buflen = %d, nbuf = %d, win = %d, nstream = %d, rate = %lu, port = %hu, trans = %d, braindead = %d", buflen, nbuf, srvrwin, nstream, rate, port, trans, braindead);
+				fprintf(ctlconn, "buflen = %d, nbuf = %llu, win = %d, nstream = %d, rate = %lu, port = %hu, trans = %d, braindead = %d", buflen, nbuf, srvrwin, nstream, rate, port, trans, braindead);
 				if (irvers >= 30200)
 					fprintf(ctlconn, ", timeout = %f", timeout);
 				else {
@@ -1660,7 +1702,7 @@ doit:
 				irvers = rvers_major*10000
 						+ rvers_minor*100
 						+ rvers_delta;
-				if (sscanf(buf, "buflen = %d, nbuf = %d, win = %d, nstream = %d, rate = %lu, port = %hu, trans = %d, braindead = %d, timeout = %lf, udp = %d, vers = %d.%d.%d", &nbuflen, &nbuf, &sendwin, &nstream, &rate, &port, &trans, &braindead, &timeout, &udp, &rvers_major, &rvers_minor, &rvers_delta) < 13) {
+				if (sscanf(buf, "buflen = %d, nbuf = %llu, win = %d, nstream = %d, rate = %lu, port = %hu, trans = %d, braindead = %d, timeout = %lf, udp = %d, vers = %d.%d.%d", &nbuflen, &nbuf, &sendwin, &nstream, &rate, &port, &trans, &braindead, &timeout, &udp, &rvers_major, &rvers_minor, &rvers_delta) < 13) {
 					trans = !trans;
 					fputs("KO\n", stdout);
 					mes("error scanning parameters");
@@ -1767,7 +1809,7 @@ doit:
 				if (nbuf < 1) {
 					fputs("KO\n", stdout);
 					mes("invalid nbuf");
-					fprintf(stdout, "nbuf = %d\n", nbuf);
+					fprintf(stdout, "nbuf = %llu\n", nbuf);
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
@@ -2014,7 +2056,7 @@ doit:
 				fprintf(stdout,"nuttcp-t%s: buflen=%d ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%d ", nbuf);
+				    fprintf(stdout,"nbuf=%llu ", nbuf);
 				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s",
 				    nstream, port,
 				    udp?"udp":"tcp",
@@ -2035,7 +2077,7 @@ doit:
 				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%d, ", nbuf);
+				    fprintf(stdout,"nbuf=%llu, ", nbuf);
 				fprintf(stdout,"nstream=%d, port=%d %s -> %s",
 				    nstream, port,
 				    udp?"udp":"tcp",
@@ -2057,7 +2099,7 @@ doit:
 				fprintf(stdout,"nuttcp-r%s: buflen=%d ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%d ", nbuf);
+				    fprintf(stdout,"nbuf=%llu ", nbuf);
 				fprintf(stdout,"nstream=%d port=%d mode=%s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
@@ -2069,7 +2111,7 @@ doit:
 				fprintf(stdout,"nuttcp-r%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%d, ", nbuf);
+				    fprintf(stdout,"nbuf=%llu, ", nbuf);
 				fprintf(stdout,"nstream=%d, port=%d %s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
@@ -2416,6 +2458,10 @@ doit:
 			j = 0;
 			cmdargs[i++] = cmd;
 			cmdargs[i++] = "-3";
+			if (pass_ctlport) {
+				sprintf(tmpargs[j], "-P%hu", ctlport);
+				cmdargs[i++] = tmpargs[j++];
+			}
 			if ((udp && !multicast
 				 && (buflen != DEFAULTUDPBUFLEN)) ||
 			    (udp && multicast
@@ -2425,7 +2471,7 @@ doit:
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (nbuf != INT_MAX) {
-				sprintf(tmpargs[j], "-n%d", nbuf);
+				sprintf(tmpargs[j], "-n%llu", nbuf);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (brief3 != 1) {
@@ -2500,6 +2546,12 @@ doit:
 			}
 			if (errno == ENOENT) {
 				strcpy(path, "/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if ((errno == ENOENT) && (getuid() != 0)
+					      && (geteuid() != 0)) {
+				strcpy(path, "./");
 				strcat(path, cmd);
 				execv(path, cmdargs);
 			}
@@ -2729,7 +2781,7 @@ doit:
 	if (do_poll) {
 		long flags;
 
-		pollfds[0].fd = 0;
+		pollfds[0].fd = fileno(ctlconn);
 		pollfds[0].events = POLLIN | POLLPRI;
 		pollfds[0].revents = 0;
 		for ( i = 1; i <= nstream; i++ ) {
@@ -2775,10 +2827,12 @@ doit:
 			}
 			if (udplossinfo)
 				bcopy(&nbytes, buf + 24, 8);
+			if (nbuf == INT_MAX)
+				nbuf = ULLONG_MAX;
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
 				if (clientserver && !client
 						 && ((nbuf & 0x3FF) == 0)) {
-					pollfds[0].fd = 0;
+					pollfds[0].fd = fileno(ctlconn);
 					save_events = pollfds[0].events;
 					pollfds[0].events = POLLIN | POLLPRI;
 					pollfds[0].revents = 0;
@@ -3673,7 +3727,7 @@ Nwrite( int fd, char *buf, int count )
 			realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
 			if( realt <= 0.0 )  realt = 0.000001;
 		}
-		if (intr) return(0);
+		if (intr && (!udp || (count != 4))) return(0);
 		gettimeofday(&timepk, (struct timezone *)0);
 		realt = 0.000001;
 	}
