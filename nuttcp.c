@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.0.3
+ *	N U T T C P . C						v5.0.4
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.0.4, Bill Fink, 6-Nov-03
+ *	Fix bug reporting 0 drops when negative loss percentage
  * V5.0.3, Bill Fink, 6-Nov-03
  *	Kill server transmission if control connection goes away
  *	Kill 3rd party nuttcp if control connection goes away
@@ -364,7 +366,7 @@ int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
 int vers_minor = 0;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -2859,7 +2861,7 @@ doit:
 					else
 						strcpy(fmt, DROP_FMT);
 					sprintf(cp2, fmt,
-						(uint64_t)(((MB - srvr_MB)
+						(int64_t)(((MB - srvr_MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((MB*1024*1024)
@@ -2926,7 +2928,7 @@ doit:
 			else
 				strcpy(fmt, DROP_FMT);
 			fprintf(stdout, fmt,
-				(uint64_t)(((srvr_MB - MB)*1024*1024)
+				(int64_t)(((srvr_MB - MB)*1024*1024)
 					/buflen + 0.5),
 				(uint64_t)((srvr_MB*1024*1024)/buflen + 0.5));
 			if (format & PARSE)
@@ -2999,7 +3001,7 @@ doit:
 					else
 						strcpy(fmt, DROP_FMT_BRIEF);
 					fprintf(stdout, fmt,
-						(uint64_t)(((MB - srvr_MB)
+						(int64_t)(((MB - srvr_MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((MB*1024*1024)
@@ -3037,7 +3039,7 @@ doit:
 					else
 						strcpy(fmt, DROP_FMT_BRIEF);
 					fprintf(stdout, fmt,
-						(uint64_t)(((srvr_MB - MB)
+						(int64_t)(((srvr_MB - MB)
 							*1024*1024)
 								/buflen + 0.5),
 						(uint64_t)((srvr_MB*1024*1024)
