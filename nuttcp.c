@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.0.4
+ *	N U T T C P . C						v5.1.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.1, Bill Fink, 8-Nov-03
+ *	Add IPv4 multicast support
+ *	Delay receiver EOD until EOD1 (for out of order last data packet)
+ *	Above also drains UDP receive buffer (wait for fragmentation reassembly)
  * V5.0.4, Bill Fink, 6-Nov-03
  *	Fix bug reporting 0 drops when negative loss percentage
  * V5.0.3, Bill Fink, 6-Nov-03
@@ -160,12 +164,9 @@
  * TODO/Wish-List:
  *	Transmit interval marking option
  *	Allow at least some traceroute options
- *	Handle <control-C> for UDP receiver
- *	Multicast support
- *	Drain UDP receive buffer (wait for fragmentation reassembly)
+ *	IPv6 multicast support
  *	Add "-ut" option to do both UDP and TCP simultaneously
  *	Default rate limit UDP if too much loss
- *	Watchdog for server to check if client has gone away
  *	QOS support
  *	Ping option
  *	Other brief output formats
@@ -333,9 +334,12 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #endif
 #define DEFAULT_NBUF		2048
 #define DEFAULT_TIMEOUT		10.0
+#define DEFAULT_MC_RATE		1000
 #define DEFAULTUDPBUFLEN	8192
+#define DEFAULT_MC_UDPBUFLEN	1024
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
+#define HI_MC			231
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -365,8 +369,8 @@ int delay( int us );
 int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
-int vers_minor = 0;
-int vers_delta = 4;
+int vers_minor = 1;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -375,6 +379,7 @@ int irvers;
 
 struct sockaddr_in sinme[MAXSTREAM + 1];
 struct sockaddr_in sinhim[MAXSTREAM + 1];
+struct sockaddr_in save_sinhim, save_mc;
 
 #ifdef AF_INET6
 struct sockaddr_in6 sinme6[MAXSTREAM + 1];
@@ -455,6 +460,13 @@ int format = 0;			/* controls formatting of output */
 char fmt[257];
 int traceroute = 0;		/* do traceroute back to client if set */
 int skip_data = 0;		/* skip opening of data channel */
+#if defined(linux)
+int multicast = 0;		/* set to 1 for multicast UDP transfer */
+#else
+uint8_t multicast = 0;		/* set to 1 for multicast UDP transfer */
+#endif
+int mc_param;
+struct ip_mreq mc_group;	/* holds multicast group address */
 
 #ifdef HAVE_SETPRIO
 int priority = 0;		/* nuttcp process priority */
@@ -495,7 +507,7 @@ extern int errno;
 char Usage[] = "\
 Usage: nuttcp or nuttcp -h	prints this usage info\n\
 Usage: nuttcp -V		prints version info\n\
-Usage: nuttcp -xt host		forward and reverse traceroute to/from server\n\
+Usage: nuttcp -xt [-m] host	forward and reverse traceroute to/from server\n\
 Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 	-4	Use IPv4\n"
 #ifdef AF_INET6
@@ -510,6 +522,7 @@ Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 	-p##	port number to send to (default 5001)\n\
 	-P##	port number for control connection (default 5000)\n\
 	-u	use UDP instead of TCP\n\
+	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
 	-D	don't buffer TCP writes (sets TCP_NODELAY socket option)\n\
 	-N##	number of streams (starting at port number)\n\
 	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
@@ -542,6 +555,7 @@ Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 	-P##	port number for control connection (default 5000)\n\
 	-B	Only output full blocks, as specified in -l## (for TAR)\n\
 	-u	use UDP instead of TCP\n\
+	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
 	-N##	number of streams (starting at port number), implies -B\n\
 	-R##	server transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
 	-T##	server transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
@@ -1084,6 +1098,18 @@ optlen = sizeof(maxseg);
 		case '3':
 			thirdparty = 1;
 			break;
+		case 'm':
+			if (argv[0][2])
+				mc_param = atoi(&argv[0][2]);
+			else
+				mc_param = 1;
+			if ((mc_param < 1) || (mc_param > 255)) {
+				fprintf(stderr, "invalid multicast ttl = %d\n", mc_param);
+				fflush(stderr);
+				exit(1);
+			}
+			multicast = mc_param;
+			break;
 		case '-':
 			if (strcmp(&argv[0][2], "nofork") == 0) {
 				nofork=1;
@@ -1132,6 +1158,14 @@ optlen = sizeof(maxseg);
 			}
 			cp1++;
 		}
+	}
+
+	if (multicast) {
+		udp = 1;
+		if (!buflenopt) buflen = DEFAULT_MC_UDPBUFLEN;
+		nstream = 1;
+		if (rate == MAXRATE)
+			rate = DEFAULT_MC_RATE;
 	}
 
 	bzero((char *)&frominet, sizeof(frominet));
@@ -1201,6 +1235,14 @@ optlen = sizeof(maxseg);
 			}
 #endif
 	}
+
+#ifdef AF_INET6
+	if (multicast && (af == AF_INET6)) {
+		fprintf(stderr, "multicast not yet supported for IPv6\n");
+		fflush(stderr);
+		exit(1);
+	}
+#endif
 
 	if (!port) {
 		if (af == AF_INET) {
@@ -1541,6 +1583,21 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 50101) {
+					fprintf(ctlconn, " , multicast = %d", multicast);
+				}
+				else {
+					if (multicast) {
+						fprintf(stdout, "nuttcp%s%s: multicast not supported by server version %d.%d.%d, need >= 5.1.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						multicast = 0;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -1683,6 +1740,13 @@ doit:
 				else {
 					host3 = NULL;
 				}
+				if (irvers >= 50101) {
+					sscanf(strstr(buf, ", multicast =") + 14,
+						"%d", &mc_param);
+				}
+				else {
+					mc_param = 0;
+				}
 				trans = !trans;
 				if (nbuflen != buflen) {
 					buflen = nbuflen;
@@ -1757,6 +1821,21 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
+				if (mc_param) {
+					if ((mc_param < 1) ||
+					    (mc_param > 255)) {
+						fputs("KO\n", stdout);
+						mes("invalid multicast ttl");
+						fprintf(stdout, "multicast ttl = %d\n", mc_param);
+						fputs("KO\n", stdout);
+						goto cleanup;
+					}
+					udp = 1;
+					nstream = 1;
+					if (rate == MAXRATE)
+						rate = DEFAULT_MC_RATE;
+				}
+				multicast = mc_param;
 				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
 						vers_minor, vers_delta);
 				fflush(stdout);
@@ -1896,15 +1975,54 @@ doit:
 			}
 #endif
 			if (trans) {
+			    char tmphost[ADDRSTRLEN] = "\0";
+			    if (multicast) {
+				/* The multicast transmitter just sends
+				 * to the multicast group
+				 */
+				if (af == AF_INET) {
+				    struct sockaddr_in me;
+				    socklen_t melen = sizeof(me);
+				    if (getsockname(fd[0],
+				    		    (struct sockaddr *) &me, 
+						    &melen) < 0) {
+					err("getsockname");
+				    }
+				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
+					(char *)&save_sinhim.sin_addr.s_addr,
+					sizeof(struct in_addr));
+				    bcopy((char *)&me.sin_addr.s_addr,
+					(char *)&sinhim[1].sin_addr.s_addr,
+					sizeof(struct in_addr));
+				    sinhim[1].sin_addr.s_addr &=
+					htonl(0xFFFFFF);
+				    sinhim[1].sin_addr.s_addr |=
+					htonl(HI_MC << 24);
+				    inet_ntop(af, &sinhim[1].sin_addr,
+					      tmphost, sizeof(tmphost));
+				    if (setsockopt(fd[1], IPPROTO_IP,
+						   IP_MULTICAST_TTL,
+						   (void *)&multicast,
+						   sizeof(multicast)) < 0)
+					err("setsockopt");
+				}
+				else {
+				    err("unsupported AF");
+				}
+			    }
 			    if ((brief <= 0) && (format & PARSE)) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
 				    fprintf(stdout,"nbuf=%d ", nbuf);
-				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s\n",
+				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s",
 				    nstream, port,
 				    udp?"udp":"tcp",
-				    host);
+				    multicast ? tmphost : host);
+				if (multicast)
+				    fprintf(stdout, " multicast_ttl=%d",
+					    multicast);
+				fprintf(stdout, "\n");
 				if (timeout)
 				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n", 
 				    ident, timeout);
@@ -1918,10 +2036,13 @@ doit:
 					ident, buflen);
 				if (nbuf != INT_MAX)
 				    fprintf(stdout,"nbuf=%d, ", nbuf);
-				fprintf(stdout,"nstream=%d, port=%d %s -> %s\n",
+				fprintf(stdout,"nstream=%d, port=%d %s -> %s",
 				    nstream, port,
 				    udp?"udp":"tcp",
-				    host);
+				    multicast ? tmphost : host);
+				if (multicast)
+				    fprintf(stdout, " ttl=%d", multicast);
+				fprintf(stdout, "\n");
 				if (timeout)
 				    fprintf(stdout,"nuttcp-t%s: time limit = %.2f second%s\n",
 					ident, timeout,
@@ -2081,6 +2202,12 @@ doit:
 					if (host3) {
 						perror("connect failed");
 						fprintf(stderr, "3rd party nuttcp only supported for client/server mode\n");
+						fflush(stderr);
+						exit(1);
+					}
+					if (multicast) {
+						perror("connect failed");
+						fprintf(stderr, "multicast only supported for client/server mode\n");
 						fflush(stderr);
 						exit(1);
 					}
@@ -2289,7 +2416,10 @@ doit:
 			j = 0;
 			cmdargs[i++] = cmd;
 			cmdargs[i++] = "-3";
-			if ((udp && (buflen != DEFAULTUDPBUFLEN)) ||
+			if ((udp && !multicast
+				 && (buflen != DEFAULTUDPBUFLEN)) ||
+			    (udp && multicast
+				 && (buflen != DEFAULT_MC_UDPBUFLEN)) ||
 			    (!udp && (buflen != 65536))) {
 				sprintf(tmpargs[j], "-l%d", buflen);
 				cmdargs[i++] = tmpargs[j++];
@@ -2327,8 +2457,14 @@ doit:
 				sprintf(tmpargs[j], "-T%lf", timeout);
 				cmdargs[i++] = tmpargs[j++];
 			}
-			if (udp)
-				cmdargs[i++] = "-u";
+			if (udp) {
+				if (multicast) {
+					sprintf(tmpargs[j], "-m%d", multicast);
+					cmdargs[i++] = tmpargs[j++];
+				}
+				else
+					cmdargs[i++] = "-u";
+			}
 			if (interval) {
 				sprintf(tmpargs[j], "-i%f", interval);
 				cmdargs[i++] = tmpargs[j++];
@@ -2383,11 +2519,15 @@ doit:
 
 		fflush(stdout);
 		fflush(stderr);
-		cmd = "traceroute";
+		if (multicast)
+			cmd = "mtrace";
+		else {
+			cmd = "traceroute";
 #ifdef AF_INET6
-		if (af == AF_INET6)
-			cmd = "traceroute6";
+			if (af == AF_INET6)
+				cmd = "traceroute6";
 #endif
+		}
 		if (client) {
 			if ((pid = fork()) == (pid_t)-1)
 				err("can't fork");
@@ -2517,6 +2657,48 @@ doit:
 		}
 	}
 
+	if (multicast && !trans) {
+		/* The multicast receiver must join the multicast group */
+		if (af == AF_INET) {
+			struct sockaddr_in peer;
+			char tmphost[ADDRSTRLEN] = "\0";
+			char tmphost2[ADDRSTRLEN] = "\0";
+			socklen_t peerlen = sizeof(peer);
+			if (getpeername(fd[0], (struct sockaddr *) &peer, 
+					&peerlen) < 0) {
+				err("getpeername");
+			}
+			bcopy((char *)&peer.sin_addr.s_addr,
+			      (char *)&mc_group.imr_multiaddr.s_addr,
+			      sizeof(struct in_addr));
+			mc_group.imr_multiaddr.s_addr &= htonl(0xFFFFFF);
+			mc_group.imr_multiaddr.s_addr |= htonl(HI_MC << 24);
+			if (setsockopt(fd[1], IPPROTO_IP, IP_ADD_MEMBERSHIP,
+				       (void *)&mc_group, sizeof(mc_group)) < 0)
+				err("setsockopt");
+			if (brief <= 0) {
+				inet_ntop(af, &peer.sin_addr.s_addr,
+					  tmphost, sizeof(tmphost));
+				inet_ntop(af, &mc_group.imr_multiaddr,
+					  tmphost2, sizeof(tmphost2));
+
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s\n", 
+						trans?"-t":"-r", ident,
+						tmphost, tmphost2);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: receiving from multicast source %s on group %s\n", 
+						trans?"-t":"-r", ident,
+						tmphost, tmphost2);
+			}
+		}
+		else {
+			err("unsupported AF");
+		}
+	}
+
 	if (trans && timeout) {
 		itimer.it_value.tv_sec = timeout;
 		itimer.it_value.tv_usec =
@@ -2567,7 +2749,20 @@ doit:
 		if (trans)  {
 			if(udp) {
 				strcpy(buf, "BOD0");
+				if (multicast) {
+				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
+					  (char *)&save_mc.sin_addr.s_addr,
+					  sizeof(struct in_addr));
+				    bcopy((char *)&save_sinhim.sin_addr.s_addr,
+					  (char *)&sinhim[1].sin_addr.s_addr,
+					  sizeof(struct in_addr));
+				}
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr start */
+				if (multicast) {
+				    bcopy((char *)&save_mc.sin_addr.s_addr,
+					  (char *)&sinhim[1].sin_addr.s_addr,
+					  sizeof(struct in_addr));
+				}
 				prep_timer();
 			}
 /*			beginnings of timestamps - not ready for prime time */
@@ -2679,6 +2874,10 @@ doit:
 			if (intr)
 				nbytes += cnt;
 			if(udp) {
+				if (multicast)
+				    bcopy((char *)&save_sinhim.sin_addr.s_addr,
+					  (char *)&sinhim[1].sin_addr.s_addr,
+					  sizeof(struct in_addr));
 				strcpy(buf, "EOD0");
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 			}
@@ -2690,6 +2889,8 @@ doit:
 			    need_swap = 0;
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    if( cnt <= 4 ) {
+					    if (strncmp(buf, "EOD0", 4) == 0)
+						    continue;
 					    if (strncmp(buf, "EOD", 3) == 0) {
 						    correction = buf[3] - '0';
 						    break;	/* "EOF" */
@@ -2784,6 +2985,19 @@ doit:
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 		stream_idx = ++stream_idx % nstream;
 	}
+
+	if (multicast && !trans) {
+		/* Leave the multicast group */
+		if (af == AF_INET) {
+			if (setsockopt(fd[1], IPPROTO_IP, IP_DROP_MEMBERSHIP,
+				       (void *)&mc_group, sizeof(mc_group)) < 0)
+				err("setsockopt");
+		}
+		else {
+			err("unsupported AF");
+		}
+	}
+
 	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ )
 		close(fd[stream_idx]);
 
@@ -3172,6 +3386,7 @@ cleanup:
 		reverse = 0;
 		format = 0;
 		traceroute = 0;
+		multicast = 0;
 		skip_data = 0;
 		host3 = NULL;
 		thirdparty = 0;
