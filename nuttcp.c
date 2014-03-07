@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.4
+ *	N U T T C P . C						v6.2.5
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.5, Bill Fink, 16-Apr-09
+ *	Allow passing of third party control port via "-Pctlport/ctlport3"
+ *	Up default idle data minimum to 15 sec to better handle net transients
+ *	Don't reset nstream until after last use (fix getaddrinfo() memory leak)
  * 6.2.4, Bill Fink, 10-Apr-09
  *	Fix bug with simultaneous server connections to manually started server
  * 6.2.3, Bill Fink, 5-Apr-09
@@ -617,7 +621,7 @@ static struct	sigaction savesigact;
 #endif
 #define MAX_EOT_WAIT_SEC	60.0	/* max wait for unacked data at EOT */
 #define SRVR_INFO_TIMEOUT	60	/* timeout for reading server info */
-#define IDLE_DATA_MIN		5.0	/* minimum value for chk_idle_data */
+#define IDLE_DATA_MIN		15.0	/* minimum value for chk_idle_data */
 #define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
 #define IDLE_DATA_MAX		60.0	/* maximum value for chk_idle_data */
 #define NON_JUMBO_ETHER_MSS	1448	/* 1500 - 20:IP - 20:TCP -12:TCPOPTS */
@@ -676,7 +680,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -779,6 +783,7 @@ int one = 1;                    /* for 4.3 BSD style setsockopt() */
 #define DEFAULT_CTLPORT	5000
 unsigned short port = 0;	/* TCP port number */
 unsigned short ctlport = 0;	/* control port for server connection */
+unsigned short ctlport3 = 0;	/* control port for 3rd party server conn */
 int tmpport;
 char *host;			/* ptr to name of host */
 char *host3 = NULL;		/* ptr to 3rd party host */
@@ -1639,13 +1644,26 @@ main( int argc, char **argv )
 			break;
 		case 'P':
 			reqval = 0;
-			tmpport = atoi(getoptvalp(argv, 2, reqval, &skiparg));
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			tmpport = atoi(cp1);
 			if ((tmpport < 5000) || (tmpport > 65535)) {
-				fprintf(stderr, "invalid ctlport = %d\n", tmpport);
+				fprintf(stderr,
+					"invalid ctlport = %d\n", tmpport);
 				fflush(stderr);
 				exit(1);
 			}
 			ctlport = tmpport;
+			if ((cp2 = strchr(cp1, '/'))) {
+				tmpport = atoi(cp2 + 1);
+				if ((tmpport < 5000) || (tmpport > 65535)) {
+					fprintf(stderr,
+						"invalid third party "
+						"ctlport = %d\n", tmpport);
+					fflush(stderr);
+					exit(1);
+				}
+				ctlport3 = tmpport;
+			}
 			break;
 		case 'u':
 			udp = 1;
@@ -2712,6 +2730,26 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (host3 && !abortconn) {
+					if (irvers >= 60205) {
+						fprintf(ctlconn,
+							" , ctlport3 = %hu",
+							ctlport3);
+					}
+					else {
+						if (ctlport3) {
+							fprintf(stdout, "nuttcp%s%s: ctlport3 option not supported by server version %d.%d.%d, need >= 6.2.5\n",
+								trans?"-t":"-r",
+								ident,
+								rvers_major,
+								rvers_minor,
+								rvers_delta);
+							fflush(stdout);
+							ctlport3 = 0;
+							abortconn = 1;
+						}
+					}
+				}
 				if (irvers >= 50101) {
 					fprintf(ctlconn, " , multicast = %d", multicast);
 				}
@@ -2973,6 +3011,13 @@ doit:
 				else {
 					host3 = NULL;
 				}
+				if (host3 && (irvers >= 60205)) {
+					sscanf(strstr(buf, ", ctlport3 =") + 13,
+						"%hu", &ctlport3);
+				}
+				else {
+					ctlport3 = 0;
+				}
 				if (irvers >= 50101) {
 					sscanf(strstr(buf, ", multicast =") + 14,
 						"%d", &mc_param);
@@ -3099,6 +3144,14 @@ doit:
 					fputs("KO\n", stdout);
 					mes("ctlport overlaps port/nstream");
 					fprintf(stdout, "ctlport = %hu, port/nstream = %hu/%d\n", ctlport, port, nstream);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (host3 && ctlport3 && (ctlport3 < 5000)) {
+					fputs("KO\n", stdout);
+					mes("invalid ctlport3");
+					fprintf(stdout, "ctlport3 = %hu\n",
+						ctlport3);
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
@@ -4131,9 +4184,15 @@ acceptnewconn:
 			j = 0;
 			cmdargs[i++] = cmd;
 			cmdargs[i++] = "-3";
-			if (pass_ctlport) {
-				sprintf(tmpargs[j], "-P%hu", ctlport);
+			if (ctlport3) {
+				sprintf(tmpargs[j], "-P%hu", ctlport3);
 				cmdargs[i++] = tmpargs[j++];
+			}
+			else {
+				if (pass_ctlport) {
+					sprintf(tmpargs[j], "-P%hu", ctlport);
+					cmdargs[i++] = tmpargs[j++];
+				}
 			}
 			if (irvers < 50302) {
 				if ((udp && !multicast
@@ -5969,7 +6028,6 @@ cleanup:
 		nbuf = 0;
 		sendwin = origsendwin;
 		rcvwin = origrcvwin;
-		nstream = 1;
 		b_flag = 1;
 		rate = MAXRATE;
 		irate = 0;
@@ -6009,6 +6067,7 @@ cleanup:
 		skip_data = 0;
 		host3 = NULL;
 		thirdparty = 0;
+		ctlport3 = 0;
 		nbuf_bytes = 0;
 		rate_pps = 0;
 		brief = 0;
@@ -6016,14 +6075,24 @@ cleanup:
 		got_begin = 0;
 		two_bod = 0;
 		handle_urg = 0;
-		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
-			res[stream_idx] = NULL;
+		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
+			if (res[stream_idx]) {
+				freeaddrinfo(res[stream_idx]);
+				res[stream_idx] = NULL;
+			}
+		}
+		nstream = 1;
 		if (!oneshot)
 			goto doit;
 	}
-	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
-		if (res[stream_idx])
+
+	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
+		if (res[stream_idx]) {
 			freeaddrinfo(res[stream_idx]);
+			res[stream_idx] = NULL;
+		}
+	}
+
 	exit(0);
 
 usage:
