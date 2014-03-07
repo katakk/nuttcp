@@ -1,8 +1,8 @@
 /*
- *	N U T T C P . C						v6.1.3
+ *	N U T T C P . C						v6.1.4
  *
- * Copyright(c) 2000 - 2008 Bill Fink.  All rights reserved.
- * Copyright(c) 2003 - 2008 Rob Scott.  All rights reserved.
+ * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
+ * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
  *
  * nuttcp is free, opensource software.  You can redistribute it and/or
  * modify it under the terms of Version 2 of the GNU General Public
@@ -29,6 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.1.4, Bill Fink, 5-Jan-09
+ *	Updated Copyright notice
+ *	Bugfix: set chk_idle_data on client (now also checks no data received)
+ *	Use argv[0] instead of "nuttcp" for third party
+ *	Bugfix: give error message again on error starting server
  * 6.1.3, Bill Fink, 17-Sep-08
  *	Timeout client accept() too and give nice error message (for scripts)
  * 6.1.2, Bill Fink, 29-Aug-08
@@ -636,7 +641,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 1;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -745,6 +750,7 @@ int no3rd = 0;			/* set to 1 by server to disallow 3rd party */
 int forked = 0;			/* set to 1 after server has forked */
 int pass_ctlport = 0;		/* set to 1 to use same outgoing control port
 				   as incoming with 3rd party usage */
+char *nut_cmd;			/* command used to invoke nuttcp */
 char *cmdargs[50];		/* command arguments array */
 char tmpargs[50][40];
 
@@ -1326,6 +1332,7 @@ main( int argc, char **argv )
 
 	if (argc < 2) goto usage;
 
+	nut_cmd = argv[0];
 	argv++; argc--;
 	while( argc>0 && argv[0][0] == '-' )  {
 		skiparg = 0;
@@ -2160,15 +2167,6 @@ main( int argc, char **argv )
 		else {
 			err("unsupported AF");
 		}
-	}
-
-	if (clientserver && !inetd && sinkmode) {
-		close(0);
-		close(1);
-		close(2);
-		open("/dev/null", O_RDWR);
-		dup(0);
-		dup(0);
 	}
 
 	if (clientserver && !inetd && !oneshot && !sinkmode) {
@@ -3551,6 +3549,14 @@ doit:
 				if (pid != 0)
 					exit(0);
 				forked = 1;
+				if (sinkmode) {
+					close(0);
+					close(1);
+					close(2);
+					open("/dev/null", O_RDWR);
+					dup(0);
+					dup(0);
+				}
 				setsid();
 			}
 			if (options && (stream_idx > 0))  {
@@ -3793,7 +3799,7 @@ doit:
 
 		fflush(stdout);
 		fflush(stderr);
-		cmd = "nuttcp";
+		cmd = nut_cmd;
 
 		if (client) {
 			if ((pid = fork()) == (pid_t)-1)
@@ -4264,7 +4270,7 @@ doit:
 		itimer.it_interval.tv_usec =
 			(interval - itimer.it_interval.tv_sec)*1000000;
 		setitimer(ITIMER_REAL, &itimer, 0);
-		if (clientserver && !client) {
+		if (clientserver) {
 			chk_idle_data = (interval < idle_data_min) ?
 						idle_data_min : interval;
 			chk_idle_data = (chk_idle_data > idle_data_max) ?
