@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.4
+ *	N U T T C P . C						v6.0.5
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.5, Bill Fink, 10-Aug-08
+ *	Allow "-s" from/to stdin/stdout with "-1" oneshot server mode
+ *	Switch beta vers message to stderr to not interfere with "-s" option
+ *	Don't set default timeout if "-s" specified
+ *	Give error message for "-s" with "-S" (xinetd or manually started)
  * 6.0.4, Bill Fink, 18-Jul-08
  *	Forgot about 3rd party support for RTT info - fix that
  * 6.0.3, Bill Fink, 17-Jul-08
@@ -594,7 +599,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -779,8 +784,8 @@ pid_t pid;			/* process id when forking server process */
 pid_t wait_pid;			/* return of wait system call */
 int pidstat;			/* status of forked process */
 FILE *ctlconn;			/* uses fd[0] for control channel */
+int savestdin;			/* used to save real standard in */
 int savestdout;			/* used to save real standard out */
-int realstdout;			/* used for "-s" output to real standard out */
 int firsttime = 1;		/* flag for first pass through server */
 struct in_addr clientaddr;	/* IP address of client connecting to server */
 
@@ -1867,10 +1872,13 @@ main( int argc, char **argv )
 
 	if (!nbuf) {
 		if (timeout == 0.0) {
-			timeout = DEFAULT_TIMEOUT;
-			itimer.it_value.tv_sec = timeout;
-			itimer.it_value.tv_usec =
-				(timeout - itimer.it_value.tv_sec)*1000000;
+			if (sinkmode) {
+				timeout = DEFAULT_TIMEOUT;
+				itimer.it_value.tv_sec = timeout;
+				itimer.it_value.tv_usec =
+					(timeout - itimer.it_value.tv_sec)
+						*1000000;
+			}
 			nbuf = INT_MAX;
 		}
 	}
@@ -2048,7 +2056,6 @@ main( int argc, char **argv )
 			goto usage;
 		}
 		udp = 0;
-		sinkmode = 1;
 		start_idx = 0;
 		ident[0] = '\0';
 		if (force_server) {
@@ -2089,11 +2096,19 @@ main( int argc, char **argv )
 		}
 	}
 
-	if (clientserver && !inetd && !nofork) {
-		if ((pid = fork()) == (pid_t)-1)
-			err("can't fork");
-		if (pid != 0)
-			exit(0);
+	if (clientserver && !inetd) {
+		if (!oneshot && !sinkmode) {
+			fprintf(stderr, "option \"-s\" invalid with \"-S\" server mode\n");
+			fprintf(stderr, "option \"-s\" can be used with \"-1\" oneshot server mode\n");
+			fflush(stderr);
+			exit(1);
+		}
+		if (!nofork) {
+			if ((pid = fork()) == (pid_t)-1)
+				err("can't fork");
+			if (pid != 0)
+				exit(0);
+		}
 	}
 
 #ifdef HAVE_SETPRIO
@@ -2195,13 +2210,13 @@ main( int argc, char **argv )
 
 	if (clientserver && client && !thirdparty &&
 	    beta && !(format & NOBETAMSG)) {
-		fprintf(stdout, "nuttcp-%d.%d.%d: ",
+		fprintf(stderr, "nuttcp-%d.%d.%d: ",
 				vers_major, vers_minor, vers_delta);
-		fprintf(stdout, "Using beta vers: %s interface/output "
+		fprintf(stderr, "Using beta vers: %s interface/output "
 				"subject to change\n", BETA_FEATURES);
-		fprintf(stdout, "              (to suppress this message "
+		fprintf(stderr, "              (to suppress this message "
 				"use \"-f-beta\")\n\n");
-		fflush(stdout);
+		fflush(stderr);
 	}
 
 doit:
@@ -2254,6 +2269,15 @@ doit:
 				}
 				if (!(ctlconn = fdopen(fd[0], "w")))
 					err("fdopen: ctlconn for writing");
+				if (!sinkmode) {
+					if (trans)
+						savestdin=dup(0);
+					else {
+						savestdout=dup(1);
+						close(1);
+						dup(2);
+					}
+				}
 				close(0);
 				dup(fd[0]);
 				if (srvr_helo) {
@@ -2743,6 +2767,12 @@ doit:
 					nodelay = 0;
 				}
 				trans = !trans;
+				if (inetd && !sinkmode) {
+					fputs("KO\n", stdout);
+					mes("option \"-s\" invalid with inetd server");
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
 				if (!traceroute && !host3 &&
 				    (nbuflen != buflen)) {
 					if (nbuflen < 1) {
@@ -2994,11 +3024,6 @@ doit:
 			err("socket");
 
 		if (stream_idx == nstream) {
-			if (!sinkmode && !trans) {
-				realstdout = dup(1);
-				close(1);
-				dup(2);
-			}
 			if (brief <= 0)
 				mes("socket");
 #ifdef HAVE_SETPRIO
@@ -4539,7 +4564,7 @@ doit:
 	} else {
 		register int cnt;
 		if (trans)  {
-			while((cnt=read(0,buf,buflen)) > 0 &&
+			while((cnt=read(savestdin,buf,buflen)) > 0 &&
 			    Nwrite(fd[stream_idx + 1],buf,cnt) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
@@ -4548,7 +4573,7 @@ doit:
 			}
 		}  else  {
 			while((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
-			    write(realstdout,buf,cnt) == cnt) {
+			    write(savestdout,buf,cnt) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
 				stream_idx++;
@@ -5221,8 +5246,6 @@ cleanup:
 		if (!oneshot)
 			goto doit;
 	}
-	if (!sinkmode && !trans)
-		close(realstdout);
 	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
 		if (res[stream_idx])
 			freeaddrinfo(res[stream_idx]);
