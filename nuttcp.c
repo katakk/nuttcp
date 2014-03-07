@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.11
+ *	N U T T C P . C						v5.1.12
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.12, Bill Fink & Rob Scott, 4-Oct-05
+ *	Terminate server receiver if client control connection goes away
+ *	or if no data received from client within CHECK_CLIENT_INTERVAL
  * V5.1.11, Rob Scott, 25-Jun-04
  *	Add support for scoped ipv6 addresses
  * V5.1.10, Bill Fink, 16-Jun-04
@@ -393,6 +396,8 @@ static struct	sigaction savesigact;
 #define MINMALLOC		1024
 #define HI_MC			231ul
 #define ACCEPT_TIMEOUT		5
+#define CHECK_CLIENT_INTERVAL	60	/* server receiver checks this often
+					 * for client having gone away */
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -426,7 +431,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 11;
+int vers_delta = 12;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -509,6 +514,7 @@ unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
 int irate = 0;			/* instantaneous rate limit if set */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
+double chk_interval = 0.0;	/* timer (in seconds) for checking client */
 char intervalbuf[256+2];	/* buf for interval reporting */
 char linebuf[256+2];		/* line buffer */
 int do_poll = 0;		/* set to read interval reports (client xmit) */
@@ -638,6 +644,9 @@ uint64_t ntbytes = 0;		/* bytes sent by transmitter */
 uint64_t ptbytes = 0;		/* previous bytes sent by transmitter */
 uint64_t ntbytesc = 0;		/* bytes sent by transmitter that have
 				 * been counted */
+uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
+				 * being received by server (presumably because
+				 * client transmitter went away */
 int numCalls = 0;		/* # of NRead/NWrite calls. */
 int nstream = 1;		/* number of streams */
 int stream_idx = 0;		/* current stream */
@@ -685,11 +694,49 @@ sigalarm( int signum )
 /*	beginnings of timestamps - not ready for prime time */
 /*	struct	timeval timet; */	/* Transmitter time */
 	uint64_t nrbytes;
+	int nodata;
 	int i;
 	char *cp1, *cp2;
 
 	if (host3 && clientserver && !client)
 		return;
+
+	if (clientserver && !client && !trans) {
+		struct sockaddr_in peer;
+		socklen_t peerlen = sizeof(peer);
+
+		nodata = 0;
+
+		if (getpeername(fd[0], (struct sockaddr *)&peer, &peerlen) < 0)
+			nodata = 1;
+
+		if (interval) {
+			chk_interval += interval;
+			if (chk_interval >= CHECK_CLIENT_INTERVAL) {
+				chk_interval = 0;
+				if ((nbytes - chk_nbytes) == 0)
+					nodata = 1;
+				chk_nbytes = nbytes;
+			}
+		}
+		else {
+			if ((nbytes - chk_nbytes) == 0)
+				nodata = 1;
+			chk_nbytes = nbytes;
+		}
+
+		if (nodata) {
+			if (inetd)
+				exit(1);
+			for ( i = 1; i <= nstream; i++ )
+				close(fd[i]);
+			intr = 1;
+			return;
+		}
+
+		if (!interval)
+			return;
+	}
 
 	if (interval && !trans) {
 		if ((udp && !got_begin) || done)
@@ -2893,6 +2940,17 @@ doit:
 			(interval - itimer.it_interval.tv_sec)*1000000;
 		setitimer(ITIMER_REAL, &itimer, 0);
 	}
+	else if (clientserver && !client && !trans) {
+		sigact.sa_handler = &sigalarm;
+		sigemptyset(&sigact.sa_mask);
+		sigact.sa_flags = SA_RESTART;
+		sigaction(SIGALRM, &sigact, 0);
+		itimer.it_value.tv_sec = CHECK_CLIENT_INTERVAL;
+		itimer.it_value.tv_usec = 0;
+		itimer.it_interval.tv_sec = CHECK_CLIENT_INTERVAL;
+		itimer.it_interval.tv_usec = 0;
+		setitimer(ITIMER_REAL, &itimer, 0);
+	}
 
 	if (interval && clientserver && client && trans)
 		do_poll = 1;
@@ -3541,6 +3599,7 @@ cleanup:
 		nbytes = 0;
 		ntbytes = 0;
 		ntbytesc = 0;
+		chk_nbytes = 0;
 		numCalls = 0;
 		buflen = 64 * 1024;
 		if (udp) buflen = DEFAULTUDPBUFLEN;
@@ -3553,6 +3612,7 @@ cleanup:
 		irate = 0;
 		timeout = 0.0;
 		interval = 0.0;
+		chk_interval = 0.0;
 		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
