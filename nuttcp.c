@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.9
+ *	N U T T C P . C						v5.1.10
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.10, Bill Fink, 16-Jun-04
+ *	Allow 'b' suffix on "-w" option to specify window size in bytes
  * V5.1.9, Bill Fink, 23-May-04
  *	Fix bug with client error on "-d" option putting server into bad state
  *	Set server accept timeout (currently 5 seconds) to prevent stuck server
@@ -422,7 +424,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 9;
+int vers_delta = 10;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -966,15 +968,19 @@ optlen = sizeof(maxseg);
 			reqval = 0;
 			if (argv[0][2] == 's') {
 				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
-				srvrwin = 1024 * atoi(cp1);
+				srvrwin = atoi(cp1);
 				if (*cp1)
 					ch = *(cp1 + strlen(cp1) - 1);
 				else
 					ch = '\0';
-				if ((ch == 'm') || (ch == 'M'))
+				if ((ch == 'k') || (ch == 'K'))
 					srvrwin *= 1024;
-				else if ((ch == 'g') || (ch == 'G'))
+				else if ((ch == 'm') || (ch == 'M'))
 					srvrwin *= 1048576;
+				else if ((ch == 'g') || (ch == 'G'))
+					srvrwin *= 1073741824;
+				else if ((ch != 'b') && (ch != 'B'))
+					srvrwin *= 1024;
 				if (srvrwin < 0) {
 					fprintf(stderr, "invalid srvrwin = %d\n", srvrwin);
 					fflush(stderr);
@@ -988,22 +994,26 @@ optlen = sizeof(maxseg);
 							 &skiparg);
 					if (*cp1 == '\0')
 						break;
-					sendwin = 1024 * atoi(cp1);
+					sendwin = atoi(cp1);
 				}
 				else {
 					cp1 = getoptvalp(argv, 2, reqval,
 							 &skiparg);
-					sendwin = 1024 * atoi(cp1);
+					sendwin = atoi(cp1);
 				}
 
 				if (*cp1)
 					ch = *(cp1 + strlen(cp1) - 1);
 				else
 					ch = '\0';
-				if ((ch == 'm') || (ch == 'M'))
+				if ((ch == 'k') || (ch == 'K'))
 					sendwin *= 1024;
-				else if ((ch == 'g') || (ch == 'G'))
+				else if ((ch == 'm') || (ch == 'M'))
 					sendwin *= 1048576;
+				else if ((ch == 'g') || (ch == 'G'))
+					sendwin *= 1073741824;
+				else if ((ch != 'b') && (ch != 'B'))
+					sendwin *= 1024;
 				rcvwin = sendwin;
 				if (sendwin < 0) {
 					fprintf(stderr, "invalid sendwin = %d\n", sendwin);
