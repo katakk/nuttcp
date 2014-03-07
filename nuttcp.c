@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.4
+ *	N U T T C P . C						v5.1.5
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.5, Bill Fink, 23-Apr-04
+ *	Modification to allow space between option parameter and its value
+ *	Permit 'k' or 'm' suffix on "-l" option
+ *	Add "-nb" option to specify number of bytes to transfer
+ *	Permit 'k', 'm', 'g', 't', or 'p' suffix on "-n" and "-nb" options
  * V5.1.4, Bill Fink, 21-Apr-04
  *	Change usage statement to use standard out instead of standard error
  *	Fix bug with interval > timeout, give warning and ignore interval
@@ -362,6 +367,7 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #define MAXSTREAM		128
 #endif
 #define DEFAULT_NBUF		2048
+#define DEFAULT_NBYTES		134217728	/* 128 MB */
 #define DEFAULT_TIMEOUT		10.0
 #define DEFAULT_MC_RATE		1000
 #define DEFAULTUDPBUFLEN	8192
@@ -396,10 +402,11 @@ int Nread( int fd, char *buf, int count );
 int Nwrite( int fd, char *buf, int count );
 int delay( int us );
 int mread( int fd, char *bufp, unsigned n);
+char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -432,6 +439,7 @@ int nbuflen;
 int mallocsize;
 char *buf;			/* ptr to dynamic buffer */
 uint64_t nbuf = 0;		/* number of buffers to send in sinkmode */
+int nbuf_bytes = 0;		/* set to 1 if nbuf is actually bytes */
 
 /*  nick code  */
 int sendwin=0, sendwinval=0, origsendwin=0;
@@ -507,7 +515,7 @@ int priority = 0;		/* nuttcp process priority */
 long timeout_sec = 0;
 struct itimerval itimer;	/* for setitimer */
 int srvr_helo = 1;		/* set to 0 if server doesn't send HELO */
-char *ident = "";		/* identifier for nuttcp output */
+char ident[40 + 1 + 1] = "";	/* identifier for nuttcp output */
 int intr = 0;
 int abortconn = 0;
 int braindead = 0;		/* for braindead Solaris 2.8 systems */
@@ -549,6 +557,7 @@ Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
 "	-l##	length of network write|read buf (default 8192/udp, 65536/tcp)\n\
 	-s	use stdin|stdout for data input|output instead of pattern data\n\
 	-n##	number of source bufs written to network (default unlimited)\n\
+	-nb##	number of source bytes written to network (default unlimited)\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
 	-ws##	server receive|transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
@@ -821,6 +830,8 @@ main( int argc, char **argv )
 	struct servent *sp = 0;
 	struct addrinfo hints, *res = NULL;
 	short save_events;
+	int skiparg;
+	int reqval;
 
 /*  nick code  */
 optlen = sizeof(maxseg);
@@ -834,6 +845,7 @@ optlen = sizeof(maxseg);
 
 	argv++; argc--;
 	while( argc>0 && argv[0][0] == '-' )  {
+		skiparg = 0;
 		switch (argv[0][1]) {
 
 		case '4':
@@ -864,7 +876,14 @@ optlen = sizeof(maxseg);
 			nodelay = 1;
 			break;
 		case 'n':
-			nbuf = strtoull(&argv[0][2], NULL, 0);
+			reqval = 0;
+			if (argv[0][2] == 'b') {
+				nbuf_bytes = 1;
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+			}
+			else
+				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			nbuf = strtoull(cp1, NULL, 0);
 			if (nbuf == 0) {
 				if (errno == EINVAL) {
 					fprintf(stderr, "invalid nbuf = %s\n",
@@ -872,23 +891,57 @@ optlen = sizeof(maxseg);
 					fflush(stderr);
 					exit(1);
 				}
-				else
-					nbuf = DEFAULT_NBUF;
+				else {
+					if (nbuf_bytes)
+						nbuf = DEFAULT_NBYTES;
+					else
+						nbuf = DEFAULT_NBUF;
+					break;
+				}
 			}
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
+			else
+				ch = '\0';
+			if ((ch == 'k') || (ch == 'K'))
+				nbuf *= 1024;
+			else if ((ch == 'm') || (ch == 'M'))
+				nbuf *= 1048576;
+			else if ((ch == 'g') || (ch == 'G'))
+				nbuf *= 1073741824;
+			else if ((ch == 't') || (ch == 'T'))
+				nbuf *= 1099511627776ull;
+			else if ((ch == 'p') || (ch == 'P'))
+				nbuf *= 1125899906842624ull;
 			break;
 		case 'l':
-			buflen = atoi(&argv[0][2]);
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			buflen = atoi(cp1);
 			buflenopt = 1;
 			if (buflen < 1) {
 				fprintf(stderr, "invalid buflen = %d\n", buflen);
 				fflush(stderr);
 				exit(1);
 			}
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
+			else
+				ch = '\0';
+			if ((ch == 'k') || (ch == 'K'))
+				buflen *= 1024;
+			else if ((ch == 'm') || (ch == 'M'))
+				buflen *= 1048576;
 			break;
 		case 'w':
+			reqval = 0;
 			if (argv[0][2] == 's') {
-				srvrwin = 1024 * atoi(&argv[0][3]);
-				ch = argv[0][strlen(argv[0]) - 1];
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+				srvrwin = 1024 * atoi(cp1);
+				if (*cp1)
+					ch = *(cp1 + strlen(cp1) - 1);
+				else
+					ch = '\0';
 				if ((ch == 'm') || (ch == 'M'))
 					srvrwin *= 1024;
 				else if ((ch == 'g') || (ch == 'G'))
@@ -902,16 +955,22 @@ optlen = sizeof(maxseg);
 			else {
 				if (argv[0][2] == 'b') {
 					braindead = 1;
-					if (argv[0][3])
-						sendwin = 1024 *
-							  atoi(&argv[0][3]);
-					else
+					cp1 = getoptvalp(argv, 3, reqval,
+							 &skiparg);
+					if (*cp1 == '\0')
 						break;
+					sendwin = 1024 * atoi(cp1);
 				}
-				else
-					sendwin = 1024 * atoi(&argv[0][2]);
+				else {
+					cp1 = getoptvalp(argv, 2, reqval,
+							 &skiparg);
+					sendwin = 1024 * atoi(cp1);
+				}
 
-				ch = argv[0][strlen(argv[0]) - 1];
+				if (*cp1)
+					ch = *(cp1 + strlen(cp1) - 1);
+				else
+					ch = '\0';
 				if ((ch == 'm') || (ch == 'M'))
 					sendwin *= 1024;
 				else if ((ch == 'g') || (ch == 'G'))
@@ -931,7 +990,8 @@ optlen = sizeof(maxseg);
 			sinkmode = 0;	/* sink/source data */
 			break;
 		case 'p':
-			tmpport = atoi(&argv[0][2]);
+			reqval = 0;
+			tmpport = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if ((tmpport < 5001) || (tmpport > 65535)) {
 				fprintf(stderr, "invalid port = %d\n", tmpport);
 				fflush(stderr);
@@ -940,7 +1000,8 @@ optlen = sizeof(maxseg);
 			port = tmpport;
 			break;
 		case 'P':
-			tmpport = atoi(&argv[0][2]);
+			reqval = 0;
+			tmpport = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if ((tmpport < 5000) || (tmpport > 65535)) {
 				fprintf(stderr, "invalid ctlport = %d\n", tmpport);
 				fflush(stderr);
@@ -958,7 +1019,8 @@ optlen = sizeof(maxseg);
 				verbose = 1;
 			break;
 		case 'N':
-			nstream = atoi(&argv[0][2]);
+			reqval = 0;
+			nstream = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if (nstream < 1) {
 				fprintf(stderr, "invalid nstream = %d\n", nstream);
 				fflush(stderr);
@@ -972,13 +1034,20 @@ optlen = sizeof(maxseg);
 			if (nstream > 1) b_flag = 1;
 			break;
 		case 'R':
+			reqval = 0;
 			if (argv[0][2] == 'i') {
-				rate = atoi(&argv[0][3]);
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+				rate = atoi(cp1);
 				irate = 1;
 			}
+			else {
+				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+				rate = atoi(cp1);
+			}
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
 			else
-				rate = atoi(&argv[0][2]);
-			ch = argv[0][strlen(argv[0]) - 1];
+				ch = '\0';
 			if ((ch == 'm') || (ch == 'M'))
 				rate *= 1000;
 			else if ((ch == 'g') || (ch == 'G'))
@@ -987,7 +1056,9 @@ optlen = sizeof(maxseg);
 				rate = MAXRATE;
 			break;
 		case 'T':
-			sscanf(&argv[0][2], "%lf", &timeout);
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			sscanf(cp1, "%lf", &timeout);
 			if (timeout < 0) {
 				fprintf(stderr, "invalid timeout = %f\n", timeout);
 				fflush(stderr);
@@ -995,7 +1066,10 @@ optlen = sizeof(maxseg);
 			}
 			else if (timeout == 0.0)
 				timeout = DEFAULT_TIMEOUT;
-			ch = argv[0][strlen(argv[0]) - 1];
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
+			else
+				ch = '\0';
 			if ((ch == 'm') || (ch == 'M'))
 				timeout *= 60.0;
 			else if ((ch == 'h') || (ch == 'H'))
@@ -1007,7 +1081,9 @@ optlen = sizeof(maxseg);
 				nbuf = INT_MAX;
 			break;
 		case 'i':
-			sscanf(&argv[0][2], "%lf", &interval);
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			sscanf(cp1, "%lf", &interval);
 			if (interval < 0.0) {
 				fprintf(stderr, "invalid interval = %f\n", interval);
 				fflush(stderr);
@@ -1015,22 +1091,30 @@ optlen = sizeof(maxseg);
 			}
 			else if (interval == 0.0) 
 				interval = 1.0;
-			ch = argv[0][strlen(argv[0]) - 1];
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
+			else
+				ch = '\0';
 			if ((ch == 'm') || (ch == 'M'))
 				interval *= 60.0;
+			else if ((ch == 'h') || (ch == 'H'))
+				interval *= 3600.0;
 			break;
 		case 'I':
-			ident = &argv[0][1];
-			*ident = '-';
-			if (strlen(ident) > 41)
-				*(ident + 41) = '\0';
+			reqval = 1;
+			ident[0] = '-';
+			strncpy(&ident[1],
+				getoptvalp(argv, 2, reqval, &skiparg), 40);
+			ident[41] = '\0';
 			break;
 		case 'F':
 			reverse = 1;
 			break;
 		case 'b':
-			if (argv[0][2])
-				brief = atoi(&argv[0][2]);
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			if (*cp1)
+				brief = atoi(cp1);
 			else
 				brief = 1;
 			break;
@@ -1085,13 +1169,15 @@ optlen = sizeof(maxseg);
 			}
 			break;
 		case 'x':
+			reqval = 0;
 			if (argv[0][2] == 't') {
 				traceroute = 1;
 				brief = 1;
 			}
 #ifdef HAVE_SETPRIO
 			else if (argv[0][2] == 'P')
-				priority = atoi(&argv[0][3]);
+				priority = atoi(getoptvalp(argv, 3, reqval,
+						&skiparg));
 #endif
 			else {
 				if (argv[0][2]) {
@@ -1110,8 +1196,10 @@ optlen = sizeof(maxseg);
 			thirdparty = 1;
 			break;
 		case 'm':
-			if (argv[0][2])
-				mc_param = atoi(&argv[0][2]);
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			if (*cp1)
+				mc_param = atoi(cp1);
 			else
 				mc_param = 1;
 			if ((mc_param < 1) || (mc_param > 255)) {
@@ -1144,7 +1232,12 @@ optlen = sizeof(maxseg);
 		default:
 			goto usage;
 		}
-		argv++; argc--;
+		argv++;
+		argc--;
+		if (skiparg) {
+			argv++;
+			argc--;
+		}
 	}
 
 	if (argc > 2) goto usage;
@@ -1327,7 +1420,7 @@ optlen = sizeof(maxseg);
 		udp = 0;
 		sinkmode = 1;
 		start_idx = 0;
-		ident = "";
+		ident[0] = '\0';
 		if (force_server) {
 			close(0);
 			close(1);
@@ -1425,6 +1518,11 @@ optlen = sizeof(maxseg);
 	    fprintf(stderr, "UDP buflen = %d > MAXUDPBUFLEN, set to %d\n",
 		buflen, MAXUDPBUFLEN);
 	    buflen = MAXUDPBUFLEN;
+	}
+
+	if (nbuf_bytes) {
+		nbuf /= buflen;
+		nbuf_bytes = 0;
 	}
 
 	if (udp && interval)
@@ -3416,7 +3514,7 @@ cleanup:
 		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
-		ident = "";
+		ident[0] = '\0';
 		intr = 0;
 		abortconn = 0;
 		port = 5001;
@@ -3799,4 +3897,79 @@ mread( int fd, register char *bufp, unsigned n )
 	 } while(count < n);
 
 	return((int)count);
+}
+
+/*
+ *			G E T O P T V A L P
+ *
+ * This function returns a character pointer to the option value
+ * pointed at by argv and sets skiparg to 1 if the option and its
+ * value were passed as separate arguments (otherwise it sets
+ * skiparg to 0).  index is the position within argv where the
+ * option value resides if the option was specified as a single
+ * argument.  reqval indicates whether or not the option requires
+ * a value
+ */
+char *
+getoptvalp( char **argv, int index, int reqval, int *skiparg )
+{
+	struct sockaddr_storage dummy;
+	char **nextarg;
+	char *cp;
+
+	*skiparg = 0;
+	nextarg = argv + 1;
+
+	/* if there is a value in the current arg return it */
+	if (argv[0][index])
+		return(&argv[0][index]);
+
+	/* if there isn't a next arg return a pointer to the
+	   current arg value (which will be an empty string) */
+	if (*nextarg == NULL)
+		return(&argv[0][index]);
+
+	/* if the next arg is another option, return a pointer to the
+	   current arg value (which will be an empty string) */
+	if (**nextarg == '-')
+		return(&argv[0][index]);
+
+	/* if there is an arg after the next arg and it is another
+	   option, return the next arg as the option value */
+	if (*(nextarg + 1) && (**(nextarg + 1) == '-')) {
+		*skiparg = 1;
+		return(*nextarg);
+	}
+
+	/* if the option requires a value, return the next arg
+	   as the option value */
+	if (reqval) {
+		*skiparg = 1;
+		return(*nextarg);
+	}
+
+	/* if the next arg is an Ipv4 address, return a pointer to the
+	   current arg value (which will be an empty string) */
+	if (inet_pton(AF_INET, *nextarg, &dummy) > 0)
+		return(&argv[0][index]);
+
+#ifdef AF_INET6
+	/* if the next arg is an Ipv6 address, return a pointer to the
+	   current arg value (which will be an empty string) */
+	if (inet_pton(AF_INET6, *nextarg, &dummy) > 0)
+		return(&argv[0][index]);
+#endif
+
+	/* if the next arg begins with an alphabetic character,
+	   assume it is a hostname and thus return a pointer to the
+	   current arg value (which will be an empty string).
+	   note all current options which don't require a value
+	   have numeric values (start with a digit) */
+	if (isalpha(**nextarg))
+		return(&argv[0][index]);
+
+	/* assume the next arg is the option value */
+	*skiparg = 1;
+
+	return(*nextarg);
 }
