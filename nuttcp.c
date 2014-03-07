@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.3
+ *	N U T T C P . C						v6.0.4
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.4, Bill Fink, 18-Jul-08
+ *	Forgot about 3rd party support for RTT info - fix that
  * 6.0.3, Bill Fink, 17-Jul-08
  *	A better (and accurate) way to get RTT info (and not just Linux)
  * 6.0.2, Bill Fink, 16-Jul-08
@@ -592,7 +594,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -3815,6 +3817,8 @@ doit:
 					cmdargs[i++] = "-f-retrans";
 				if (format & PARSE)
 					cmdargs[i++] = "-fparse";
+				if (format & WANTRTT)
+					cmdargs[i++] = "-frtt";
 			}
 			if (traceroute)
 				cmdargs[i++] = "-xt";
