@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.1.2
+ *	N U T T C P . C						v6.1.3
  *
  * Copyright(c) 2000 - 2008 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2008 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.1.3, Bill Fink, 17-Sep-08
+ *	Timeout client accept() too and give nice error message (for scripts)
  * 6.1.2, Bill Fink, 29-Aug-08
  *	Don't wait forever for unacked data at EOT (limit to 1 minute max)
  *	Extend no data received protection to client too (for scripts)
@@ -634,7 +636,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 1;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -3562,7 +3564,7 @@ doit:
 					if (errno != EINVAL)
 						err("unable to set maximum segment size");
 			}
-			if (clientserver && !client && (stream_idx > 0)) {
+			if (clientserver && (stream_idx > 0)) {
 				sigact.sa_handler = ignore_alarm;
 				sigemptyset(&sigact.sa_mask);
 				sigact.sa_flags = 0;
@@ -3572,7 +3574,7 @@ doit:
 			fromlen = sizeof(frominet);
 			nfd=accept(fd[stream_idx], (struct sockaddr *)&frominet, &fromlen);
 			save_errno = errno;
-			if (clientserver && !client && (stream_idx > 0)) {
+			if (clientserver && (stream_idx > 0)) {
 				alarm(0);
 				sigact.sa_handler = savesigact.sa_handler;
 				sigact.sa_mask = savesigact.sa_mask;
@@ -3580,13 +3582,19 @@ doit:
 				sigaction(SIGALRM, &sigact, 0);
 			}
 			if (nfd < 0) {
-				/* check for interrupted system call,
-				 * close data streams, cleanup and try
-				 * again - all other errors just die
+				/* check for interrupted system call - on
+				 * server, close data streams, cleanup and
+				 * try again - all other errors just die
 				 */
 				if ((save_errno == EINTR) && clientserver
-							  && !client
 							  && (stream_idx > 0)) {
+					if (client) {
+						/* if client, just give nice
+						 * error message and exit
+						 */
+						mes("Error: accept() timeout");
+						exit(1);
+					}
 					for ( i = 1; i <= stream_idx; i++ )
 						close(fd[i]);
 					goto cleanup;
