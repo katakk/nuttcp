@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.3.4
+ *	N U T T C P . C						v5.4.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,12 +22,25 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.4.1, Bill Fink, 30-Jun-06
+ *	Fix bug with UDP reporting > linerate because of bad correction
+ *	Send 2nd UDP BOD packet in case 1st is lost, e.g. waiting for ARP reply
+ *	(makes UDP BOD more robust for new separate control and data paths)
+ *	Fix bug with interval reports after EOD for UDP with small interval
+ *	Don't just exit inetd server on no data so can get partial results
+ *	(keep an eye out that servers don't start hanging again)
+ *	Make default idle data timeout 1/2 of timeout if interval not set
+ *	(with a minimum of 5 seconds and a maximum of 60 seconds)
+ *	Make server send abort via urgent TCP data if no UDP data received
+ *	(non-interval only: so client won't keep transmitting for full period)
+ *	Workaround for Windows not handling TCP_MAXSEG getsockopt()
  * V5.3.4, Bill Fink, 21-Jun-06
  *	Add "--idle-data-timeout" server option
  *	(server ends transfer if no data received for the specified
  *	timeout interval, previously it was a fixed 60 second timeout)
  *	Shutdown client control connection for writing at end of UDP transfer
- *	(so server can cope better with loss of all EOD packets)
+ *	(so server can cope better with loss of all EOD packets, which is
+ *	mostly of benefit when using separate control and data paths)
  * V5.3.3, Bill Fink & Mark S. Mathews, 18-Jun-06
  *	Add new capability for separate control and data paths
  *	(using syntax:  nuttcp ctl_name_or_IP/data_name_or_IP)
@@ -439,14 +452,17 @@ static struct	sigaction savesigact;
 #define DEFAULT_NBUF		2048
 #define DEFAULT_NBYTES		134217728	/* 128 MB */
 #define DEFAULT_TIMEOUT		10.0
-#define DEFAULT_UDP_RATE		1000
+#define DEFAULT_UDP_RATE	1000
 #define DEFAULTUDPBUFLEN	8192
 #define DEFAULT_MC_UDPBUFLEN	1024
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
 #define HI_MC			231ul
 #define ACCEPT_TIMEOUT		5
-#define DEFAULT_IDLE_DATA	60	/* default value for chk_idle_data */
+#define IDLE_DATA_MIN		5.0	/* minimum value for chk_idle_data */
+#define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
+#define IDLE_DATA_MAX		60.0	/* maximum value for chk_idle_data */
+#define NON_JUMBO_ETHER_MSS	1448	/* 1500 - 20:IP - 20:TCP -12:TCPOPTS */
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -485,8 +501,8 @@ int mread( int fd, char *bufp, unsigned n);
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
-int vers_minor = 3;
-int vers_delta = 4;
+int vers_minor = 4;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -573,8 +589,8 @@ double irate_cum_nsec = 0.0;	/* cumulative nanaseconds over several pkts */
 int rate_pps = 0;		/* set to 1 if rate is given as pps */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
-double chk_idle_data		/* server receiver checks this often */
-	= DEFAULT_IDLE_DATA;	/* for client having gone away */
+double chk_idle_data = 0.0;	/* server receiver checks this often */
+				/* for client having gone away */
 double chk_interval = 0.0;	/* timer (in seconds) for checking client */
 int ctlconnmss;			/* control connection maximum segment size */
 int datamss = 0;		/* data connection maximum segment size */
@@ -611,6 +627,9 @@ int brief = 1;			/* set for brief output */
 int brief3 = 1;			/* for third party nuttcp */
 int done = 0;			/* don't output interval report if done */
 int got_begin = 0;		/* don't output interval report if not begun */
+int two_bod = 0;		/* newer versions send 2 BOD packets for UDP */
+int handle_urg = 0;		/* newer versions send/recv urgent TCP data */
+int got_eod0 = 0;		/* got EOD0 packet - marks end of UDP xfer */
 int buflenopt = 0;		/* whether or not user specified buflen */
 int haverateopt = 0;		/* whether or not user specified rate */
 int clientserver = 0;		/* client server mode (use control channel) */
@@ -688,7 +707,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
-"	--idle-data-timeout <value>   server timeout for idle data connection\n"
+"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
+"		     server timeout in seconds for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
 #ifdef IPV6_V6ONLY
@@ -768,7 +788,7 @@ sigalarm( int signum )
 	uint64_t deltarbytes, deltatbytes;
 	double fractloss;
 	int nodata;
-	int eod;
+/*	int normal_eod;							*/
 	int i;
 	char *cp1, *cp2;
 	short save_events;
@@ -776,17 +796,29 @@ sigalarm( int signum )
 	if (host3 && clientserver && !client)
 		return;
 
+	if (interval && !trans) {
+		/* Get real time */
+		gettimeofday(&timec, (struct timezone *)0);
+		tvsub( &timed, &timec, &timep );
+		realtd = timed.tv_sec + ((double)timed.tv_usec) / 1000000;
+		if( realtd <= 0.0 )  realtd = 0.000001;
+		tvsub( &timed, &timec, &time0 );
+		realt = timed.tv_sec + ((double)timed.tv_usec)
+						    / 1000000;
+		if( realt <= 0.0 )  realt = 0.000001;
+	}
+
 	if (clientserver && !client && !trans) {
 		struct sockaddr_in peer;
 		socklen_t peerlen = sizeof(peer);
 
 		nodata = 0;
-		eod = 0;
+/*		normal_eod = 0;						*/
 
 		if (getpeername(fd[0], (struct sockaddr *)&peer, &peerlen) < 0)
 			nodata = 1;
 
-		if (udp) {
+		if (udp && got_begin) {
 			/* checks if client did a shutdown() for writing
 			 * on the control connection */
 			pollfds[0].fd = fileno(ctlconn);
@@ -796,13 +828,13 @@ sigalarm( int signum )
 			if ((poll(pollfds, 1, 0) > 0) &&
 			    (pollfds[0].revents & (POLLIN | POLLPRI))) {
 				nodata = 1;
-				eod = 1;
+/*				normal_eod = 1;				*/
 			}
 			pollfds[0].events = save_events;
 		}
 
 		if (interval) {
-			chk_interval += interval;
+			chk_interval += realtd;
 			if (chk_interval >= chk_idle_data) {
 				chk_interval = 0;
 				if ((nbytes - chk_nbytes) == 0)
@@ -817,8 +849,16 @@ sigalarm( int signum )
 		}
 
 		if (nodata) {
-			if (inetd && !eod)
-				exit(1);
+			/* Don't just exit anymore so can get partial results
+			 * (shouldn't be a problem but keep an eye out that
+			 * servers don't start hanging again) */
+/*			if (inetd && !normal_eod)			*/
+/*				exit(1);				*/
+			if (udp && !interval && handle_urg) {
+				/* send 'A' for ABORT as urgent TCP data
+				 * on control connection (don't block) */
+				send(fd[0], "A", 1, MSG_OOB | MSG_DONTWAIT);
+			}
 			for ( i = 1; i <= nstream; i++ )
 				close(fd[i]);
 			intr = 1;
@@ -830,19 +870,12 @@ sigalarm( int signum )
 	}
 
 	if (interval && !trans) {
-		if ((udp && !got_begin) || done)
+		if ((udp && !got_begin) || done) {
+			timep.tv_sec = timec.tv_sec;
+			timep.tv_usec = timec.tv_usec;
 			return;
+		}
 		if (clientserver) {
-			/* Get real time */
-			gettimeofday(&timec, (struct timezone *)0);
-			tvsub( &timed, &timec, &timep );
-			realtd = timed.tv_sec + ((double)timed.tv_usec)
-								/ 1000000;
-			if( realtd <= 0.0 )  realtd = 0.000001;
-			tvsub( &timed, &timec, &time0 );
-			realt = timed.tv_sec + ((double)timed.tv_usec)
-							    / 1000000;
-			if( realt <= 0.0 )  realt = 0.000001;
 			nrbytes = nbytes;
 			if (udplossinfo) {
 				ntbytes = *(unsigned long long *)(buf + 24);
@@ -998,7 +1031,8 @@ main( int argc, char **argv )
 	double fractloss;
 	int cpu_util;
 	int first_read;
-	int correction = 0;
+	int ocorrection = 0;
+	double  correction = 0.0;
 	int pollst = 0;
 	int i, j;
 	char *cp1, *cp2;
@@ -1008,9 +1042,15 @@ main( int argc, char **argv )
 	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL };
+	struct timeval time_eod;	/* time EOD packet was received */
+	struct timeval timepkrcv;	/* time last data packet received */
+	struct timeval timed;		/* time delta */
 	short save_events;
 	int skiparg;
 	int reqval;
+	double idle_data_min = IDLE_DATA_MIN;
+	double idle_data_max = IDLE_DATA_MAX;
+	double default_idle_data = DEFAULT_IDLE_DATA;
 
 	sendwin = 0;
 	rcvwin = 0;
@@ -1464,11 +1504,54 @@ main( int argc, char **argv )
 			}
 			else if (strcmp(&argv[0][2],
 				 "idle-data-timeout") == 0) {
-				sscanf(argv[1], "%lf", &chk_idle_data);
-				if (chk_idle_data <= 0.0) {
-					fprintf(stderr, "invalid value for idle-data-timeout = %f\n", chk_idle_data);
-					fflush(stderr);
-					exit(1);
+				if ((cp1 = strchr(argv[1], '/'))) {
+					if (strchr(cp1 + 1, '/')) {
+						if (sscanf(argv[1],
+							"%lf/%lf/%lf",
+							&idle_data_min,
+							&default_idle_data,
+							&idle_data_max) != 3) {
+							fprintf(stderr, "error scanning idle-data-timeout parameter = %s\n", argv[1]);
+							fflush(stderr);
+							exit(1);
+						}
+						if (idle_data_min <= 0.0) {
+							fprintf(stderr, "invalid value for idle-data-timeout minimum = %f\n", idle_data_min);
+							fflush(stderr);
+							exit(1);
+						}
+						if (default_idle_data <= 0.0) {
+							fprintf(stderr, "invalid value for idle-data-timeout default = %f\n", default_idle_data);
+							fflush(stderr);
+							exit(1);
+						}
+						if (idle_data_max <= 0.0) {
+							fprintf(stderr, "invalid value for idle-data-timeout maximum = %f\n", idle_data_max);
+							fflush(stderr);
+							exit(1);
+						}
+						if (idle_data_max <
+							idle_data_min) {
+							fprintf(stderr, "error: idle-data-timeout maximum of %f < minimum of %f\n", idle_data_max, idle_data_min);
+							fflush(stderr);
+							exit(1);
+						}
+					}
+					else {
+						fprintf(stderr, "invalid idle-data-timeout parameter = %s\n", argv[1]);
+						fflush(stderr);
+						exit(1);
+					}
+				}
+				else {
+					sscanf(argv[1], "%lf", &idle_data_min);
+					if (idle_data_min <= 0.0) {
+						fprintf(stderr, "invalid value for idle-data-timeout = %f\n", idle_data_min);
+						fflush(stderr);
+						exit(1);
+					}
+					idle_data_max = idle_data_min;
+					default_idle_data = idle_data_min;
 				}
 				argv++;
 				argc--;
@@ -2080,6 +2163,10 @@ doit:
 				}
 				if (irvers < 30403)
 					udplossinfo = 0;
+				if (udp && (irvers >= 50401)) {
+					two_bod = 1;
+					handle_urg = 1;
+				}
 				if (strncmp(buf, "OK", 2) != 0) {
 					mes("error from server");
 					fprintf(stderr, "server ");
@@ -2340,6 +2427,10 @@ doit:
 				if (udp && interval && (buflen >= 32) &&
 					(irvers >= 30403))
 					udplossinfo = 1;
+				if (udp && (irvers >= 50401)) {
+					two_bod = 1;
+					handle_urg = 1;
+				}
 				if ((trans && !reverse) || (!trans && reverse))
 					usleep(50000);
 			}
@@ -2361,9 +2452,12 @@ doit:
 			break;
 
 		if (clientserver && client && udp && (stream_idx == 1)) {
+			ctlconnmss = 0;
 			optlen = sizeof(ctlconnmss);
 			if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
 				err("get ctlconn maximum segment size didn't work\n");
+			if (!ctlconnmss)
+				ctlconnmss = NON_JUMBO_ETHER_MSS;
 			if (format & DEBUGMTU)
 				fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
 			if (buflenopt) {
@@ -2843,7 +2937,7 @@ doit:
 						"nuttcp%s%s: connect=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans) {
+					if (trans && datamss) {
 						fprintf(stdout, " mss=%d",
 							datamss);
 					}
@@ -2853,7 +2947,7 @@ doit:
 						"nuttcp%s%s: connect to %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans) {
+					if (trans && datamss) {
 						fprintf(stdout, " with mss=%d",
 							datamss);
 					}
@@ -2959,7 +3053,7 @@ doit:
 						"nuttcp%s%s: accept=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans) {
+					if (trans && datamss) {
 						fprintf(stdout, " mss=%d",
 							datamss);
 					}
@@ -2969,7 +3063,7 @@ doit:
 						"nuttcp%s%s: accept from %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans) {
+					if (trans && datamss) {
 						fprintf(stdout, " with mss=%d",
 							datamss);
 					}
@@ -2995,7 +3089,7 @@ doit:
 					    "nuttcp%s%s: accept=%s", 
 					    trans?"-t":"-r", ident,
 					    tmphost);
-				    if (trans) {
+				    if (trans && datamss) {
 					fprintf(stdout, " mss=%d", datamss);
 				    }
 				}
@@ -3004,7 +3098,7 @@ doit:
 					    "nuttcp%s%s: accept from %s", 
 					    trans?"-t":"-r", ident,
 					    tmphost);
-				    if (trans) {
+				    if (trans && datamss) {
 					fprintf(stdout, " with mss=%d",
 						datamss);
 				    }
@@ -3509,7 +3603,8 @@ doit:
 		itimer.it_value.tv_usec =
 			(timeout - itimer.it_value.tv_sec)*1000000;
 		signal(SIGALRM, sigalarm);
-		setitimer(ITIMER_REAL, &itimer, 0);
+		if (!udp)
+			setitimer(ITIMER_REAL, &itimer, 0);
 	}
 	else if (!trans && interval) {
 		sigact.sa_handler = &sigalarm;
@@ -3523,12 +3618,32 @@ doit:
 		itimer.it_interval.tv_usec =
 			(interval - itimer.it_interval.tv_sec)*1000000;
 		setitimer(ITIMER_REAL, &itimer, 0);
+		if (clientserver && !client) {
+			chk_idle_data = (interval < idle_data_min) ?
+						idle_data_min : interval;
+			chk_idle_data = (chk_idle_data > idle_data_max) ?
+						idle_data_max : chk_idle_data;
+		}
 	}
 	else if (clientserver && !client && !trans) {
 		sigact.sa_handler = &sigalarm;
 		sigemptyset(&sigact.sa_mask);
 		sigact.sa_flags = SA_RESTART;
 		sigaction(SIGALRM, &sigact, 0);
+		if (timeout) {
+			chk_idle_data = timeout/2;
+		}
+		else {
+			if (rate != MAXRATE)
+				chk_idle_data = (double)(nbuf*buflen)
+							    /rate/125/2;
+			else
+				chk_idle_data = default_idle_data;
+		}
+		chk_idle_data = (chk_idle_data < idle_data_min) ?
+					idle_data_min : chk_idle_data;
+		chk_idle_data = (chk_idle_data > idle_data_max) ?
+					idle_data_max : chk_idle_data;
 		itimer.it_value.tv_sec = chk_idle_data;
 		itimer.it_value.tv_usec =
 			(chk_idle_data - itimer.it_value.tv_sec)
@@ -3552,7 +3667,8 @@ doit:
 	prep_timer();
 	errno = 0;
 	stream_idx = 0;
-	correction = 0;
+	ocorrection = 0;
+	correction = 0.0;
 	if (do_poll) {
 		long flags;
 
@@ -3585,11 +3701,18 @@ doit:
 					  sizeof(struct in_addr));
 				}
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr start */
+				if (two_bod) {
+					usleep(250000);
+					strcpy(buf, "BOD1");
+					(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr start */
+				}
 				if (multicast) {
 				    bcopy((char *)&save_mc.sin_addr.s_addr,
 					  (char *)&sinhim[1].sin_addr.s_addr,
 					  sizeof(struct in_addr));
 				}
+				if (timeout)
+					setitimer(ITIMER_REAL, &itimer, 0);
 				prep_timer();
 			}
 /*			beginnings of timestamps - not ready for prime time */
@@ -3605,8 +3728,9 @@ doit:
 			if (nbuf == INT_MAX)
 				nbuf = ULLONG_MAX;
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
-				if (clientserver && !client
-						 && ((nbuf & 0x3FF) == 0)) {
+				if (clientserver && ((nbuf & 0x3FF) == 0)) {
+				    if (!client) {
+					/* check if client went away */
 					pollfds[0].fd = fileno(ctlconn);
 					save_events = pollfds[0].events;
 					pollfds[0].events = POLLIN | POLLPRI;
@@ -3616,6 +3740,27 @@ doit:
 							(POLLIN | POLLPRI)))
 						break;
 					pollfds[0].events = save_events;
+				    }
+				    else if (udp && !interval && handle_urg) {
+					/* check for urgent TCP data
+					 * on control connection */
+					pollfds[0].fd = fileno(ctlconn);
+					save_events = pollfds[0].events;
+					pollfds[0].events = POLLPRI;
+					pollfds[0].revents = 0;
+					if ((poll(pollfds, 1, 0) > 0)
+						&& (pollfds[0].revents &
+							POLLPRI)) {
+						tmpbuf[0] = '\0';
+						recv(fd[0], tmpbuf, 1,
+						     MSG_OOB | MSG_DONTWAIT);
+						if (tmpbuf[0] == 'A')
+							intr = 1;
+						else
+							err("recv urgent data");
+					}
+					pollfds[0].events = save_events;
+				    }
 				}
 				nbytes += buflen;
 				cnt = 0;
@@ -3673,7 +3818,9 @@ doit:
 							fflush(stdout);
 						}
 						got_done = 1;
+						intr = 1;
 						do_poll = 0;
+						break;
 					}
 					else if (strncmp(intervalbuf, "nuttcp-r", 8) == 0) {
 						if ((brief <= 0) ||
@@ -3720,15 +3867,27 @@ doit:
 			    ntbytesc = 0;
 			    first_read = 1;
 			    need_swap = 0;
+			    got_eod0 = 0;
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    if( cnt <= 4 ) {
-					    if (strncmp(buf, "EOD0", 4) == 0)
+					    if (strncmp(buf, "EOD0", 4) == 0) {
+						    gettimeofday(&timepkrcv,
+							(struct timezone *)0);
+						    got_eod0 = 1;
+						    done = 1;
 						    continue;
+					    }
 					    if (strncmp(buf, "EOD", 3) == 0) {
-						    correction = buf[3] - '0';
+						    ocorrection = buf[3] - '0';
+						    gettimeofday(&time_eod,
+							(struct timezone *)0);
+						    done = 1;
 						    break;	/* "EOF" */
 					    }
 					    if (strncmp(buf, "BOD", 3) == 0) {
+						    if (two_bod &&
+							(buf[3] == '0'))
+							    continue;
 						    if (interval)
 							setitimer(ITIMER_REAL,
 								  &itimer, 0);
@@ -3737,6 +3896,17 @@ doit:
 						    continue;
 					    }
 					    break;
+				    }
+				    else if (!got_begin) {
+					    if (interval)
+						    setitimer(ITIMER_REAL,
+							      &itimer, 0);
+					    prep_timer();
+					    got_begin = 1;
+				    }
+				    else if (got_eod0) {
+					    gettimeofday(&timepkrcv,
+							 (struct timezone *)0);
 				    }
 				    if (!got_begin)
 					    continue;
@@ -3769,6 +3939,12 @@ doit:
 			    }
 			    if (intr && (cnt > 0))
 				    nbytes += cnt;
+			    if (got_eod0) {
+				    tvsub( &timed, &time_eod, &timepkrcv );
+				    correction = timed.tv_sec +
+						    ((double)timed.tv_usec)
+								/ 1000000;
+			    }
 			} else {
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    nbytes += cnt;
@@ -3806,7 +3982,7 @@ doit:
 	itimer.it_value.tv_sec = 0;
 	itimer.it_value.tv_usec = 0;
 	setitimer(ITIMER_REAL, &itimer, 0);
-	done++;
+	done = 1;
 	(void)read_timer(stats,sizeof(stats));
 	if(udp&&trans)  {
 		usleep(500000);
@@ -3835,7 +4011,8 @@ doit:
 		/* If all the EOD packets get lost at the end of a UDP
 		 * transfer, having the client do a shutdown() for writing
 		 * on the control connection allows the server to more
-		 * quickly realize that the UDP transfer has completed */
+		 * quickly realize that the UDP transfer has completed
+		 * (mostly of benefit for separate control and data paths) */
 		shutdown(0, SHUT_WR);
 
 	if (multicast && !trans) {
@@ -3861,8 +4038,12 @@ doit:
 	if( cput <= 0.0 )  cput = 0.000001;
 	if( realt <= 0.0 )  realt = 0.000001;
 
-	if (udp && !trans)
-		realt -= correction * 0.5;
+	if (udp && !trans) {
+		if (got_eod0)
+			realt -= correction;
+		else
+			realt -= ocorrection * 0.5;
+	}
 
 	sprintf(srvrbuf, "%.4f", (double)nbytes/1024/1024);
 	sscanf(srvrbuf, "%lf", &MB);
@@ -3883,7 +4064,7 @@ doit:
 		while (fgets(intervalbuf, sizeof(intervalbuf), stdin)) {
 			if (strncmp(intervalbuf, "DONE", 4) == 0) {
 				if (format & DEBUGPOLL) {
-					fprintf(stdout, "got DONE\n");
+					fprintf(stdout, "got DONE 2\n");
 					fflush(stdout);
 				}
 				break;
@@ -4250,6 +4431,7 @@ cleanup:
 		timeout = 0.0;
 		interval = 0.0;
 		chk_interval = 0.0;
+		chk_idle_data = 0.0;
 		datamss = 0;
 		tos = 0;
 		do_poll = 0;
@@ -4279,6 +4461,8 @@ cleanup:
 		brief = 0;
 		done = 0;
 		got_begin = 0;
+		two_bod = 0;
+		handle_urg = 0;
 		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
 			res[stream_idx] = NULL;
 		if (!oneshot)
