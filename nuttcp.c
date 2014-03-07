@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.2.2
+ *	N U T T C P . C						v5.3.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,12 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.3.1, Rob Scott, 06-Jun-06
+ *	Add "-c" COS option for setting DSCP/TOS setting
+ *	Fix builds on latest MacOS X
+ *	Fix bug with 3rd party unlimited rate UDP not working
+ *	Change "-M" option to require a value
+ *	Fix compiler warnings with -Wall (thanks to Daniel J Blueman)
  * V5.2.2, Bill Fink, 13-May-06
  *	Have client report server warnings even if not verbose
  * V5.2.1, Bill Fink, 12-May-06
@@ -291,6 +297,12 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <string.h>
 #include <fcntl.h>
 
+#if defined(linux) || defined (sgi) || (defined(__MACH__) && defined(_SOCKLEN_T)) || defined(sparc) || defined(__CYGWIN__)
+#include <unistd.h>
+#include <sys/wait.h>
+#include <strings.h>
+#endif
+
 #ifndef ULLONG_MAX
 #define ULLONG_MAX	18446744073709551615ULL
 #endif
@@ -301,7 +313,7 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #define HAVE_SETPRIO
 #endif
 
-#if !defined(__MACH__) && !defined(_WIN32)
+#if !defined(_WIN32) && (!defined(__MACH__) || defined(_SOCKLEN_T))
 #define HAVE_POLL
 #endif
 
@@ -324,11 +336,9 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
  */
 
 /*
- * FIXME:
- * the nice gentlemen at Apple fixed their includes to typedef this now, but
- * there is no obvious way of differentiating the need for this.
+ * _SOCKLEN_T is now defined by apple when they typedef socklen_t
  */
-#if (defined(__APPLE__) && defined(__MACH__)) || (defined(sparc) && !defined(EAI_NONAME))
+#if (defined(__APPLE__) && defined(__MACH__)) && !defined(_SOCKLEN_T) || (defined(sparc) && !defined(EAI_NONAME))
 typedef int socklen_t;
 #endif
 
@@ -336,11 +346,7 @@ typedef int socklen_t;
 #if !defined(EAI_NONAME) /* old sparc */
 #define sockaddr_storage sockaddr
 #define ss_family sa_family
-#else /* new sparc */
-#include <unistd.h>
-#include <sys/wait.h>
-#include <strings.h>
-#endif /* new sparc */
+#endif /* old sparc */
 #endif /* sparc */
 
 #if defined(_AIX)
@@ -444,9 +450,9 @@ void sigpipe( int signum );
 void sigint( int signum );
 void ignore_alarm( int signum );
 void sigalarm( int signum );
-void err( char *s );
-void mes( char *s );
-void errmes( char *s );
+static void err( char *s );
+static void mes( char *s );
+static void errmes( char *s );
 void pattern( char *cp, int cnt );
 void prep_timer();
 double read_timer( char *str, int len );
@@ -461,8 +467,8 @@ int mread( int fd, char *bufp, unsigned n);
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
-int vers_minor = 2;
-int vers_delta = 2;
+int vers_minor = 3;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -552,6 +558,7 @@ double interval = 0.0;		/* interval timer in seconds */
 double chk_interval = 0.0;	/* timer (in seconds) for checking client */
 int ctlconnmss;			/* control connection maximum segment size */
 int datamss = 0;		/* data connection maximum segment size */
+unsigned int tos = 0;		/* 8-bit TOS field for setting DSCP/TOS */
 char intervalbuf[256+2];	/* buf for interval reporting */
 char linebuf[256+2];		/* line buffer */
 int do_poll = 0;		/* set to read interval reports (client xmit) */
@@ -617,7 +624,8 @@ Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
 #endif
-"	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n\
+"	-c##	cos dscp value on data streams (t|T suffix for full TOS field)\n\
+	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n\
 	-s	use stdin|stdout for data input|output instead of pattern data\n\
 	-n##	number of source bufs written to network (default unlimited)\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
@@ -952,12 +960,12 @@ main( int argc, char **argv )
 	int cpu_util;
 	int first_read;
 	int correction = 0;
-	int pollst;
+	int pollst = 0;
 	int i, j;
 	char *cp1, *cp2;
 	char ch;
-	int error_num;
-	int sockopterr;
+	int error_num = 0;
+	int sockopterr = 0;
 	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res = NULL;
@@ -1301,7 +1309,7 @@ main( int argc, char **argv )
 			verbose = 1;
 			break;
 		case 'V':
-			fprintf(stdout, "nuttcp v%d.%d.%d\n", vers_major,
+			fprintf(stdout, "nuttcp-%d.%d.%d\n", vers_major,
 					vers_minor, vers_delta);
 			exit(0);
 		case 'f':
@@ -1377,10 +1385,33 @@ main( int argc, char **argv )
 			multicast = mc_param;
 			break;
 		case 'M':
-			reqval = 0;
+			reqval = 1;
 			datamss = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if (datamss < 0) {
 				fprintf(stderr, "invalid datamss = %d\n", datamss);
+				fflush(stderr);
+				exit(1);
+			}
+			break;
+		case 'c':
+			reqval = 1;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			tos = strtol(cp1, NULL, 0);
+			if (*cp1)
+				ch = *(cp1 + strlen(cp1) - 1);
+			else
+				ch = '\0';
+			if ((ch != 't') && (ch != 'T')) {
+				/* DSCP */
+				if (tos > 63) {
+					fprintf(stderr, "invalid dscp = %d\n", tos);
+					fflush(stderr);
+					exit(1);
+				}
+				tos <<= 2;
+			}
+			if (tos > 255) {
+				fprintf(stderr, "invalid tos = %d\n", tos);
 				fflush(stderr);
 				exit(1);
 			}
@@ -1430,7 +1461,7 @@ main( int argc, char **argv )
 		}
 		cp1 = host3;
 		while (*cp1) {
-			if (!isalnum(*cp1) && (*cp1 != '-') && (*cp1 != '.')
+			if (!isalnum((int)(*cp1)) && (*cp1 != '-') && (*cp1 != '.')
 					   && (*cp1 != ':')) {
 				fprintf(stderr, "invalid 3rd party host '%s'\n", host3);
 				fflush(stderr);
@@ -1477,14 +1508,12 @@ main( int argc, char **argv )
 	}
 
 	if (argc >= 1) {
-		struct sockaddr_storage dummy;
-
 		host = argv[0];
 
 		bzero(&hints, sizeof(hints));
 		res = NULL;
 		if (explicitaf) hints.ai_family = af;
-		if (error_num = getaddrinfo(host, NULL, &hints, &res)) {
+		if ((error_num = getaddrinfo(host, NULL, &hints, &res))) {
 			fprintf(stderr, "bad hostname or address: %s\n", gai_strerror(error_num));
 			exit(1);
 		}
@@ -1510,17 +1539,17 @@ main( int argc, char **argv )
 
 	if (!port) {
 		if (af == AF_INET) {
-			if (sp = getservbyname( "nuttcp-data", "tcp" ))
+			if ((sp = getservbyname( "nuttcp-data", "tcp" )))
 				port = ntohs(sp->s_port);
 			else
 				port = DEFAULT_PORT;
 		}
 #ifdef AF_INET6
 		else if (af == AF_INET6) {
-			if (sp = getservbyname( "nuttcp6-data", "tcp" ))
+			if ((sp = getservbyname( "nuttcp6-data", "tcp" )))
 				port = ntohs(sp->s_port);
 			else {
-				if (sp = getservbyname( "nuttcp-data", "tcp" ))
+				if ((sp = getservbyname( "nuttcp-data", "tcp" )))
 					port = ntohs(sp->s_port);
 				else
 					port = DEFAULT_PORT;
@@ -1534,17 +1563,17 @@ main( int argc, char **argv )
 
 	if (!ctlport) {
 		if (af == AF_INET) {
-			if (sp = getservbyname( "nuttcp", "tcp" ))
+			if ((sp = getservbyname( "nuttcp", "tcp" )))
 				ctlport = ntohs(sp->s_port);
 			else
 				ctlport = DEFAULT_CTLPORT;
 		}
 #ifdef AF_INET6
 		else if (af == AF_INET6) {
-			if (sp = getservbyname( "nuttcp6", "tcp" ))
+			if ((sp = getservbyname( "nuttcp6", "tcp" )))
 				ctlport = ntohs(sp->s_port);
 			else {
-				if (sp = getservbyname( "nuttcp", "tcp" ))
+				if ((sp = getservbyname( "nuttcp", "tcp" )))
 					ctlport = ntohs(sp->s_port);
 				else
 					ctlport = DEFAULT_CTLPORT;
@@ -1694,11 +1723,12 @@ main( int argc, char **argv )
 		rate = llrate;
 	}
 
-	if (udp && interval)
+	if (udp && interval) {
 		if (buflen >= 32)
 			udplossinfo = 1;
 		else
 			fprintf(stderr, "Unable to print interval loss information if UDP buflen < 32\n");
+	}
 
 	ivers = vers_major*10000 + vers_minor*100 + vers_delta;
 
@@ -1933,6 +1963,21 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 50301) {
+					fprintf(ctlconn, " , tos = %X", tos);
+				}
+				else {
+					if (tos && !trans) {
+						fprintf(stdout, "nuttcp%s%s: tos option not supported by server version %d.%d.%d, need >= 5.3.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						tos = 0;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -2054,7 +2099,7 @@ doit:
 						}
 						cp1 = host3;
 						while (*cp1) {
-							if (!isalnum(*cp1)
+							if (!isalnum((int)(*cp1))
 							     && (*cp1 != '-')
 							     && (*cp1 != '.')
 							     && (*cp1 != ':')) {
@@ -2088,6 +2133,13 @@ doit:
 				}
 				else {
 					datamss = 0;
+				}
+				if (irvers >= 50301) {
+					sscanf(strstr(buf, ", tos =") + 8,
+						"%X", &tos);
+				}
+				else {
+					tos = 0;
 				}
 				trans = !trans;
 				if (nbuflen != buflen) {
@@ -2182,6 +2234,13 @@ doit:
 					fputs("KO\n", stdout);
 					mes("invalid datamss");
 					fprintf(stdout, "datamss = %d\n", datamss);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (tos > 255) {
+					fputs("KO\n", stdout);
+					mes("invalid tos");
+					fprintf(stdout, "tos = %d\n", tos);
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
@@ -2361,19 +2420,24 @@ doit:
 				if (timeout)
 				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n", 
 				    ident, timeout);
+				if ((rate != MAXRATE) || tos)
+				    fprintf(stdout,"nuttcp-t%s:", ident);
 				if (rate != MAXRATE) {
-				    fprintf(stdout,"nuttcp-t%s: rate_limit = %.3f rate_unit=Mbps rate_mode=%s",
-					ident, (double)rate/1000,
+				    fprintf(stdout," rate_limit=%.3f rate_unit=Mbps rate_mode=%s",
+					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (udp) {
 					uint64_t ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
-					fprintf(stdout," pps_rate=%lld",
+					fprintf(stdout," pps_rate=%llu",
 					    ppsrate);
 				    }
-				    fprintf(stdout,"\n");
 				}
+				if (tos)
+				    fprintf(stdout," tos=0x%X", tos);
+				if ((rate != MAXRATE) || tos)
+				    fprintf(stdout,"\n");
 			    }
 			    else if (brief <= 0) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
@@ -2391,18 +2455,25 @@ doit:
 				    fprintf(stdout,"nuttcp-t%s: time limit = %.2f second%s\n",
 					ident, timeout,
 					(timeout == 1.0)?"":"s");
+				if ((rate != MAXRATE) || tos)
+				    fprintf(stdout,"nuttcp-t%s:", ident);
 				if (rate != MAXRATE) {
-				    fprintf(stdout,"nuttcp-t%s: rate limit = %.3f Mbps (%s)",
-					ident, (double)rate/1000,
+				    fprintf(stdout," rate limit = %.3f Mbps (%s)",
+					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (udp) {
 					uint64_t ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
-					fprintf(stdout,", %lld pps", ppsrate);
+					fprintf(stdout,", %llu pps", ppsrate);
 				    }
-				    fprintf(stdout,"\n");
+				    if (tos)
+					fprintf(stdout,",");
 				}
+				if (tos)
+				    fprintf(stdout," tos = 0x%X", tos);
+				if ((rate != MAXRATE) || tos)
+				    fprintf(stdout,"\n");
 			    }
 			} else {
 			    if ((brief <= 0) && (format & PARSE)) {
@@ -2413,6 +2484,9 @@ doit:
 				fprintf(stdout,"nstream=%d port=%d mode=%s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
+				if (tos)
+				    fprintf(stdout,"nuttcp-r%s: tos=0x%X\n",
+					ident, tos);
 				if (interval)
 				    fprintf(stdout,"nuttcp-r%s: reporting_interval=%.2f\n",
 					ident, interval);
@@ -2425,6 +2499,9 @@ doit:
 				fprintf(stdout,"nstream=%d, port=%d %s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
+				if (tos)
+				    fprintf(stdout,"nuttcp-r%s: tos = 0x%X\n",
+					ident, tos);
 				if (interval)
 				    fprintf(stdout,"nuttcp-r%s: interval reporting every %.2f second%s\n",
 					ident, interval,
@@ -2469,6 +2546,11 @@ doit:
 					(void *)&rcvwin, sizeof(rcvwin)) < 0))
 					err("setsockopt");
 			}
+			if (tos) {
+				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
+					(void *)&tos, sizeof(tos)) < 0)
+					err("setsockopt");
+			}
 			if (nodelay && !udp) {
 				struct protoent *p;
 				p = getprotobyname("tcp");
@@ -2486,6 +2568,11 @@ doit:
 					err("setsockopt");
 				if (braindead && (setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
 					(void *)&sendwin, sizeof(sendwin)) < 0))
+					err("setsockopt");
+			}
+			if (tos) {
+				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
+					(void *)&tos, sizeof(tos)) < 0)
 					err("setsockopt");
 			}
 		    }
@@ -2593,11 +2680,12 @@ doit:
 			if (sockopterr && trans &&
 			    (stream_idx > 0) && datamss) {
 				optlen = sizeof(datamss);
-				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0) {
 					if (errno != EINVAL)
 						err("unable to set maximum segment size\n");
 					else
 						err("setting maximum segment size not supported on this OS\n");
+				}
 			}
 			if (stream_idx == nstream) {
 				optlen = sizeof(datamss);
@@ -2627,18 +2715,20 @@ doit:
 						"nuttcp%s%s: connect=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans)
+					if (trans) {
 						fprintf(stdout, " mss=%d",
 							datamss);
+					}
 				}
 				else {
 					fprintf(stdout,
 						"nuttcp%s%s: connect to %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans)
+					if (trans) {
 						fprintf(stdout, " with mss=%d",
 							datamss);
+					}
 				}
 				fprintf(stdout, "\n");
 			}
@@ -2682,9 +2772,13 @@ doit:
 				sigaction(SIGALRM, &sigact, 0);
 			}
 			if (nfd < 0) {
-				if ((save_errno = EINTR) && clientserver
-							 && !client
-							 && (stream_idx > 0)) {
+				/* check for interrupted system call,
+				 * close data streams, cleanup and try
+				 * again - all other errors just die
+				 */
+				if ((save_errno == EINTR) && clientserver
+							  && !client
+							  && (stream_idx > 0)) {
 					for ( i = 1; i <= stream_idx; i++ )
 						close(fd[i]);
 					goto cleanup;
@@ -2697,11 +2791,12 @@ doit:
 			if (sockopterr && trans &&
 			    (stream_idx > 0) && datamss) {
 				optlen = sizeof(datamss);
-				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0) {
 					if (errno != EINVAL)
 						err("unable to set maximum segment size\n");
 					else
 						err("setting maximum segment size not supported on this OS\n");
+				}
 			}
 			if (stream_idx == nstream) {
 				optlen = sizeof(datamss);
@@ -2727,18 +2822,20 @@ doit:
 						"nuttcp%s%s: accept=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans)
+					if (trans) {
 						fprintf(stdout, " mss=%d",
 							datamss);
+					}
 				}
 				else {
 					fprintf(stdout,
 						"nuttcp%s%s: accept from %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-					if (trans)
+					if (trans) {
 						fprintf(stdout, " with mss=%d",
 							datamss);
+					}
 				}
 				fprintf(stdout, "\n");
 			    }
@@ -2761,17 +2858,19 @@ doit:
 					    "nuttcp%s%s: accept=%s", 
 					    trans?"-t":"-r", ident,
 					    tmphost);
-				    if (trans)
+				    if (trans) {
 					fprintf(stdout, " mss=%d", datamss);
+				    }
 				}
 				else {
 				    fprintf(stdout,
 					    "nuttcp%s%s: accept from %s", 
 					    trans?"-t":"-r", ident,
 					    tmphost);
-				    if (trans)
+				    if (trans) {
 					fprintf(stdout, " with mss=%d",
 						datamss);
+				    }
 				}
 				fprintf(stdout, "\n");
 			    }
@@ -2960,6 +3059,9 @@ doit:
 				sprintf(tmpargs[j], "-R%s%lu",
 					irate ? "i" : "", rate);
 				cmdargs[i++] = tmpargs[j++];
+			} else {
+				if (udp && !multicast)
+					cmdargs[i++] = "-R0";
 			}
 			if (port != DEFAULT_PORT) {
 				sprintf(tmpargs[j], "-p%hu", port);
@@ -3003,6 +3105,10 @@ doit:
 				cmdargs[i++] = "-xt";
 			if (datamss) {
 				sprintf(tmpargs[j], "-M%d", datamss);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (tos) {
+				sprintf(tmpargs[j], "-c0x%Xt", tos);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			cmdargs[i++] = host3;
@@ -3367,7 +3473,8 @@ doit:
 				cnt = 0;
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
-				stream_idx = ++stream_idx % nstream;
+				stream_idx++;
+				stream_idx = stream_idx % nstream;
 				if (do_poll &&
 				       ((pollst = poll(pollfds, nstream + 1, 5000))
 						> 0) &&
@@ -3509,7 +3616,8 @@ doit:
 							    *cp1++ = *cp2--;
 					    }
 				    }
-				    stream_idx = ++stream_idx % nstream;
+				    stream_idx++;
+				    stream_idx = stream_idx % nstream;
 			    }
 			    if (intr && (cnt > 0))
 				    nbytes += cnt;
@@ -3517,7 +3625,8 @@ doit:
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    nbytes += cnt;
 				    cnt = 0;
-				    stream_idx = ++stream_idx % nstream;
+				    stream_idx++;
+				    stream_idx = stream_idx % nstream;
 			    }
 			    if (intr && (cnt > 0))
 				    nbytes += cnt;
@@ -3530,14 +3639,16 @@ doit:
 			    Nwrite(fd[stream_idx + 1],buf,cnt) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
-				stream_idx = ++stream_idx % nstream;
+				stream_idx++;
+				stream_idx = stream_idx % nstream;
 			}
 		}  else  {
 			while((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
 			    write(realstdout,buf,cnt) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
-				stream_idx = ++stream_idx % nstream;
+				stream_idx++;
+				stream_idx = stream_idx % nstream;
 			}
 		}
 	}
@@ -3553,19 +3664,23 @@ doit:
 		usleep(500000);
 		strcpy(buf, "EOD1");
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
-		stream_idx = ++stream_idx % nstream;
+		stream_idx++;
+		stream_idx = stream_idx % nstream;
 		usleep(500000);
 		strcpy(buf, "EOD2");
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
-		stream_idx = ++stream_idx % nstream;
+		stream_idx++;
+		stream_idx = stream_idx % nstream;
 		usleep(500000);
 		strcpy(buf, "EOD3");
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
-		stream_idx = ++stream_idx % nstream;
+		stream_idx++;
+		stream_idx = stream_idx % nstream;
 		usleep(500000);
 		strcpy(buf, "EOD4");
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
-		stream_idx = ++stream_idx % nstream;
+		stream_idx++;
+		stream_idx = stream_idx % nstream;
 	}
 
 	if (multicast && !trans) {
@@ -3975,6 +4090,7 @@ cleanup:
 		interval = 0.0;
 		chk_interval = 0.0;
 		datamss = 0;
+		tos = 0;
 		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
@@ -4017,7 +4133,7 @@ usage:
 	exit(1);
 }
 
-void
+static void
 err( char *s )
 {
 	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
@@ -4027,14 +4143,14 @@ err( char *s )
 	exit(1);
 }
 
-void
+static void
 mes( char *s )
 {
 	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d: %s\n", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta, s);
 }
 
-void
+static void
 errmes( char *s )
 {
 	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
@@ -4127,13 +4243,13 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 
 		case 'U':
 			tvsub(&tdiff, &r1->ru_utime, &r0->ru_utime);
-			sprintf(outp,"%d.%01d", tdiff.tv_sec, tdiff.tv_usec/100000);
+			sprintf(outp,"%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
 			END(outp);
 			break;
 
 		case 'S':
 			tvsub(&tdiff, &r1->ru_stime, &r0->ru_stime);
-			sprintf(outp,"%d.%01d", tdiff.tv_sec, tdiff.tv_usec/100000);
+			sprintf(outp,"%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
 			END(outp);
 			break;
 
@@ -4154,49 +4270,49 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 			break;
 
 		case 'X':
-			sprintf(outp,"%d", t == 0 ? 0 : (r1->ru_ixrss-r0->ru_ixrss)/t);
+			sprintf(outp,"%ld", t == 0 ? 0 : (r1->ru_ixrss-r0->ru_ixrss)/t);
 			END(outp);
 			break;
 
 		case 'D':
-			sprintf(outp,"%d", t == 0 ? 0 :
+			sprintf(outp,"%ld", t == 0 ? 0 :
 			    (r1->ru_idrss+r1->ru_isrss-(r0->ru_idrss+r0->ru_isrss))/t);
 			END(outp);
 			break;
 
 		case 'K':
-			sprintf(outp,"%d", t == 0 ? 0 :
+			sprintf(outp,"%ld", t == 0 ? 0 :
 			    ((r1->ru_ixrss+r1->ru_isrss+r1->ru_idrss) -
 			    (r0->ru_ixrss+r0->ru_idrss+r0->ru_isrss))/t);
 			END(outp);
 			break;
 
 		case 'M':
-			sprintf(outp,"%d", r1->ru_maxrss/2);
+			sprintf(outp,"%ld", r1->ru_maxrss/2);
 			END(outp);
 			break;
 
 		case 'F':
-			sprintf(outp,"%d", r1->ru_majflt-r0->ru_majflt);
+			sprintf(outp,"%ld", r1->ru_majflt-r0->ru_majflt);
 			END(outp);
 			break;
 
 		case 'R':
-			sprintf(outp,"%d", r1->ru_minflt-r0->ru_minflt);
+			sprintf(outp,"%ld", r1->ru_minflt-r0->ru_minflt);
 			END(outp);
 			break;
 
 		case 'I':
-			sprintf(outp,"%d", r1->ru_inblock-r0->ru_inblock);
+			sprintf(outp,"%ld", r1->ru_inblock-r0->ru_inblock);
 			END(outp);
 			break;
 
 		case 'O':
-			sprintf(outp,"%d", r1->ru_oublock-r0->ru_oublock);
+			sprintf(outp,"%ld", r1->ru_oublock-r0->ru_oublock);
 			END(outp);
 			break;
 		case 'C':
-			sprintf(outp,"%d+%d", r1->ru_nvcsw-r0->ru_nvcsw,
+			sprintf(outp,"%ld+%ld", r1->ru_nvcsw-r0->ru_nvcsw,
 				r1->ru_nivcsw-r0->ru_nivcsw );
 			END(outp);
 			break;
@@ -4278,7 +4394,7 @@ Nwrite( int fd, char *buf, int count )
 {
 	struct timeval timedol;
 	struct timeval td;
-	register int cnt;
+	register int cnt = 0;
 	double deltat;
 
 	if (irate) {
@@ -4448,7 +4564,7 @@ getoptvalp( char **argv, int index, int reqval, int *skiparg )
 	   current arg value (which will be an empty string).
 	   note all current options which don't require a value
 	   have numeric values (start with a digit) */
-	if (isalpha(**nextarg))
+	if (isalpha((int)(**nextarg)))
 		return(&argv[0][index]);
 
 	/* assume the next arg is the option value */
