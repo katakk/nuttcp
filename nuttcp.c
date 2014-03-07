@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.3
+ *	N U T T C P . C						v6.2.4
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.4, Bill Fink, 10-Apr-09
+ *	Fix bug with simultaneous server connections to manually started server
  * 6.2.3, Bill Fink, 5-Apr-09
  *	Add "-xc" option to set CPU affinity (Linux only)
  *	Fix Usage: statement: "--idle-data-timeout" both server & client option
@@ -603,6 +605,9 @@ static struct	sigaction savesigact;
 /* locally defined global scope IPv6 multicast, FF3E::8000:0-FF3E::FFFF:FFFF */
 #define HI_MC6			"FF3E::8000:0000"
 #define HI_MC6_LEN		13
+#ifndef LISTEN_BACKLOG
+#define LISTEN_BACKLOG		64
+#endif
 #define ACCEPT_TIMEOUT		5
 #ifndef MAX_CONNECT_TRIES
 #define MAX_CONNECT_TRIES	10	/* maximum server connect attempts */
@@ -671,7 +676,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -2874,37 +2879,6 @@ doit:
 					    /* send stderr to client */
 					    close(2);
 					    dup(1);
-					    if (!single_threaded) {
-						/* multi-threaded server */
-						if ((pid = fork()) == (pid_t)-1)
-						    err("can't fork");
-						if (pid != 0) {
-						    /* parent just waits for
-						     * quick child exit */
-						    while ((wait_pid =
-								wait(&pidstat))
-								    != pid) {
-							if (wait_pid ==
-								(pid_t)-1) {
-							    if (errno == ECHILD)
-								break;
-							    err("wait failed");
-							}
-						    }
-						    /* and then accepts another
-						     * client connection */
-						    goto cleanup;
-						}
-						/* child just makes a grandchild
-						 * and then immediately exits
-						 * (avoids zombie processes) */
-						if ((pid = fork()) == (pid_t)-1)
-						    err("can't fork");
-						if (pid != 0)
-						    exit(0);
-						/* grandkid does all the work */
-						oneshot = 1;
-					    }
 					}
 				}
 				fgets(buf, mallocsize, ctlconn);
@@ -3757,7 +3731,7 @@ doit:
 					if (errno != EINVAL)
 						err("unable to set maximum segment size");
 			}
-			listen(fd[stream_idx],1);   /* allow a queue of 1 */
+			listen(fd[stream_idx], LISTEN_BACKLOG);
 			if (clientserver && !client && (stream_idx == 0)
 					 && !inetd && !nofork && !forked) {
 				if ((pid = fork()) == (pid_t)-1)
@@ -3793,6 +3767,7 @@ doit:
 				sigaction(SIGALRM, &sigact, &savesigact);
 				alarm(ACCEPT_TIMEOUT);
 			}
+acceptnewconn:
 			fromlen = sizeof(frominet);
 			nfd=accept(fd[stream_idx], (struct sockaddr *)&frominet, &fromlen);
 			save_errno = errno;
@@ -3822,6 +3797,38 @@ doit:
 					goto cleanup;
 				}
 				err("accept");
+			}
+			if (clientserver && !client && (stream_idx == 0)
+					 && !inetd && !nofork
+					 && !single_threaded) {
+				/* multi-threaded manually started server */
+				if ((pid = fork()) == (pid_t)-1)
+					err("can't fork");
+				if (pid != 0) {
+					/* parent just waits for quick
+					 * child exit */
+					while ((wait_pid = wait(&pidstat))
+						    != pid) {
+						if (wait_pid == (pid_t)-1) {
+							if (errno == ECHILD)
+								break;
+							err("wait failed");
+						}
+					}
+					/* and then accept()s another client
+					 * connection */
+					close(nfd);
+					stream_idx = 0;
+					goto acceptnewconn;
+				}
+				/* child just makes a grandchild and then
+				 * immediately exits (avoid zombie processes) */
+				if ((pid = fork()) == (pid_t)-1)
+					err("can't fork");
+				if (pid != 0)
+					exit(0);
+				/* grandkid does all the work */
+				oneshot = 1;
 			}
 			af = frominet.ss_family;
 			close(fd[stream_idx]);
