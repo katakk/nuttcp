@@ -512,6 +512,7 @@ int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 int nodelay = 0;		/* set TCP_NODELAY socket option */
 unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
 int irate = 0;			/* instantaneous rate limit if set */
+int firstpak = 1;		/* is this the first packet of a rate limited stream? */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
 double chk_interval = 0.0;	/* timer (in seconds) for checking client */
@@ -658,9 +659,10 @@ double srvr_realt;
 double srvr_KBps;
 double srvr_Mbps;
 int srvr_cpu_util;
+unsigned long sleept = 0;
 
 double cput = 0.000001, realt = 0.000001;	/* user, real time (seconds) */
-double realtd = 0.000001;	/* real time delta - for interval reporting */
+double realtd = 0.000001;			/* real time delta - for interval reporting */
 
 #ifdef SIGPIPE
 void
@@ -2978,6 +2980,8 @@ doit:
 	}
 	if (sinkmode) {      
 		register int cnt = 0;
+		register unsigned long holdrate;
+
 		if (trans)  {
 			if(udp) {
 				strcpy(buf, "BOD0");
@@ -2989,7 +2993,10 @@ doit:
 					  (char *)&sinhim[1].sin_addr.s_addr,
 					  sizeof(struct in_addr));
 				}
+				holdrate = rate;
+				rate = MAXRATE;
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr start */
+				rate = holdrate;
 				if (multicast) {
 				    bcopy((char *)&save_mc.sin_addr.s_addr,
 					  (char *)&sinhim[1].sin_addr.s_addr,
@@ -3114,6 +3121,7 @@ doit:
 					  (char *)&sinhim[1].sin_addr.s_addr,
 					  sizeof(struct in_addr));
 				strcpy(buf, "EOD0");
+				rate = MAXRATE;
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 			}
 		} else {
@@ -3700,6 +3708,8 @@ prep_timer()
 	gettimeofday(&time0, (struct timezone *)0);
 	timep.tv_sec = time0.tv_sec;
 	timep.tv_usec = time0.tv_usec;
+	timepk.tv_sec = time0.tv_sec;
+	timepk.tv_usec = time0.tv_usec;
 	getrusage(RUSAGE_SELF, &ru0);
 }
 
@@ -3730,7 +3740,7 @@ read_timer( char *str, int len )
 	tvadd( &tstart, &ru0.ru_utime, &ru0.ru_stime );
 	tvsub( &td, &tend, &tstart );
 	cput = td.tv_sec + ((double)td.tv_usec) / 1000000;
-	if( cput < 0.00001 )  cput = 0.00001;
+	if( cput < 0.000001 )  cput = 0.000001;
 	return( cput );
 }
 
@@ -3909,32 +3919,55 @@ Nread( int fd, char *buf, int count )
 /*
  *			N W R I T E
  */
+//#define DEBUG_NWRITE_TIMING
 int
 Nwrite( int fd, char *buf, int count )
 {
 	struct timeval timedol;
 	struct timeval td;
 	register int cnt;
+	int64_t waitt = 0;
 
-	if (irate) {
-		while (((double)count/realt/125 > rate) && !intr) {
+	if (rate != MAXRATE) {
+		if (irate) {
+			/* set start of this packet time and see how long its been */
 			/* Get real time */
 			gettimeofday(&timedol, (struct timezone *)0);
 			tvsub( &td, &timedol, &timepk );
 			realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
 			if( realt <= 0.0 )  realt = 0.000001;
-		}
-		if (intr && (!udp || (count != 4))) return(0);
-		gettimeofday(&timepk, (struct timezone *)0);
-		realt = 0.000001;
-	}
-	else {
-		while ((double)nbytes/realt/125 > rate) {
-			/* Get real time */
-			gettimeofday(&timedol, (struct timezone *)0);
-			tvsub( &td, &timedol, &time0 );
-			realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
-			if( realt <= 0.0 )  realt = 0.000001;
+			waitt = td.tv_sec * 1000000 + td.tv_usec - sleept;
+			if (waitt <= 0 ) waitt = 0;
+#ifdef DEBUG_NWRITE_TIMING
+			fprintf( stderr, "waitt is %ld\n", waitt );
+#endif
+			while (!firstpak && ((double)count/realt/125 > rate) && !intr) {
+#ifdef DEBUG_NWRITE_TIMING
+//				fprintf( stderr, "had to wait with %d count, %lf realt, %f > %d\n", count, realt, (double)count/realt/125, rate );
+#endif
+				/* Get real time */
+				gettimeofday(&timedol, (struct timezone *)0);
+				tvsub( &td, &timedol, &timepk );
+				realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
+				if( realt <= 0.0 )  realt = 0.000001;
+			}
+#ifdef DEBUG_NWRITE_TIMING
+			fprintf( stderr, "sleept = %d\n", sleept );
+#endif
+			timepk.tv_sec  = timedol.tv_sec;
+			timepk.tv_usec = timedol.tv_usec;
+			if (intr && (!udp || (count != 4))) return(0);
+		} else {
+			while (!firstpak && (double)nbytes/realt/125 > rate) {
+#ifdef DEBUG_NWRITE_TIMING
+				fprintf( stderr, "had to wait with %f > %d, ", (double)nbytes/realt/125, rate );
+#endif
+				/* Get real time */
+				gettimeofday(&timedol, (struct timezone *)0);
+				tvsub( &td, &timedol, &time0 );
+				realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
+				if( realt <= 0.0 )  realt = 0.000001;
+			}
 		}
 	}
 /*	beginnings of timestamps - not ready for prime time		*/
@@ -3963,6 +3996,30 @@ again:
 	} else {
 		cnt = write( fd, buf, count );
 		numCalls++;
+	}
+	/*
+	 * To improve cpu use, sleep the time for the buf to move at our specified rate less the time around packets
+	 * ((((cnt<bytes> * 8)<bits> / 1000)<kbits>  / rate<kbits/sec>)<secs> * 1000000)<usecs>
+	 * sleep only if long enough for usleep overhead, and for only 80% of the way...
+	 */
+	if (!firstpak) {
+	    if (rate != MAXRATE) {
+#ifdef DEBUG_NWRITE_TIMING
+		fprintf( stderr, "full loop time would be %d\n", (((int64_t)cnt*8000) / rate) );
+#endif
+		sleept = (((int64_t)cnt*6400) / rate);
+		if (sleept - waitt > 300) {
+		sleept -= waitt;
+#ifdef DEBUG_NWRITE_TIMING
+			fprintf( stderr, "for %d bits  at %d b/s sleeping %d usecs\n", cnt*8, rate*1000, sleept );
+#endif
+			usleep( sleept );
+		} else {
+			sleept = 0;
+		}
+	    }
+	} else {
+	    firstpak = 0;
 	}
 	return(cnt);
 }
