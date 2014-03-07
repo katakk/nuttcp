@@ -1,5 +1,5 @@
-APP = nuttcp-5.5.5
-EXTRAVERSION=-pre1
+APP = nuttcp-6.1.2
+#EXTRAVERSION=-pre1
 CC = gcc -Wall
 #OPT = -g -O0
 OPT = -O3

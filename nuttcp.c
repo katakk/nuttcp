@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.1.1
+ *	N U T T C P . C						v6.1.2
  *
  * Copyright(c) 2000 - 2008 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2008 Rob Scott.  All rights reserved.
@@ -29,6 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.1.2, Bill Fink, 29-Aug-08
+ *	Don't wait forever for unacked data at EOT (limit to 1 minute max)
+ *	Extend no data received protection to client too (for scripts)
+ *	Give nice error messages to client for above cases
+ *	Don't hang getting server info if server exited (timeout reads)
  * 6.1.1, Bill Fink, 26-Aug-08
  *	Remove beta designation
  *	Report RTT by default (use "-f-rtt" to suppress)
@@ -568,6 +573,8 @@ static struct	sigaction savesigact;
 #ifndef SERVER_RETRY_USEC
 #define SERVER_RETRY_USEC	500000	/* server retry time in usec */
 #endif
+#define MAX_EOT_WAIT_SEC	60.0	/* max wait for unacked data at EOT */
+#define SRVR_INFO_TIMEOUT	60	/* timeout for reading server info */
 #define IDLE_DATA_MIN		5.0	/* minimum value for chk_idle_data */
 #define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
 #define IDLE_DATA_MAX		60.0	/* maximum value for chk_idle_data */
@@ -627,7 +634,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 1;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -928,6 +935,7 @@ int stream_idx = 0;		/* current stream */
 int start_idx = 1;		/* set to use or bypass control channel */
 int b_flag = 1;			/* use mread() */
 int got_srvr_output = 0;	/* set when server output has been read */
+int reading_srvr_info = 0;	/* set when starting to read server info */
 int retry_server = 0;		/* set to retry control connect() to server */
 int num_connect_tries = 0;	/* tracks attempted connects to server */
 int single_threaded = 0;	/* set to make server single threaded */
@@ -987,6 +995,11 @@ sigalarm( int signum )
 	if (host3 && clientserver && !client)
 		return;
 
+	if (clientserver && client && reading_srvr_info) {
+		mes("Error: not receiving server info");
+		exit(1);
+	}
+
 	if (interval && !trans) {
 		/* Get real time */
 		gettimeofday(&timec, (struct timezone *)0);
@@ -999,7 +1012,7 @@ sigalarm( int signum )
 		if( realt <= 0.0 )  realt = 0.000001;
 	}
 
-	if (clientserver && !client && !trans) {
+	if (clientserver && !trans) {
 		struct sockaddr_in peer;
 		socklen_t peerlen = sizeof(peer);
 
@@ -1009,7 +1022,7 @@ sigalarm( int signum )
 		if (getpeername(fd[0], (struct sockaddr *)&peer, &peerlen) < 0)
 			nodata = 1;
 
-		if (udp && got_begin) {
+		if (!client && udp && got_begin) {
 			/* checks if client did a shutdown() for writing
 			 * on the control connection */
 			pollfds[0].fd = fileno(ctlconn);
@@ -1047,9 +1060,13 @@ sigalarm( int signum )
 /*			if ((inetd  || (!nofork && !single_threaded))	*/
 /*					&& !normal_eod)			*/
 /*				exit(1);				*/
-			if (udp && !interval && handle_urg) {
+			if (!client && udp && !interval && handle_urg) {
 				/* send 'A' for ABORT as urgent TCP data
-				 * on control connection (don't block) */
+				 * on control connection (don't block)
+				 *
+				 * Only server can do this since client
+				 * does a shutdown() for writing on the
+				 * control connection */
 				saveflags = fcntl(fd[0], F_GETFL, 0);
 				if (saveflags != -1) {
 					flags = saveflags | O_NONBLOCK;
@@ -1063,6 +1080,10 @@ sigalarm( int signum )
 			}
 			for ( i = 1; i <= nstream; i++ )
 				close(fd[i]);
+			if (client) {
+				mes("Error: not receiving data from server");
+				exit(1);
+			}
 			intr = 1;
 			return;
 		}
@@ -4217,6 +4238,8 @@ doit:
 		itimer.it_value.tv_sec = timeout;
 		itimer.it_value.tv_usec =
 			(timeout - itimer.it_value.tv_sec)*1000000;
+		itimer.it_interval.tv_sec = 0;
+		itimer.it_interval.tv_usec = 0;
 		signal(SIGALRM, sigalarm);
 		if (!udp)
 			setitimer(ITIMER_REAL, &itimer, 0);
@@ -4240,7 +4263,7 @@ doit:
 						idle_data_max : chk_idle_data;
 		}
 	}
-	else if (clientserver && !client && !trans) {
+	else if (clientserver && !trans) {
 		sigact.sa_handler = &sigalarm;
 		sigemptyset(&sigact.sa_mask);
 		sigact.sa_flags = SA_RESTART;
@@ -4679,6 +4702,8 @@ doit:
 	}
 	itimer.it_value.tv_sec = 0;
 	itimer.it_value.tv_usec = 0;
+	itimer.it_interval.tv_sec = 0;
+	itimer.it_interval.tv_usec = 0;
 	setitimer(ITIMER_REAL, &itimer, 0);
 	done = 1;
 	(void)read_timer(stats,sizeof(stats));
@@ -4710,7 +4735,10 @@ doit:
 		 * transfer, having the client do a shutdown() for writing
 		 * on the control connection allows the server to more
 		 * quickly realize that the UDP transfer has completed
-		 * (mostly of benefit for separate control and data paths) */
+		 * (mostly of benefit for separate control and data paths)
+		 *
+		 * Can't do this in the opposite direction since the
+		 * server needs to send info back to client */
 		shutdown(0, SHUT_WR);
 
 	if (multicast && !trans) {
@@ -4734,13 +4762,18 @@ doit:
 	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 		if (!udp && trans) {
 #if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+			struct timeval timeunack, timec, timed;
+
 			optlen = sizeof(tcpinf);
 			if (getsockopt(fd[stream_idx], SOL_TCP, TCP_INFO,
 				       (void *)&tcpinf, &optlen) < 0) {
 				mes("couldn't collect TCP info\n");
 				retransinfo = -1;
 			}
-			while (tcpinf.tcpinfo_unacked) {
+			gettimeofday(&timeunack, (struct timezone *)0);
+			realtd = 0.0;
+			while ((tcpinf.tcpinfo_unacked) &&
+			       (realtd < MAX_EOT_WAIT_SEC)) {
 				if (format & DEBUGRETRANS)
 					print_tcpinfo();
 				if (format & DEBUGRETRANS)
@@ -4754,7 +4787,21 @@ doit:
 					mes("couldn't collect TCP info\n");
 					retransinfo = -1;
 				}
+				gettimeofday(&timec, (struct timezone *)0);
+				tvsub(&timed, &timec, &timeunack);
+				realtd = timed.tv_sec
+					    + ((double)timed.tv_usec) / 1000000;
 			}
+
+			if (tcpinf.tcpinfo_unacked) {
+				/* assume receiver went away */
+				if (clientserver && client) {
+					mes("Error: server not ACKing data");
+					exit(1);
+				}
+				goto cleanup;
+			}
+
 			if (format & DEBUGRETRANS)
 				print_tcpinfo();
 #endif
@@ -4789,6 +4836,9 @@ doit:
 	sprintf(srvrbuf, "%.4f", (double)nbytes/1024/1024);
 	sscanf(srvrbuf, "%lf", &MB);
 
+	if (clientserver && client)
+		reading_srvr_info = 1;
+
 	if (interval && clientserver && client && trans && !got_done) {
 		long flags;
 
@@ -4802,7 +4852,13 @@ doit:
 		flags &= ~O_NONBLOCK;
 		if (fcntl(0, F_SETFL, flags) < 0)
 			err("fcntl 4");
+		itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+		itimer.it_value.tv_usec = 0;
+		itimer.it_interval.tv_sec = 0;
+		itimer.it_interval.tv_usec = 0;
+		setitimer(ITIMER_REAL, &itimer, 0);
 		while (fgets(intervalbuf, sizeof(intervalbuf), stdin)) {
+			setitimer(ITIMER_REAL, &itimer, 0);
 			if (strncmp(intervalbuf, "DONE", 4) == 0) {
 				if (format & DEBUGPOLL) {
 					fprintf(stdout, "got DONE 2\n");
@@ -4818,12 +4874,19 @@ doit:
 			fputs(intervalbuf, stdout);
 			fflush(stdout);
 		}
+		itimer.it_value.tv_sec = 0;
+		itimer.it_value.tv_usec = 0;
+		setitimer(ITIMER_REAL, &itimer, 0);
 	}
 
 	if (clientserver && client) {
+		itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+		itimer.it_value.tv_usec = 0;
+		setitimer(ITIMER_REAL, &itimer, 0);
 		cp1 = srvrbuf;
 		got_srvr_retrans = 0;
 		while (fgets(cp1, sizeof(srvrbuf) - (cp1 - srvrbuf), stdin)) {
+			setitimer(ITIMER_REAL, &itimer, 0);
 			if (*(cp1 + strlen(cp1) - 1) != '\n') {
 				*cp1 = '\0';
 				break;
@@ -4935,6 +4998,9 @@ doit:
 			}
 			cp1 += strlen(cp1);
 		}
+		itimer.it_value.tv_sec = 0;
+		itimer.it_value.tv_usec = 0;
+		setitimer(ITIMER_REAL, &itimer, 0);
 		got_srvr_output = 1;
 		if (!udp && !trans && !got_srvr_retrans)
 			retransinfo = -1;
@@ -5208,6 +5274,9 @@ doit:
 cleanup:
 	if (clientserver) {
 		if (client) {
+			itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+			itimer.it_value.tv_usec = 0;
+			setitimer(ITIMER_REAL, &itimer, 0);
 			if (brief <= 0)
 				fputs("\n", stdout);
 			if (brief <= 0) {
@@ -5216,9 +5285,14 @@ cleanup:
 				}
 			}
 			else {
-				while (fgets(buf, mallocsize, stdin))
+				while (fgets(buf, mallocsize, stdin)) {
+					setitimer(ITIMER_REAL, &itimer, 0);
 					fputs(buf, stdout);
+				}
 			}
+			itimer.it_value.tv_sec = 0;
+			itimer.it_value.tv_usec = 0;
+			setitimer(ITIMER_REAL, &itimer, 0);
 			fflush(stdout);
 			close(0);
 		}
@@ -5249,6 +5323,8 @@ cleanup:
 	if (clientserver && !client) {
 		itimer.it_value.tv_sec = 0;
 		itimer.it_value.tv_usec = 0;
+		itimer.it_interval.tv_sec = 0;
+		itimer.it_interval.tv_usec = 0;
 		setitimer(ITIMER_REAL, &itimer, 0);
 		signal(SIGALRM, SIG_DFL);
 		bzero((char *)&frominet, sizeof(frominet));
@@ -5303,6 +5379,7 @@ cleanup:
 		pretrans = 0;
 		sretrans = 0;
 		got_srvr_output = 0;
+		reading_srvr_info = 0;
 		reverse = 0;
 		format = 0;
 		traceroute = 0;
