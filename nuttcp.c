@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.2.1
+ *	N U T T C P . C						v5.2.2
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.2.2, Bill Fink, 13-May-06
+ *	Have client report server warnings even if not verbose
  * V5.2.1, Bill Fink, 12-May-06
  *	Pass "-M" option to server so it also works for receives
  *	Make "-uu" be a shortcut for "-u -Ru"
@@ -460,7 +462,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 2;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -3419,7 +3421,9 @@ doit:
 						do_poll = 0;
 					}
 					else if (strncmp(intervalbuf, "nuttcp-r", 8) == 0) {
-						if (brief <= 0) {
+						if ((brief <= 0) ||
+						    strstr(intervalbuf,
+							    "Warning")) {
 							if (*ident) {
 								fputs("nuttcp-r", stdout);
 								fputs(ident, stdout);
@@ -3702,6 +3706,8 @@ doit:
 			if (strncmp(tmpbuf, "nuttcp-", 7) == 0)
 				sprintf(cp1, "nuttcp-%c%s%s",
 					tmpbuf[7], ident, tmpbuf + 8);
+			if (strstr(cp1, "Warning") && (brief > 0))
+				fputs(cp1, stdout);
 			cp1 += strlen(cp1);
 		}
 		got_srvr_output = 1;
