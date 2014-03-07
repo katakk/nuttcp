@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.4.3
+ *	N U T T C P . C						v5.5.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 5.5.1, Bill Fink, 22-Jul-06
+ *	Fix bugs with nbuf_bytes and rate_pps used with 3rd party
+ *	Pass "-D" option to server (and also make work for third party)
+ *	Allow setting precedence with "-c##p"
  * 5.4.3, Rob Scott & Bill Fink, 17-Jul-06
  *	Fix bug with buflen passed to server when no buflen option speicified
  *	(revert 5.3.2: Fix bug with default UDP buflen for 3rd party)
@@ -517,8 +521,8 @@ int mread( int fd, char *bufp, unsigned n);
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
-int vers_minor = 4;
-int vers_delta = 3;
+int vers_minor = 5;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1141,7 +1145,9 @@ main( int argc, char **argv )
 				ch = *(cp1 + strlen(cp1) - 1);
 			else
 				ch = '\0';
-			if ((ch == 'k') || (ch == 'K')) {
+			if ((ch == 'b') || (ch == 'B'))
+				nbuf_bytes = 1;
+			else if ((ch == 'k') || (ch == 'K')) {
 				nbuf *= 1024;
 				nbuf_bytes = 1;
 			}
@@ -1506,7 +1512,16 @@ main( int argc, char **argv )
 				ch = *(cp1 + strlen(cp1) - 1);
 			else
 				ch = '\0';
-			if ((ch != 't') && (ch != 'T')) {
+			if ((ch == 'p') || (ch == 'P')) {
+				/* Precedence */
+				if (tos > 7) {
+					fprintf(stderr, "invalid precedence = %d\n", tos);
+					fflush(stderr);
+					exit(1);
+				}
+				tos <<= 5;
+			}
+			else if ((ch != 't') && (ch != 'T')) {
 				/* DSCP */
 				if (tos > 63) {
 					fprintf(stderr, "invalid dscp = %d\n", tos);
@@ -1933,11 +1948,11 @@ main( int argc, char **argv )
 	    buflen = MAXUDPBUFLEN;
 	}
 
-	if (nbuf_bytes) {
+	if (nbuf_bytes && !host3 && !traceroute) {
 		nbuf /= buflen;
 	}
 
-	if ((rate != MAXRATE) && rate_pps) {
+	if ((rate != MAXRATE) && rate_pps && !host3 && !traceroute) {
 		uint64_t llrate = rate;
 
 		llrate *= ((double)buflen * 8 / 1000);
@@ -2040,6 +2055,15 @@ doit:
 					irvers = rvers_major*10000
 							+ rvers_minor*100
 							+ rvers_delta;
+				}
+				if (host3 && nbuf_bytes && (irvers < 50501))
+					nbuf /= buflen;
+				if (host3 && (rate != MAXRATE) && rate_pps &&
+					     (irvers < 50501)) {
+					uint64_t llrate = rate;
+
+					llrate *= ((double)buflen * 8 / 1000);
+					rate = llrate;
 				}
 				if (host3 && !buflenopt && (irvers >= 50302))
 					buflen = 0;
@@ -2206,6 +2230,47 @@ doit:
 							rvers_delta);
 						fflush(stdout);
 						tos = 0;
+						abortconn = 1;
+					}
+				}
+				if (irvers >= 50501) {
+					fprintf(ctlconn, " , nbuf_bytes = %d", nbuf_bytes);
+					fprintf(ctlconn, " , rate_pps = %d", rate_pps);
+					fprintf(ctlconn, " , nodelay = %d", nodelay);
+				}
+				else {
+					if (host3 && udp && nbuf_bytes) {
+						fprintf(stdout, "nuttcp%s%s: Warning: \"-n\" option in bytes for third party not supported\n",
+							trans?"-t":"-r", ident);
+						fprintf(stdout, "          Warning: by server version %d.%d.%d, need >= 5.5.1\n",
+							rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fprintf(stdout, "          Warning: third party request may not transfer\n");
+						fprintf(stdout, "          Warning: desired number of bytes in some UDP cases\n");
+						fflush(stdout);
+						nbuf_bytes = 0;
+					}
+					if (host3 && udp && rate_pps) {
+						fprintf(stdout, "nuttcp%s%s: Warning: \"-R\" option in pps for third party not supported\n",
+							trans?"-t":"-r", ident);
+						fprintf(stdout, "          Warning: by server version %d.%d.%d, need >= 5.5.1\n",
+							rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fprintf(stdout, "          Warning: third party request may not produce\n");
+						fprintf(stdout, "          Warning: desired pps rate in some UDP cases\n");
+						fflush(stdout);
+						rate_pps = 0;
+					}
+					if (nodelay && !trans) {
+						fprintf(stdout, "nuttcp%s%s: TCP_NODELAY opt not supported by server version %d.%d.%d, need >= 5.5.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						nodelay = 0;
 						abortconn = 1;
 					}
 				}
@@ -2381,6 +2446,20 @@ doit:
 				else {
 					tos = 0;
 				}
+				if (irvers >= 50501) {
+					sscanf(strstr(buf, ", nbuf_bytes =")
+							+ 15,
+						"%d", &nbuf_bytes);
+					sscanf(strstr(buf, ", rate_pps =") + 13,
+						"%d", &rate_pps);
+					sscanf(strstr(buf, ", nodelay =") + 12,
+						"%d", &nodelay);
+				}
+				else {
+					nbuf_bytes = 0;
+					rate_pps = 0;
+					nodelay = 0;
+				}
 				trans = !trans;
 				if (!traceroute && !host3 &&
 				    (nbuflen != buflen)) {
@@ -2482,6 +2561,30 @@ doit:
 					fputs("KO\n", stdout);
 					mes("invalid tos");
 					fprintf(stdout, "tos = %d\n", tos);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (nbuf_bytes < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid nbuf_bytes");
+					fprintf(stdout, "nbuf_bytes = %d\n",
+						nbuf_bytes);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (rate_pps < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid rate_pps");
+					fprintf(stdout, "rate_pps = %d\n",
+						rate_pps);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (nodelay < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid nodelay");
+					fprintf(stdout, "nodelay = %d\n",
+						nodelay);
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
@@ -3309,7 +3412,10 @@ doit:
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (nbuf != INT_MAX) {
-				sprintf(tmpargs[j], "-n%llu", nbuf);
+				if (nbuf_bytes)
+					sprintf(tmpargs[j], "-n%llub", nbuf);
+				else
+					sprintf(tmpargs[j], "-n%llu", nbuf);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (brief3 != 1) {
@@ -3325,8 +3431,12 @@ doit:
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (rate != MAXRATE) {
-				sprintf(tmpargs[j], "-R%s%lu",
-					irate ? "i" : "", rate);
+				if (rate_pps)
+					sprintf(tmpargs[j], "-R%s%lup",
+						irate ? "i" : "", rate);
+				else
+					sprintf(tmpargs[j], "-R%s%lu",
+						irate ? "i" : "", rate);
 				cmdargs[i++] = tmpargs[j++];
 			} else {
 				if (udp && !multicast)
@@ -3380,6 +3490,8 @@ doit:
 				sprintf(tmpargs[j], "-c0x%Xt", tos);
 				cmdargs[i++] = tmpargs[j++];
 			}
+			if (nodelay)
+				cmdargs[i++] = "-D";
 			cmdargs[i++] = host3;
 			cmdargs[i] = NULL;
 			execvp(cmd, cmdargs);
@@ -4483,6 +4595,7 @@ cleanup:
 		chk_idle_data = 0.0;
 		datamss = 0;
 		tos = 0;
+		nodelay = 0;
 		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
@@ -4502,6 +4615,8 @@ cleanup:
 		skip_data = 0;
 		host3 = NULL;
 		thirdparty = 0;
+		nbuf_bytes = 0;
+		rate_pps = 0;
 
 #ifdef HAVE_SETPRIO
 		priority = 0;
