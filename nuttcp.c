@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.1.5
+ *	N U T T C P . C						v6.2.1
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.1, Rob Scott, 22-Mar-09
+ *	Added IPv6 and SSM MC support
+ *	Ported from Rob's 5.5.5 based code by Bill Fink
  * 6.1.5, Bill Fink, 5-Mar-09
  *	Fix client lockup with third party when network problem (for scripts)
  * 6.1.4, Bill Fink, 5-Jan-09
@@ -358,7 +361,6 @@
  * TODO/Wish-List:
  *	Transmit interval marking option
  *	Allow at least some traceroute options
- *	IPv6 multicast support
  *	Add "-ut" option to do both UDP and TCP simultaneously
  *	Default rate limit UDP if too much loss
  *	Ping option
@@ -575,6 +577,10 @@ static struct	sigaction savesigact;
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
 #define HI_MC			231ul
+#define HI_MC_SSM		232ul
+/* locally defined global scope IPv6 multicast, FF3E::8000:0-FF3E::FFFF:FFFF */
+#define HI_MC6			"FF3E::8000:0000"
+#define HI_MC6_LEN		13
 #define ACCEPT_TIMEOUT		5
 #ifndef MAX_CONNECT_TRIES
 #define MAX_CONNECT_TRIES	10	/* maximum server connect attempts */
@@ -642,8 +648,8 @@ void print_tcpinfo();
 #endif
 
 int vers_major = 6;
-int vers_minor = 1;
-int vers_delta = 5;
+int vers_minor = 2;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -658,6 +664,8 @@ struct sockaddr_in save_sinhim, save_mc;
 #ifdef AF_INET6
 struct sockaddr_in6 sinme6[MAXSTREAM + 1];
 struct sockaddr_in6 sinhim6[MAXSTREAM + 1];
+struct sockaddr_in6 save_sinhim6, save_mc6;
+struct in6_addr hi_mc6;
 #endif
 
 struct sockaddr_storage frominet;
@@ -802,8 +810,19 @@ int multicast = 0;		/* set to 1 for multicast UDP transfer */
 #else
 uint8_t multicast = 0;		/* set to 1 for multicast UDP transfer */
 #endif
+int ssm = -1;			/* set to 1 for Source Specific Multicast */
+				/* set to 0 to NOT do SSM */
+				/* set to -1 to have SSM follow protocol */
+				/* (off for ipv4, on for ipv6) */
 int mc_param;
 struct ip_mreq mc_group;	/* holds multicast group address */
+#ifdef AF_INET6
+struct ipv6_mreq mc6_group;	/* holds multicast group address */
+#endif
+#ifdef MCAST_JOIN_SOURCE_GROUP
+struct group_source_req group_source_req;  /* holds multicast SSM group and */
+					   /* source information */
+#endif
 
 #ifdef HAVE_SETPRIO
 int priority = 0;		/* nuttcp process priority */
@@ -958,6 +977,71 @@ int srvr_cpu_util;
 double cput = 0.000001, realt = 0.000001;	/* user, real time (seconds) */
 double realtd = 0.000001;	/* real time delta - for interval reporting */
 
+void
+close_data_channels()
+{
+	if (fd[1] == -1) return;
+
+	if (clientserver && client && !host3 && udp && trans) {
+		/* If all the EOD packets get lost at the end of a UDP
+		 * transfer, having the client do a shutdown() for writing
+		 * on the control connection allows the server to more
+		 * quickly realize that the UDP transfer has completed
+		 * (mostly of benefit for separate control and data paths)
+		 *
+		 * Can't do this in the opposite direction since the
+		 * server needs to send info back to client */
+		shutdown(0, SHUT_WR);
+	}
+
+	if (multicast && !trans) {
+		/* Leave the multicast group */
+		if ((af == AF_INET) && !ssm) {
+			if (setsockopt(fd[1], IPPROTO_IP, IP_DROP_MEMBERSHIP,
+				       (void *)&mc_group,
+				       sizeof(mc_group)) < 0) {
+				 err("setsockopt: IP_DROP_MEMBERSHIP");
+			}
+		}
+#ifdef AF_INET6
+		else if ((af == AF_INET6) && !ssm) {
+			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_LEAVE_GROUP,
+				       (void *)&mc6_group,
+				       sizeof(mc6_group)) < 0) {
+				err("setsockopt: IPV6_LEAVE_GROUP");
+			}
+		}
+#endif
+#ifdef MCAST_JOIN_SOURCE_GROUP
+		else if ((af == AF_INET) && ssm) {
+			/* Leave the source specific multicast group */
+			if (setsockopt(fd[1], IPPROTO_IP,
+				       MCAST_LEAVE_SOURCE_GROUP,
+				       &group_source_req,
+				       sizeof(group_source_req)) < 0) {
+				err("setsockopt: MCAST_LEAVE_SOURCE_GROUP");
+			}
+		}
+#ifdef AF_INET6
+		else if ((af == AF_INET6) && ssm) {
+			/* Leave the source specific multicast group */
+			if (setsockopt(fd[1], IPPROTO_IPV6,
+				       MCAST_LEAVE_SOURCE_GROUP,
+				       &group_source_req,
+				       sizeof(group_source_req)) < 0) {
+				err("setsockopt: MCAST_LEAVE_SOURCE_GROUP");
+			}
+		}
+#endif /* AF_INET6 */
+#endif /* MCAST_JOIN_SOURCE_GROUP */
+	}
+
+	for (stream_idx = 1; stream_idx <= nstream; stream_idx++) {
+		close(fd[stream_idx]);
+		fd[stream_idx] = -1;
+	}
+}
+
 #ifdef SIGPIPE
 void
 sigpipe( int signum )
@@ -1091,12 +1175,11 @@ sigalarm( int signum )
 					fcntl(fd[0], F_SETFL, flags);
 				}
 			}
-			for ( i = 1; i <= nstream; i++ )
-				close(fd[i]);
 			if (client) {
 				mes("Error: not receiving data from server");
 				exit(1);
 			}
+			close_data_channels();
 			intr = 1;
 			return;
 		}
@@ -1329,6 +1412,8 @@ main( int argc, char **argv )
 	double idle_data_min = IDLE_DATA_MIN;
 	double idle_data_max = IDLE_DATA_MAX;
 	double default_idle_data = DEFAULT_IDLE_DATA;
+	char multsrc[ADDRSTRLEN] = "\0";
+	char multaddr[ADDRSTRLEN] = "\0";
 
 	sendwin = 0;
 	rcvwin = 0;
@@ -1748,7 +1833,24 @@ main( int argc, char **argv )
 			break;
 		case 'm':
 			reqval = 0;
-			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			if (argv[0][2] == 'a') {
+				ssm = 0;
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+			}
+			else if (argv[0][2] == 's') {
+#ifdef MCAST_JOIN_SOURCE_GROUP
+				ssm = 1;
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+#else
+				fprintf(stderr,
+					"This system does not support SSM\n");
+				fflush(stderr);
+				exit(1);
+#endif
+			}
+			else {
+				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			}
 			if (*cp1)
 				mc_param = atoi(cp1);
 			else
@@ -1936,6 +2038,12 @@ main( int argc, char **argv )
 		nstream = 1;
 	}
 
+#ifdef AF_INET6
+	if (!inet_pton(AF_INET6, HI_MC6, &hi_mc6)) {
+		err("inet_pton");
+	}
+#endif
+
 	if (udp && !haverateopt)
 		rate = DEFAULT_UDP_RATE;
 
@@ -2052,14 +2160,6 @@ main( int argc, char **argv )
 				*cp1 = '/';
 		}
 	}
-
-#ifdef AF_INET6
-	if (multicast && (af == AF_INET6)) {
-		fprintf(stderr, "multicast not yet supported for IPv6\n");
-		fflush(stderr);
-		exit(1);
-	}
-#endif
 
 	if (!port) {
 		if (af == AF_INET) {
@@ -2194,6 +2294,21 @@ main( int argc, char **argv )
 		clientserver = 1;
 	}
 
+	if (!host3 && clientserver && client && (ssm < 0)) {
+		if (af == AF_INET) {
+			ssm = 0;
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+#ifdef MCAST_JOIN_SOURCE_GROUP
+			ssm = 1;
+#else
+			ssm = 0;
+#endif
+		}
+#endif
+	}
+
 	if (interval && !clientserver) {
 		fprintf(stderr, "interval option only supported for client/server mode\n");
 		fflush(stderr);
@@ -2295,6 +2410,10 @@ doit:
 		fprintf(stdout, "initial system retrans = %d\n", sretrans);
 	}
 	nretrans = 0;
+
+	for (stream_idx = 1; stream_idx <= nstream; stream_idx++)
+		fd[stream_idx] = -1;
+
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
@@ -2538,6 +2657,21 @@ doit:
 							rvers_delta);
 						fflush(stdout);
 						multicast = 0;
+						abortconn = 1;
+					}
+				}
+				if (irvers >= 60201) {
+					fprintf(ctlconn, " , ssm = %d", ssm);
+				}
+				else {
+					if (multicast && (ssm == 1)) {
+						fprintf(stdout, "nuttcp%s%s: ssm not supported by server version %d.%d.%d, need >= 6.2.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						ssm = 0;
 						abortconn = 1;
 					}
 				}
@@ -2810,6 +2944,21 @@ doit:
 				else {
 					mc_param = 0;
 				}
+				if (irvers >= 60201) {
+					sscanf(strstr(buf, ", ssm =") + 7,
+						"%d", &ssm);
+				}
+				else {
+					ssm = 0;
+				}
+#ifndef MCAST_JOIN_SOURCE_GROUP
+				if (mc_param && (ssm == 1)) {
+					fputs("KO\n", stdout);
+					fprintf(stdout, "server does not support ssm\n");
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+#endif
 				if (irvers >= 50201) {
 					sscanf(strstr(buf, ", datamss =") + 12,
 						"%d", &datamss);
@@ -2939,6 +3088,14 @@ doit:
 						rate = DEFAULT_UDP_RATE;
 				}
 				multicast = mc_param;
+				if ((!host3 && ((ssm < 0) || (ssm > 1))) ||
+				    (host3 && ((ssm < -1) || (ssm > 1)))) {
+					fputs("KO\n", stdout);
+					mes("invalid ssm value");
+					fprintf(stdout, "ssm = %d\n", ssm);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
 				if (datamss < 0) {
 					fputs("KO\n", stdout);
 					mes("invalid datamss");
@@ -3112,55 +3269,6 @@ doit:
 			}
 #endif
 			if (trans) {
-			    char tmphost[ADDRSTRLEN] = "\0";
-			    if (multicast) {
-				/* The multicast transmitter just sends
-				 * to the multicast group
-				 */
-				if (af == AF_INET) {
-				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
-					(char *)&save_sinhim.sin_addr.s_addr,
-					sizeof(struct in_addr));
-				    if (!client && (irvers >= 50505)) {
-					struct sockaddr_in peer;
-					socklen_t peerlen = sizeof(peer);
-					if (getpeername(fd[0],
-						      (struct sockaddr *)&peer, 
-						      &peerlen) < 0) {
-						err("getpeername");
-					}
-					bcopy((char *)&peer.sin_addr.s_addr,
-					    (char *)&sinhim[1].sin_addr.s_addr,
-					    sizeof(struct in_addr));
-				    }
-				    else {
-					struct sockaddr_in me;
-					socklen_t melen = sizeof(me);
-					if (getsockname(fd[0],
-				    			(struct sockaddr *)&me, 
-							&melen) < 0) {
-						err("getsockname");
-					}
-					bcopy((char *)&me.sin_addr.s_addr,
-					    (char *)&sinhim[1].sin_addr.s_addr,
-					    sizeof(struct in_addr));
-				    }
-				    sinhim[1].sin_addr.s_addr &=
-					htonl(0xFFFFFF);
-				    sinhim[1].sin_addr.s_addr |=
-					htonl(HI_MC << 24);
-				    inet_ntop(af, &sinhim[1].sin_addr,
-					      tmphost, sizeof(tmphost));
-				    if (setsockopt(fd[1], IPPROTO_IP,
-						   IP_MULTICAST_TTL,
-						   (void *)&multicast,
-						   sizeof(multicast)) < 0)
-					err("setsockopt");
-				}
-				else {
-				    err("unsupported AF");
-				}
-			    }
 			    if ((brief <= 0) && (format & PARSE)) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d ",
 					ident, buflen);
@@ -3169,7 +3277,7 @@ doit:
 				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s",
 				    nstream, port,
 				    udp?"udp":"tcp",
-				    multicast ? tmphost : host);
+				    host);
 				if (multicast)
 				    fprintf(stdout, " multicast_ttl=%d",
 					    multicast);
@@ -3204,7 +3312,7 @@ doit:
 				fprintf(stdout,"nstream=%d, port=%d %s -> %s",
 				    nstream, port,
 				    udp?"udp":"tcp",
-				    multicast ? tmphost : host);
+				    host);
 				if (multicast)
 				    fprintf(stdout, " ttl=%d", multicast);
 				fprintf(stdout, "\n");
@@ -3958,7 +4066,15 @@ doit:
 			}
 			if (udp) {
 				if (multicast) {
-					sprintf(tmpargs[j], "-m%d", multicast);
+					if (ssm == 1)
+						sprintf(tmpargs[j], "-ms%d",
+							multicast);
+					else if (ssm == 0)
+						sprintf(tmpargs[j], "-ma%d",
+							multicast);
+					else
+						sprintf(tmpargs[j], "-m%d",
+							multicast);
 					cmdargs[i++] = tmpargs[j++];
 				}
 				else
@@ -4049,8 +4165,13 @@ doit:
 
 		fflush(stdout);
 		fflush(stderr);
-		if (multicast)
+		if (multicast) {
 			cmd = "mtrace";
+#ifdef AF_INET6
+			if (af == AF_INET6)
+				cmd = "mtrace6";
+#endif
+		}
 		else {
 			cmd = "traceroute";
 #ifdef AF_INET6
@@ -4207,24 +4328,47 @@ doit:
 		}
 	}
 
-	if (multicast && !trans) {
-		/* The multicast receiver must join the multicast group */
+	if (multicast) {
+		struct sockaddr_in peer;
+		socklen_t peerlen = sizeof(peer);
+		struct sockaddr_in me;
+		socklen_t melen = sizeof(me);
+#ifdef AF_INET6
+		struct sockaddr_in6 peer6;
+		socklen_t peer6len = sizeof(peer6);
+		struct sockaddr_in6 me6;
+		socklen_t me6len = sizeof(me6);
+#endif
 		if (af == AF_INET) {
-			struct sockaddr_in peer;
-			char tmphost[ADDRSTRLEN] = "\0";
-			char tmphost2[ADDRSTRLEN] = "\0";
-			socklen_t peerlen = sizeof(peer);
 			if (getpeername(fd[0], (struct sockaddr *)&peer, 
 					&peerlen) < 0) {
 				err("getpeername");
 			}
+			if (getsockname(fd[0], (struct sockaddr *)&me, 
+					&melen) < 0) {
+				err("getsockname");
+			}
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+			if (getpeername(fd[0], (struct sockaddr *)&peer6, 
+					&peer6len) < 0) {
+				err("getpeername");
+			}
+			if (getsockname(fd[0], (struct sockaddr *)&me6, 
+					&me6len) < 0) {
+				err("getsockname");
+			}
+		}
+#endif /* AF_INET6 */
+		else {
+			err("unsupported AF");
+		}
+
+		if (!trans) {
+		    if ((af == AF_INET) && !ssm) { /* IPv4 ASM */
+			/* The multicast receiver must join the mc group */
 			if (client && (irvers >= 50505)) {
-				struct sockaddr_in me;
-				socklen_t melen = sizeof(me);
-				if (getsockname(fd[0], (struct sockaddr *)&me, 
-						&melen) < 0) {
-					err("getsockname");
-				}
 				bcopy((char *)&me.sin_addr.s_addr,
 				      (char *)&mc_group.imr_multiaddr.s_addr,
 				      sizeof(struct in_addr));
@@ -4238,27 +4382,367 @@ doit:
 			mc_group.imr_multiaddr.s_addr |= htonl(HI_MC << 24);
 			if (setsockopt(fd[1], IPPROTO_IP, IP_ADD_MEMBERSHIP,
 				       (void *)&mc_group, sizeof(mc_group)) < 0)
-				err("setsockopt");
+				err("setsockopt: IP_ADD_MEMBERSHIP");
 			if (brief <= 0) {
 				inet_ntop(af, &peer.sin_addr.s_addr,
-					  tmphost, sizeof(tmphost));
+					  multsrc, sizeof(multsrc));
 				inet_ntop(af, &mc_group.imr_multiaddr,
-					  tmphost2, sizeof(tmphost2));
+					  multaddr, sizeof(multaddr));
 
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n", 
 						trans?"-t":"-r", ident,
-						tmphost, tmphost2);
+						multsrc, multaddr);
 				else
 					fprintf(stdout,
-						"nuttcp%s%s: receiving from multicast source %s on group %s\n", 
+						"nuttcp%s%s: receive from multicast source %s\n",
 						trans?"-t":"-r", ident,
-						tmphost, tmphost2);
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using asm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
 			}
-		}
-		else {
+		    }
+#ifdef AF_INET6
+		    else if ((af == AF_INET6) && !ssm) { /* IPv6 ASM */
+			/* The multicast receiver must join the mc group */
+			if (client) {
+				bcopy((char *)&me6.sin6_addr,
+				      (char *)&mc6_group.ipv6mr_multiaddr,
+				      sizeof(struct in6_addr));
+			}
+			else {
+				bcopy((char *)&peer6.sin6_addr,
+				      (char *)&mc6_group.ipv6mr_multiaddr,
+				      sizeof(struct in6_addr));
+			}
+			bcopy((char *)&hi_mc6,
+			      (char *)&mc6_group.ipv6mr_multiaddr,
+			      HI_MC6_LEN);
+			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_JOIN_GROUP,
+				       (void *)&mc6_group,
+				       sizeof(mc6_group)) < 0)
+				err("setsockopt: IPV6_JOIN_GROUP");
+			if (brief <= 0) {
+				inet_ntop(af, &peer6.sin6_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &mc6_group.ipv6mr_multiaddr,
+					  multaddr, sizeof(multaddr));
+
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n", 
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: receive from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using asm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+			}
+		    }
+#endif /* AF_INET6 */
+#ifdef MCAST_JOIN_SOURCE_GROUP
+		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
+			/* multicast receiver joins the mc source group */
+			struct sockaddr_in *group;
+			struct sockaddr_in *source;
+			group =
+			    (struct sockaddr_in*)&group_source_req.gsr_group;
+			source =
+			    (struct sockaddr_in*)&group_source_req.gsr_source;
+			group_source_req.gsr_interface = 0;  /* any interface */
+			if (client)
+				bcopy((char *)&me, (char *)group,
+				      sizeof(struct sockaddr_in));
+			else
+				bcopy((char *)&peer, (char *)group,
+				      sizeof(struct sockaddr_in));
+			bcopy((char *)&peer, (char *)source,
+			      sizeof(struct sockaddr_in));
+			group->sin_addr.s_addr &= htonl(0xFFFFFF);
+			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
+			if (setsockopt(fd[1], IPPROTO_IP,
+				       MCAST_JOIN_SOURCE_GROUP,
+				       &group_source_req,
+				       sizeof(group_source_req)) < 0)
+				err("setsockopt: MCAST_JOIN_SOURCE_GROUP");
+			if (brief <= 0) {
+				inet_ntop(af, &source->sin_addr.s_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &group->sin_addr.s_addr,
+					  multaddr, sizeof(multaddr));
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: receive from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using ssm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+			}
+		    }
+#ifdef AF_INET6
+		    else if ((af == AF_INET6) && ssm) { /* IPv6 SSM */
+			/* multicast receiver joins the mc source group */
+			struct sockaddr_in6 *group;
+			struct sockaddr_in6 *source;
+			group =
+			    (struct sockaddr_in6*)&group_source_req.gsr_group;
+			source =
+			    (struct sockaddr_in6*)&group_source_req.gsr_source;
+			group_source_req.gsr_interface = 0;  /* any interface */
+			if (client)
+				bcopy((char *)&me6, (char *)group,
+				      sizeof(struct sockaddr_in6));
+			else
+				bcopy((char *)&peer6, (char *)group,
+				      sizeof(struct sockaddr_in6));
+			bcopy((char *)&peer6, (char *)source,
+			      sizeof(struct sockaddr_in6));
+			bcopy((char *)&hi_mc6, (char *)&group->sin6_addr,
+			      HI_MC6_LEN);
+			if (setsockopt(fd[1], IPPROTO_IPV6,
+				       MCAST_JOIN_SOURCE_GROUP,
+				       &group_source_req,
+				       sizeof(group_source_req)) < 0)
+				err("setsockopt: MCAST_JOIN_SOURCE_GROUP");
+			if (brief <= 0) {
+				inet_ntop(af, &source->sin6_addr.s6_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &group->sin6_addr.s6_addr,
+					  multaddr, sizeof(multaddr));
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: receive from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using ssm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+			}
+		    }
+#endif /* AF_INET6 */
+#endif /* MCAST_JOIN_SOURCE_GROUP */
+		    else {
 			err("unsupported AF");
+		    }
+		}
+		else { /* trans */
+		    if (af == AF_INET) {
+			bcopy((char *)&sinhim[1].sin_addr.s_addr,
+			      (char *)&save_sinhim.sin_addr.s_addr,
+			      sizeof(struct in_addr));
+		    }
+#ifdef AF_INET6
+		    else if (af == AF_INET6) {
+		    	bcopy((char *)&sinhim6[1], (char *)&save_sinhim6,
+			      sizeof(struct sockaddr_in6));
+		    }
+#endif
+		    if ((af == AF_INET) && !ssm) { /* IPv4 ASM */
+			/* The multicast transmitter just sends to mc group */
+			if (client || (irvers < 50505)) {
+				bcopy((char *)&me.sin_addr.s_addr,
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else {
+				bcopy((char *)&peer.sin_addr.s_addr,
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			sinhim[1].sin_addr.s_addr &= htonl(0xFFFFFF);
+			sinhim[1].sin_addr.s_addr |= htonl(HI_MC << 24);
+			if (setsockopt(fd[1], IPPROTO_IP, IP_MULTICAST_TTL,
+				       (void *)&multicast,
+				       sizeof(multicast)) < 0)
+				err("setsockopt: IP_MULTICAST_TTL");
+			if (brief <= 0) {
+				inet_ntop(af, &me.sin_addr.s_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &sinhim[1].sin_addr.s_addr,
+					  multaddr, sizeof(multaddr));
+			 	if (format & PARSE) {
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				}
+				else {
+					fprintf(stdout,
+						"nuttcp%s%s: sending from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using asm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+				}
+			}
+		    }
+#ifdef AF_INET6
+		    else if ((af == AF_INET6) && !ssm) { /* IPv6 ASM */
+			/* The multicast transmitter just sends to mc group */
+			if (client) {
+				bcopy((char *)&me6.sin6_addr,
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			else {
+				bcopy((char *)&peer6.sin6_addr,
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			bcopy((char *)&hi_mc6, (char *)&sinhim6[1].sin6_addr,
+			      HI_MC6_LEN);
+			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
+				       (void *)&multicast,
+				       sizeof(multicast)) < 0)
+				err("setsockopt: IPV6_MULTICAST_HOPS");
+			if (brief <= 0) {
+				inet_ntop(af, &me6.sin6_addr.s6_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &sinhim6[1].sin6_addr.s6_addr,
+					  multaddr, sizeof(multaddr));
+			 	if (format & PARSE) {
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				}
+				else {
+					fprintf(stdout,
+						"nuttcp%s%s: sending from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using asm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+				}
+			}
+		    }
+#endif /* AF_INET6 */
+#ifdef MCAST_JOIN_SOURCE_GROUP
+		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
+			/* The multicast transmitter just sends to mc group */
+			struct sockaddr_in *group;
+			struct sockaddr_in *source;
+			group =
+			    (struct sockaddr_in*)&group_source_req.gsr_group;
+			source =
+			    (struct sockaddr_in*)&group_source_req.gsr_source;
+			group_source_req.gsr_interface = 0;  /* any interface */
+			if (client)
+				bcopy((char *)&me, (char *)group,
+				      sizeof(struct sockaddr_in));
+			else
+				bcopy((char *)&peer, (char *)group,
+				      sizeof(struct sockaddr_in));
+			bcopy((char *)&me, (char *)source,
+			      sizeof(struct sockaddr_in));
+			group->sin_addr.s_addr &= htonl(0xFFFFFF);
+			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
+			bcopy((char *)&group->sin_addr.s_addr,
+			      (char *)&sinhim[1].sin_addr.s_addr,
+			      sizeof(struct in_addr));
+			if (setsockopt(fd[1], IPPROTO_IP, IP_MULTICAST_TTL,
+				       (void *)&multicast,
+				       sizeof(multicast)) < 0)
+				err("setsockopt: IP_MULTICAST_TTL");
+			if (brief <= 0) {
+				inet_ntop(af, &source->sin_addr.s_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &group->sin_addr.s_addr,
+					  multaddr, sizeof(multaddr));
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: sending from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using ssm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+			}
+		    }
+#ifdef AF_INET6
+		    else if ((af == AF_INET6) && ssm) { /* IPv6 SSM */
+			/* The multicast transmitter just sends to mc group */
+			struct sockaddr_in6 *group;
+			struct sockaddr_in6 *source;
+			group =
+			    (struct sockaddr_in6*)&group_source_req.gsr_group;
+			source =
+			    (struct sockaddr_in6*)&group_source_req.gsr_source;
+			group_source_req.gsr_interface = 0;  /* any interface */
+			if (client)
+				bcopy((char *)&me6, (char *)group,
+				      sizeof(struct sockaddr_in6));
+			else
+				bcopy((char *)&peer6, (char *)group,
+				      sizeof(struct sockaddr_in6));
+			bcopy((char *)&me6, (char *)source,
+			      sizeof(struct sockaddr_in6));
+			bcopy((char *)&hi_mc6, (char *)&group->sin6_addr,
+			      HI_MC6_LEN);
+			bcopy((char *)&group->sin6_addr.s6_addr,
+			      (char *)&sinhim6[1].sin6_addr.s6_addr,
+			      sizeof(struct in6_addr));
+			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
+				       (void *)&multicast,
+				       sizeof(multicast)) < 0)
+				err("setsockopt: IPV6_MULTICAST_HOPS");
+			if (brief <= 0) {
+				inet_ntop(af, &source->sin6_addr.s6_addr,
+					  multsrc, sizeof(multsrc));
+				inet_ntop(af, &group->sin6_addr.s6_addr,
+					  multaddr, sizeof(multaddr));
+				if (format & PARSE)
+					fprintf(stdout,
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						trans?"-t":"-r", ident,
+						multsrc, multaddr);
+				else
+					fprintf(stdout,
+						"nuttcp%s%s: sending from multicast source %s\n",
+						trans?"-t":"-r", ident,
+						multsrc);
+					fprintf(stdout,
+						"nuttcp%s%s: using ssm on multicast group %s\n",
+						trans?"-t":"-r", ident,
+						multaddr);
+			}
+		    }
+#endif /* AF_INET6 */
+#endif /* MCAST_JOIN_SOURCE_GROUP */
+		    else {
+			err("unsupported AF");
+		    }
 		}
 	}
 
@@ -4758,29 +5242,6 @@ doit:
 		stream_idx = stream_idx % nstream;
 	}
 
-	if (clientserver && client && !host3 && udp && trans)
-		/* If all the EOD packets get lost at the end of a UDP
-		 * transfer, having the client do a shutdown() for writing
-		 * on the control connection allows the server to more
-		 * quickly realize that the UDP transfer has completed
-		 * (mostly of benefit for separate control and data paths)
-		 *
-		 * Can't do this in the opposite direction since the
-		 * server needs to send info back to client */
-		shutdown(0, SHUT_WR);
-
-	if (multicast && !trans) {
-		/* Leave the multicast group */
-		if (af == AF_INET) {
-			if (setsockopt(fd[1], IPPROTO_IP, IP_DROP_MEMBERSHIP,
-				       (void *)&mc_group, sizeof(mc_group)) < 0)
-				err("setsockopt");
-		}
-		else {
-			err("unsupported AF");
-		}
-	}
-
 	if (!udp && trans && (format & DEBUGRETRANS)) {
 		sretrans = get_retrans(-1);
 		fprintf(stdout, "before closing system retrans = %d\n",
@@ -4838,13 +5299,14 @@ doit:
 				nretrans -= iretrans;
 			}
 		}
-		close(fd[stream_idx]);
 	}
 	if (!udp && trans && (format & DEBUGRETRANS)) {
 		sretrans = get_retrans(-1);
 		fprintf(stdout, "after closing system retrans = %d\n",
 			sretrans);
 	}
+
+	close_data_channels();
 
 	if (interval && clientserver && !client && !trans) {
 		fprintf(stdout, "DONE\n");
@@ -5349,6 +5811,9 @@ cleanup:
 		}
 	}
 	if (clientserver && !client) {
+		for (stream_idx = 1; stream_idx <= nstream; stream_idx++) {
+			fd[stream_idx] = -1;
+		}
 		itimer.it_value.tv_sec = 0;
 		itimer.it_value.tv_usec = 0;
 		itimer.it_interval.tv_sec = 0;
@@ -5412,6 +5877,7 @@ cleanup:
 		format = 0;
 		traceroute = 0;
 		multicast = 0;
+		ssm = -1;
 		skip_data = 0;
 		host3 = NULL;
 		thirdparty = 0;
