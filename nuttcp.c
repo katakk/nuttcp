@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.3.3
+ *	N U T T C P . C						v5.3.4
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,12 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.3.4, Bill Fink, 21-Jun-06
+ *	Add "--idle-data-timeout" server option
+ *	(server ends transfer if no data received for the specified
+ *	timeout interval, previously it was a fixed 60 second timeout)
+ *	Shutdown client control connection for writing at end of UDP transfer
+ *	(so server can cope better with loss of all EOD packets)
  * V5.3.3, Bill Fink & Mark S. Mathews, 18-Jun-06
  *	Add new capability for separate control and data paths
  *	(using syntax:  nuttcp ctl_name_or_IP/data_name_or_IP)
@@ -440,8 +446,7 @@ static struct	sigaction savesigact;
 #define MINMALLOC		1024
 #define HI_MC			231ul
 #define ACCEPT_TIMEOUT		5
-#define CHECK_CLIENT_INTERVAL	60	/* server receiver checks this often
-					 * for client having gone away */
+#define DEFAULT_IDLE_DATA	60	/* default value for chk_idle_data */
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -481,7 +486,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 3;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -568,6 +573,8 @@ double irate_cum_nsec = 0.0;	/* cumulative nanaseconds over several pkts */
 int rate_pps = 0;		/* set to 1 if rate is given as pps */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
+double chk_idle_data		/* server receiver checks this often */
+	= DEFAULT_IDLE_DATA;	/* for client having gone away */
 double chk_interval = 0.0;	/* timer (in seconds) for checking client */
 int ctlconnmss;			/* control connection maximum segment size */
 int datamss = 0;		/* data connection maximum segment size */
@@ -681,6 +688,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
+"	--idle-data-timeout <value>   server timeout for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
 #ifdef IPV6_V6ONLY
@@ -760,8 +768,10 @@ sigalarm( int signum )
 	uint64_t deltarbytes, deltatbytes;
 	double fractloss;
 	int nodata;
+	int eod;
 	int i;
 	char *cp1, *cp2;
+	short save_events;
 
 	if (host3 && clientserver && !client)
 		return;
@@ -771,13 +781,29 @@ sigalarm( int signum )
 		socklen_t peerlen = sizeof(peer);
 
 		nodata = 0;
+		eod = 0;
 
 		if (getpeername(fd[0], (struct sockaddr *)&peer, &peerlen) < 0)
 			nodata = 1;
 
+		if (udp) {
+			/* checks if client did a shutdown() for writing
+			 * on the control connection */
+			pollfds[0].fd = fileno(ctlconn);
+			save_events = pollfds[0].events;
+			pollfds[0].events = POLLIN | POLLPRI;
+			pollfds[0].revents = 0;
+			if ((poll(pollfds, 1, 0) > 0) &&
+			    (pollfds[0].revents & (POLLIN | POLLPRI))) {
+				nodata = 1;
+				eod = 1;
+			}
+			pollfds[0].events = save_events;
+		}
+
 		if (interval) {
 			chk_interval += interval;
-			if (chk_interval >= CHECK_CLIENT_INTERVAL) {
+			if (chk_interval >= chk_idle_data) {
 				chk_interval = 0;
 				if ((nbytes - chk_nbytes) == 0)
 					nodata = 1;
@@ -791,7 +817,7 @@ sigalarm( int signum )
 		}
 
 		if (nodata) {
-			if (inetd)
+			if (inetd && !eod)
 				exit(1);
 			for ( i = 1; i <= nstream; i++ )
 				close(fd[i]);
@@ -1435,6 +1461,17 @@ main( int argc, char **argv )
 			}
 			else if (strcmp(&argv[0][2], "no3rdparty") == 0) {
 				no3rd=1;
+			}
+			else if (strcmp(&argv[0][2],
+				 "idle-data-timeout") == 0) {
+				sscanf(argv[1], "%lf", &chk_idle_data);
+				if (chk_idle_data <= 0.0) {
+					fprintf(stderr, "invalid value for idle-data-timeout = %f\n", chk_idle_data);
+					fflush(stderr);
+					exit(1);
+				}
+				argv++;
+				argc--;
 			}
 #ifdef IPV6_V6ONLY
 			else if (strcmp(&argv[0][2], "disable-v4-mapped") == 0) {
@@ -3492,10 +3529,14 @@ doit:
 		sigemptyset(&sigact.sa_mask);
 		sigact.sa_flags = SA_RESTART;
 		sigaction(SIGALRM, &sigact, 0);
-		itimer.it_value.tv_sec = CHECK_CLIENT_INTERVAL;
-		itimer.it_value.tv_usec = 0;
-		itimer.it_interval.tv_sec = CHECK_CLIENT_INTERVAL;
-		itimer.it_interval.tv_usec = 0;
+		itimer.it_value.tv_sec = chk_idle_data;
+		itimer.it_value.tv_usec =
+			(chk_idle_data - itimer.it_value.tv_sec)
+				*1000000;
+		itimer.it_interval.tv_sec = chk_idle_data;
+		itimer.it_interval.tv_usec =
+			(chk_idle_data - itimer.it_interval.tv_sec)
+				*1000000;
 		setitimer(ITIMER_REAL, &itimer, 0);
 	}
 
@@ -3511,6 +3552,7 @@ doit:
 	prep_timer();
 	errno = 0;
 	stream_idx = 0;
+	correction = 0;
 	if (do_poll) {
 		long flags;
 
@@ -3789,6 +3831,13 @@ doit:
 		stream_idx = stream_idx % nstream;
 	}
 
+	if (clientserver && client && !host3 && udp && trans)
+		/* If all the EOD packets get lost at the end of a UDP
+		 * transfer, having the client do a shutdown() for writing
+		 * on the control connection allows the server to more
+		 * quickly realize that the UDP transfer has completed */
+		shutdown(0, SHUT_WR);
+
 	if (multicast && !trans) {
 		/* Leave the multicast group */
 		if (af == AF_INET) {
@@ -3839,6 +3888,9 @@ doit:
 				}
 				break;
 			}
+			if ((!strstr(intervalbuf, " MB / ") ||
+			     !strstr(intervalbuf, " sec = ")) && (brief > 0))
+				continue;
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
 			fputs(intervalbuf, stdout);
