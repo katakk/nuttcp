@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.5.1
+ *	N U T T C P . C						v5.5.2
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 5.5.2, Bill Fink, 25-Jul-06
+ *	Make manually started server multi-threaded
+ *	Add "--single-threaded" server option to restore old behavior
+ *	Add "-a" client option to retry a failed server connection "again"
+ *	(for certain possibly transient errors)
  * 5.5.1, Bill Fink, 22-Jul-06
  *	Fix bugs with nbuf_bytes and rate_pps used with 3rd party
  *	Pass "-D" option to server (and also make work for third party)
@@ -479,6 +484,9 @@ static struct	sigaction savesigact;
 #define MINMALLOC		1024
 #define HI_MC			231ul
 #define ACCEPT_TIMEOUT		5
+#ifndef MAX_CONNECT_TRIES
+#define MAX_CONNECT_TRIES	5	/* maximum server connect attempts */
+#endif
 #define IDLE_DATA_MIN		5.0	/* minimum value for chk_idle_data */
 #define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
 #define IDLE_DATA_MAX		60.0	/* maximum value for chk_idle_data */
@@ -522,7 +530,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 5;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -700,7 +708,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
 	-i##	receiver interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
-	-F	flip option to reverse direction of data connection open\n"
+	-F	flip option to reverse direction of data connection open\n\
+	-a	retry failed server connection \"again\" for transient errors\n"
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
@@ -731,6 +740,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "		     server timeout in seconds for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
+"	--single-threaded  make manually started server be single threaded\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
@@ -761,6 +771,9 @@ int stream_idx = 0;		/* current stream */
 int start_idx = 1;		/* set to use or bypass control channel */
 int b_flag = 0;			/* use mread() */
 int got_srvr_output = 0;	/* set when server output has been read */
+int retry_server = 0;		/* set to retry control connect() to server */
+int num_connect_tries = 0;	/* tracks attempted connects to server */
+int single_threaded = 0;	/* set to make server single threaded */
 double srvr_MB;
 double srvr_realt;
 double srvr_KBps;
@@ -873,7 +886,9 @@ sigalarm( int signum )
 			/* Don't just exit anymore so can get partial results
 			 * (shouldn't be a problem but keep an eye out that
 			 * servers don't start hanging again) */
-/*			if (inetd && !normal_eod)			*/
+/*			following code untested after recent changes	*/
+/*			if ((inetd  || (!nofork && !single_threaded))	*/
+/*					&& !normal_eod)			*/
 /*				exit(1);				*/
 			if (udp && !interval && handle_urg) {
 				/* send 'A' for ABORT as urgent TCP data
@@ -1536,6 +1551,9 @@ main( int argc, char **argv )
 				exit(1);
 			}
 			break;
+		case 'a':
+			retry_server = 1;
+			break;
 		case '-':
 			if (strcmp(&argv[0][2], "nofork") == 0) {
 				nofork=1;
@@ -1596,6 +1614,9 @@ main( int argc, char **argv )
 				}
 				argv++;
 				argc--;
+			}
+			else if (strcmp(&argv[0][2], "single-threaded") == 0) {
+				single_threaded=1;
 			}
 #ifdef IPV6_V6ONLY
 			else if (strcmp(&argv[0][2], "disable-v4-mapped") == 0) {
@@ -2031,6 +2052,17 @@ doit:
 						vers_minor, vers_delta);
 					fflush(ctlconn);
 					if (!fgets(buf, mallocsize, stdin)) {
+						if ((errno == ECONNRESET) &&
+						    (num_connect_tries <
+							  MAX_CONNECT_TRIES) &&
+						    retry_server) {
+							/* retry control
+							 * connection to server
+							 * for certain possibly
+							 * transient errors */
+							fclose(ctlconn);
+							goto doit;
+						}
 						mes("error from server");
 						fprintf(stderr, "server aborted connection\n");
 						fflush(stderr);
@@ -2325,12 +2357,46 @@ doit:
 				}
 				fflush(stdout);
 				if (!inetd) {
+					/* manually started server */
+					/* send stdout to client   */
 					savestdout=dup(1);
 					close(1);
 					dup(fd[0]);
 					if (!nofork) {
-						close(2);
-						dup(1);
+					    /* send stderr to client */
+					    close(2);
+					    dup(1);
+					    if (!single_threaded) {
+						/* multi-threaded server */
+						if ((pid = fork()) == (pid_t)-1)
+						    err("can't fork");
+						if (pid != 0) {
+						    /* parent just waits for
+						     * quick child exit */
+						    while ((wait_pid =
+								wait(&pidstat))
+								    != pid) {
+							if (wait_pid ==
+								(pid_t)-1) {
+							    if (errno == ECHILD)
+								break;
+							    err("wait failed");
+							}
+						    }
+						    /* and then accepts another
+						     * client connection */
+						    goto cleanup;
+						}
+						/* child just makes a grandchild
+						 * and then immediately exits
+						 * (avoids zombie processes) */
+						if ((pid = fork()) == (pid_t)-1)
+						    err("can't fork");
+						if (pid != 0)
+						    exit(0);
+						/* grandkid does all the work */
+						oneshot = 1;
+					    }
 					}
 				}
 				fgets(buf, mallocsize, ctlconn);
@@ -2952,6 +3018,7 @@ doit:
 					if (errno != EINVAL)
 						err("unable to set maximum segment size");
 			}
+			num_connect_tries++;
 			if (af == AF_INET) {
 				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
 			}
@@ -2964,6 +3031,17 @@ doit:
 			    err("unsupported AF");
 			}
 			if(error_num < 0) {
+				if (clientserver && client && (stream_idx == 0)
+						 && ((errno == ECONNREFUSED) ||
+						     (errno == ECONNRESET))
+						 && (num_connect_tries <
+							MAX_CONNECT_TRIES)
+						 && retry_server) {
+					/* retry control connection to
+					 * server for certain possibly
+					 * transient errors */
+					goto doit;
+				}
 				if (!trans && (stream_idx == 0))
 					err("connect");
 				if (stream_idx > 0) {
