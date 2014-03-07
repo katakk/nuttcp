@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.4.2
+ *	N U T T C P . C						v5.4.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,12 +22,22 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
- * V5.4.2, Bill Fink, 1-Jul-06
+ * 5.4.3, Rob Scott & Bill Fink, 17-Jul-06
+ *	Fix bug with buflen passed to server when no buflen option speicified
+ *	(revert 5.3.2: Fix bug with default UDP buflen for 3rd party)
+ *	Better way to fix bug with default UDP buflen for 3rd party
+ *	Trim trailing '\n' character from err() calls
+ *	Use fcntl() to set O_NONBLOCK instead of MSG_DONTWAIT to send() ABORT
+ *	(and remove MSG_DONTWAIT from recv() because it's not needed)
+ *	Don't re-initialize buflen at completion of server processing
+ *	(non inetd: is needed to check for buffer memory allocation change,
+ *	caused bug if smaller "-l" followed by larger default "-l")
+ * 5.4.2, Bill Fink, 1-Jul-06
  *	Fix bug with interrupted UDP receive reporting negative packet loss
  *	Make sure errors (or debug) from server are propagated to the client
  *	Make setsockopt SO_SNDBUF/SO_RCVBUF error not be fatal to server
  *	Don't send stderr to client if nofork is set (manually started server)
- * V5.4.1, Bill Fink, 30-Jun-06
+ * 5.4.1, Bill Fink, 30-Jun-06
  *	Fix bug with UDP reporting > linerate because of bad correction
  *	Send 2nd UDP BOD packet in case 1st is lost, e.g. waiting for ARP reply
  *	(makes UDP BOD more robust for new separate control and data paths)
@@ -39,14 +49,14 @@
  *	Make server send abort via urgent TCP data if no UDP data received
  *	(non-interval only: so client won't keep transmitting for full period)
  *	Workaround for Windows not handling TCP_MAXSEG getsockopt()
- * V5.3.4, Bill Fink, 21-Jun-06
+ * 5.3.4, Bill Fink, 21-Jun-06
  *	Add "--idle-data-timeout" server option
  *	(server ends transfer if no data received for the specified
  *	timeout interval, previously it was a fixed 60 second timeout)
  *	Shutdown client control connection for writing at end of UDP transfer
  *	(so server can cope better with loss of all EOD packets, which is
  *	mostly of benefit when using separate control and data paths)
- * V5.3.3, Bill Fink & Mark S. Mathews, 18-Jun-06
+ * 5.3.3, Bill Fink & Mark S. Mathews, 18-Jun-06
  *	Add new capability for separate control and data paths
  *	(using syntax:  nuttcp ctl_name_or_IP/data_name_or_IP)
  *	Extend new capability for multiple independent data paths
@@ -55,16 +65,17 @@
  *	Fix -Wall compiler warnings on 64-bit systems
  *	Make manually started server also pass stderr to client
  *	(so client will get warning messages from server)
- * V5.3.2, Bill Fink, 09-Jun-06
+ * 5.3.2, Bill Fink, 09-Jun-06
  *	Fix bug with default UDP buflen for 3rd party
  *	Fix compiler warnings with -Wall on FreeBSD
  *	Give warning that windows doesn't support TCP_MAXSEG
- * V5.3.1, Rob Scott, 06-Jun-06
+ * 5.3.1, Rob Scott, 06-Jun-06
  *	Add "-c" COS option for setting DSCP/TOS setting
  *	Fix builds on latest MacOS X
  *	Fix bug with 3rd party unlimited rate UDP not working
  *	Change "-M" option to require a value
  *	Fix compiler warnings with -Wall (thanks to Daniel J Blueman)
+ *	Remove 'v' from nuttcp version (simplify RPM packaging)
  * V5.2.2, Bill Fink, 13-May-06
  *	Have client report server warnings even if not verbose
  * V5.2.1, Bill Fink, 12-May-06
@@ -507,7 +518,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 4;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -797,6 +808,7 @@ sigalarm( int signum )
 	int i;
 	char *cp1, *cp2;
 	short save_events;
+	long flags, saveflags;
 
 	if (host3 && clientserver && !client)
 		return;
@@ -862,7 +874,16 @@ sigalarm( int signum )
 			if (udp && !interval && handle_urg) {
 				/* send 'A' for ABORT as urgent TCP data
 				 * on control connection (don't block) */
-				send(fd[0], "A", 1, MSG_OOB | MSG_DONTWAIT);
+				saveflags = fcntl(fd[0], F_GETFL, 0);
+				if (saveflags != -1) {
+					flags = saveflags | O_NONBLOCK;
+					fcntl(fd[0], F_SETFL, flags);
+				}
+				send(fd[0], "A", 1, MSG_OOB);
+				if (saveflags != -1) {
+					flags = saveflags;
+					fcntl(fd[0], F_SETFL, flags);
+				}
 			}
 			for ( i = 1; i <= nstream; i++ )
 				close(fd[i]);
@@ -1949,6 +1970,42 @@ doit:
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			if (client) {
+				if (udp && !host3 && !traceroute) {
+					ctlconnmss = 0;
+					optlen = sizeof(ctlconnmss);
+					if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
+						err("get ctlconn maximum segment size didn't work");
+					if (!ctlconnmss) {
+						ctlconnmss = NON_JUMBO_ETHER_MSS;
+						if (format & DEBUGMTU) {
+							fprintf(stderr, "nuttcp%s%s: Warning: Control connection MSS reported as 0, using %d\n", trans?"-t":"-r", ident, ctlconnmss);
+							fflush(stderr);
+						}
+					}
+					else if (format & DEBUGMTU)
+						fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
+					if (buflenopt) {
+						if (buflen > ctlconnmss) {
+							if (format & PARSE)
+								fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+							else
+								fprintf(stderr, "nuttcp%s%s: Warning: IP frags or no data reception since buflen=%d > ctlconnmss=%d\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+							fflush(stderr);
+						}
+					}
+					else {
+						while (buflen > ctlconnmss) {
+							buflen >>= 1;
+							if (nbuf_bytes)
+								nbuf <<= 1;
+							if ((rate != MAXRATE) &&
+							    rate_pps)
+								rate >>= 1;
+						}
+					}
+					if (format & DEBUGMTU)
+						fprintf(stderr, "buflen = %d\n", buflen);
+				}
 				if (!(ctlconn = fdopen(fd[0], "w")))
 					err("fdopen: ctlconn for writing");
 				close(0);
@@ -2458,38 +2515,6 @@ doit:
 		if ((stream_idx > 0) && skip_data)
 			break;
 
-		if (clientserver && client && udp && (stream_idx == 1)) {
-			ctlconnmss = 0;
-			optlen = sizeof(ctlconnmss);
-			if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
-				err("get ctlconn maximum segment size didn't work\n");
-			if (!ctlconnmss)
-				ctlconnmss = NON_JUMBO_ETHER_MSS;
-			if (format & DEBUGMTU)
-				fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
-			if (buflenopt) {
-				if (buflen > ctlconnmss) {
-					if (format & PARSE)
-						fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
-					else
-						fprintf(stderr, "nuttcp%s%s: Warning: IP frags or no data reception since buflen=%d > ctlconnmss=%d\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
-					fflush(stderr);
-				}
-			}
-			else {
-				while (buflen > ctlconnmss) {
-					buflen >>= 1;
-					if (nbuf_bytes)
-						nbuf <<= 1;
-					if ((rate != MAXRATE) &&
-					    rate_pps)
-						rate >>= 1;
-				}
-			}
-			if (format & DEBUGMTU)
-				fprintf(stderr, "buflen = %d\n", buflen);
-		}
-
 		bzero((char *)&sinme[stream_idx], sizeof(sinme[stream_idx]));
 		bzero((char *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
 
@@ -2822,7 +2847,7 @@ doit:
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
-						err("unable to set maximum segment size\n");
+						err("unable to set maximum segment size");
 			}
 			if (af == AF_INET) {
 				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
@@ -2911,15 +2936,15 @@ doit:
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0) {
 					if (errno != EINVAL)
-						err("unable to set maximum segment size\n");
+						err("unable to set maximum segment size");
 					else
-						err("setting maximum segment size not supported on this OS\n");
+						err("setting maximum segment size not supported on this OS");
 				}
 			}
 			if (stream_idx == nstream) {
 				optlen = sizeof(datamss);
 				if (getsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, &optlen) < 0)
-					err("get dataconn maximum segment size didn't work\n");
+					err("get dataconn maximum segment size didn't work");
 				if (format & DEBUGMTU)
 					fprintf(stderr, "datamss = %d\n", datamss);
 			}
@@ -2978,7 +3003,7 @@ doit:
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
-						err("unable to set maximum segment size\n");
+						err("unable to set maximum segment size");
 			}
 			listen(fd[stream_idx],1);   /* allow a queue of 1 */
 			if (options && (stream_idx > 0))  {
@@ -2990,7 +3015,7 @@ doit:
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
-						err("unable to set maximum segment size\n");
+						err("unable to set maximum segment size");
 			}
 			if (clientserver && !client && (stream_idx > 0)) {
 				sigact.sa_handler = ignore_alarm;
@@ -3031,15 +3056,15 @@ doit:
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0) {
 					if (errno != EINVAL)
-						err("unable to set maximum segment size\n");
+						err("unable to set maximum segment size");
 					else
-						err("setting maximum segment size not supported on this OS\n");
+						err("setting maximum segment size not supported on this OS");
 				}
 			}
 			if (stream_idx == nstream) {
 				optlen = sizeof(datamss);
 				if (getsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, &optlen) < 0)
-					err("get dataconn maximum segment size didn't work\n");
+					err("get dataconn maximum segment size didn't work");
 				if (format & DEBUGMTU)
 					fprintf(stderr, "datamss = %d\n", datamss);
 			}
@@ -3125,7 +3150,7 @@ doit:
 		}
 		optlen = sizeof(sendwinval);
 		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,  (void *)&sendwinval, &optlen) < 0)
-			err("get send window size didn't work\n");
+			err("get send window size didn't work");
 #if defined(linux)
 		sendwinval /= 2;
 #endif
@@ -3143,7 +3168,7 @@ doit:
 		}
 		optlen = sizeof(rcvwinval);
 		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,  (void *)&rcvwinval, &optlen) < 0)
-			err("Get recv. window size didn't work\n");
+			err("Get recv window size didn't work");
 #if defined(linux)
 		rcvwinval /= 2;
 #endif
@@ -3759,8 +3784,11 @@ doit:
 						&& (pollfds[0].revents &
 							POLLPRI)) {
 						tmpbuf[0] = '\0';
-						recv(fd[0], tmpbuf, 1,
-						     MSG_OOB | MSG_DONTWAIT);
+						if ((recv(fd[0], tmpbuf, 1,
+							  MSG_OOB) == -1) &&
+						    (errno == EINVAL)) 
+							recv(fd[0], tmpbuf,
+							     1, 0);
 						if (tmpbuf[0] == 'A')
 							intr = 1;
 						else
@@ -4436,8 +4464,11 @@ cleanup:
 		ntbytesc = 0;
 		chk_nbytes = 0;
 		numCalls = 0;
-		buflen = 64 * 1024;
-		if (udp) buflen = DEFAULTUDPBUFLEN;
+/*		Don't re-initialize buflen since it's used to		*/
+/*		determine if we need to change the buffer memory	*/
+/*		allocation for the next client data stream request	*/
+/*		buflen = 64 * 1024;					*/
+/*		if (udp) buflen = DEFAULTUDPBUFLEN;			*/
 		nbuf = 0;
 		sendwin = origsendwin;
 		rcvwin = origrcvwin;
@@ -4501,6 +4532,8 @@ usage:
 static void
 err( char *s )
 {
+	long flags, saveflags;
+
 	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: Error: ", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta);
 	perror(s);
@@ -4510,7 +4543,16 @@ err( char *s )
 	    clientserver && !client && !trans && handle_urg) {
 		/* send 'A' for ABORT as urgent TCP data
 		 * on control connection (don't block) */
-		send(fd[0], "A", 1, MSG_OOB | MSG_DONTWAIT);
+		saveflags = fcntl(fd[0], F_GETFL, 0);
+		if (saveflags != -1) {
+			flags = saveflags | O_NONBLOCK;
+			fcntl(fd[0], F_SETFL, flags);
+		}
+		send(fd[0], "A", 1, MSG_OOB);
+		if (saveflags != -1) {
+			flags = saveflags;
+			fcntl(fd[0], F_SETFL, flags);
+		}
 	}
 	exit(1);
 }
