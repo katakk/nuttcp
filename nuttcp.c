@@ -1,8 +1,8 @@
 /*
- *	N U T T C P . C						v7.1.5
+ *	N U T T C P . C						v7.1.6
  *
- * Copyright(c) 2000 - 2011 Bill Fink.  All rights reserved.
- * Copyright(c) 2003 - 2011 Rob Scott.  All rights reserved.
+ * Copyright(c) 2000 - 2012 Bill Fink.  All rights reserved.
+ * Copyright(c) 2003 - 2012 Rob Scott.  All rights reserved.
  *
  * nuttcp is free, opensource software.  You can redistribute it and/or
  * modify it under the terms of Version 2 of the GNU General Public
@@ -29,6 +29,13 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 7.1.6, Bill Fink, 25-Feb-12
+ *	Add "-sd" direct I/O option for non-sinkmode (Linux only)
+ *	Fix bug with server CPU affinity being parsed as %X instead of %d
+ *	For non-sinkmode insure complete network block is written to stdout
+ *	Above fixes nuttscp bug seen with --copy-dir getting premature EOF
+ *	Updated Copyright notice for new year
+ *	Whitespace style cleanups
  * 7.1.5, Rob Scott, 19-Jul-11
  *	Not every system has ERESTART added in 7.1.4, wrapped in ifdef
  * 7.1.4, Bill Fink, 30-May-11
@@ -485,6 +492,10 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 
 #define _FILE_OFFSET_BITS	64
 
+#if defined(linux)
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <signal.h>
 #include <ctype.h>
@@ -535,7 +546,6 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 
 #if defined(linux)
 #define HAVE_SETAFFINITY
-#define __USE_GNU
 #endif
 
 #if !defined(_WIN32) && (!defined(__MACH__) || defined(_SOCKLEN_T))
@@ -814,7 +824,8 @@ static void psecs( long l, char *cp );
 int Nread( int fd, char *buf, int count );
 int Nwrite( int fd, char *buf, int count );
 int delay( int us );
-int mread( int fd, char *bufp, unsigned n);
+int mread( int fd, char *bufp, unsigned n );
+int mwrite( int fd, char *bufp, unsigned n, int last_write );
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int get_retrans( int sockfd );
@@ -825,7 +836,7 @@ void print_tcpinfo();
 
 int vers_major = 7;
 int vers_minor = 1;
-int vers_delta = 5;
+int vers_delta = 6;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -968,6 +979,7 @@ int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
 #if defined(linux)
 int zerocopy = 0;		/* set to enable zero copy via sendfile() */
+int directio = 0;		/* set to enable direct I/O */
 #endif
 int nofork = 0;			/* set to 1 to not fork server */
 int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
@@ -1088,7 +1100,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	-c##	cos dscp value on data streams (t|T suffix for full TOS field)\n\
 	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n"
 #if defined(linux)
-"	-s[z]	use stdin|stdout for data input|output instead of pattern data\n"
+"	-s[d][z] use stdin|stdout for data input|output instead of pattern data\n"
+"		('d' suboption uses direct I/O if input|output is regular file)\n"
 "		('z' suboption enables zero copy tx if input is regular file)\n"
 #else
 "	-s	use stdin|stdout for data input|output instead of pattern data\n"
@@ -1144,7 +1157,8 @@ Usage (server): nuttcp -S[P] [-options]\n\
 #endif
 "	-1	oneshot server mode (implied with inetd/xinetd), implies -S\n"
 #if defined(linux)
-"	-s[z]	use stdin|stdout for data input|output instead of pattern data\n"
+"	-s[d][z] use stdin|stdout for data input|output instead of pattern data\n"
+"		('d' suboption uses direct I/O if input|output is regular file)\n"
 "		('z' suboption enables zero copy tx if input is regular file)\n"
 #else
 "	-s	use stdin|stdout for data input|output instead of pattern data\n"
@@ -1168,13 +1182,13 @@ Usage (server): nuttcp -S[P] [-options]\n\
 #endif
 "\n\
 Multilink aggregation options (TCP only):\n\
-         nuttcp [-options] -N##  [ctl_addr]/host1/host2/.../host## (xmit only)\n\
-         nuttcp [-options] -N##  [ctl_addr/]host+addr_stride (IPv4 only)\n\
-         nuttcp [-options] -N##  [ctl_addr/]host+n.n.n.n (IPv4 only)\n\
-         nuttcp [-options] -N##m [ctl_addr/]host\n\
-                                 where host resolves to multiple addresses\n\
+	 nuttcp [-options] -N##  [ctl_addr]/host1/host2/.../host## (xmit only)\n\
+	 nuttcp [-options] -N##  [ctl_addr/]host+addr_stride (IPv4 only)\n\
+	 nuttcp [-options] -N##  [ctl_addr/]host+n.n.n.n (IPv4 only)\n\
+	 nuttcp [-options] -N##m [ctl_addr/]host\n\
+				 where host resolves to multiple addresses\n\
 \n\
-                        separate [ctl_addr/] option available only for xmit\n\
+			separate [ctl_addr/] option available only for xmit\n\
 \n\
 Format options:\n\
 	-fxmitstats	also give transmitter stats (MB) with -i (UDP only)\n\
@@ -1370,11 +1384,11 @@ sigalarm( int signum )
 		gettimeofday(&timec, (struct timezone *)0);
 		tvsub( &timed, &timec, &timep );
 		realtd = timed.tv_sec + ((double)timed.tv_usec) / 1000000;
-		if( realtd <= 0.0 )  realtd = 0.000001;
+		if (realtd <= 0.0)  realtd = 0.000001;
 		tvsub( &timed, &timec, &time0 );
 		realt = timed.tv_sec + ((double)timed.tv_usec)
 						    / 1000000;
-		if( realt <= 0.0 )  realt = 0.000001;
+		if (realt <= 0.0)  realt = 0.000001;
 	}
 
 	if (clientserver && !trans) {
@@ -1598,7 +1612,7 @@ sigalarm( int signum )
 					strcpy(fmt, PERF_FMT_INTERVAL2);
 				fprintf(stdout, fmt,
 					(double)nrbytes/(1024*1024), realt,
-					(double)nrbytes/realt/125000 );
+					(double)nrbytes/realt/125000);
 				if (udplossinfo) {
 					if (!(format & NODROPS)) {
 						if (format & PARSE)
@@ -1740,7 +1754,7 @@ main( int argc, char **argv )
 
 	nut_cmd = argv[0];
 	argv++; argc--;
-	while ( argc>0 && argv[0][0] == '-' )  {
+	while (argc>0 && argv[0][0] == '-') {
 		skiparg = 0;
 		switch (argv[0][1]) {
 
@@ -1902,8 +1916,10 @@ main( int argc, char **argv )
 		case 's':
 			sinkmode = 0;	/* sink/source data */
 #if defined(linux)
-			if (argv[0][2] == 'z')
+			if (strchr(argv[0], 'z'))
 				zerocopy = 1;
+			if (strchr(argv[0], 'd'))
+				directio = 1;
 #endif
 			break;
 		case 'p':
@@ -3102,7 +3118,17 @@ main( int argc, char **argv )
 
 	mallocsize = buflen;
 	if (mallocsize < MINMALLOC) mallocsize = MINMALLOC;
-	if( (buf = (char *)malloc(mallocsize)) == (char *)NULL)
+#if defined(linux)
+	if (directio) {
+		error_num = posix_memalign((void **)&buf, sysconf(_SC_PAGESIZE),
+					   mallocsize);
+		if (error_num) {
+			errno = error_num;
+			err("posix_memalign");
+		}
+	} else
+#endif
+	if ((buf = (char *)malloc(mallocsize)) == (char *)NULL)
 		err("malloc");
 
 	pattern( buf, buflen );
@@ -3847,16 +3873,16 @@ doit:
 					if (host3) {
 						sscanf(strstr(buf,
 							   ", affinity =") + 13,
-						       "%X", &affinity);
+						       "%d", &affinity);
 						sscanf(strstr(buf,
 							   ", srvr_affinity =")
 								+ 18,
-						       "%X", &srvr_affinity);
+						       "%d", &srvr_affinity);
 					}
 					else {
 						sscanf(strstr(buf,
 							   ", affinity =") + 13,
-						       "%X", &srvr_affinity);
+						       "%d", &srvr_affinity);
 					}
 				}
 				else {
@@ -3917,7 +3943,19 @@ doit:
 					free(buf);
 					mallocsize = nbuflen;
 					if (mallocsize < MINMALLOC) mallocsize = MINMALLOC;
-					if( (buf = (char *)malloc(mallocsize)) == (char *)NULL)
+#if defined(linux)
+					if (directio) {
+						error_num = posix_memalign(
+							(void **)&buf,
+							sysconf(_SC_PAGESIZE),
+							mallocsize);
+						if (error_num) {
+							errno = error_num;
+							err("posix_memalign");
+						}
+					} else
+#endif
+					if ((buf = (char *)malloc(mallocsize)) == (char *)NULL)
 						err("malloc");
 					pattern( buf, nbuflen );
 				}
@@ -4570,11 +4608,11 @@ doit:
 #endif
 			if (trans) {
 			    if ((brief <= 0) && (format & PARSE)) {
-				fprintf(stdout,"nuttcp-t%s: buflen=%d ",
+				fprintf(stdout, "nuttcp-t%s: buflen=%d ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%llu ", nbuf);
-				fprintf(stdout,"nstream=%d port=%d mode=%s host=%s",
+				    fprintf(stdout, "nbuf=%llu ", nbuf);
+				fprintf(stdout, "nstream=%d port=%d mode=%s host=%s",
 				    nstream, port,
 				    udp?"udp":"tcp",
 				    host);
@@ -4583,36 +4621,36 @@ doit:
 					    multicast);
 				fprintf(stdout, "\n");
 				if (timeout)
-				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n",
+				    fprintf(stdout, "nuttcp-t%s: time_limit=%.2f\n",
 				    ident, timeout);
 				if ((rate != MAXRATE) || tos)
-				    fprintf(stdout,"nuttcp-t%s:", ident);
+				    fprintf(stdout, "nuttcp-t%s:", ident);
 				if (rate != MAXRATE) {
-				    fprintf(stdout," rate_limit=%.3f rate_unit=Mbps rate_mode=%s",
+				    fprintf(stdout, " rate_limit=%.3f rate_unit=Mbps rate_mode=%s",
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (maxburst > 1)
-					fprintf(stdout," packet_burst=%d",
+					fprintf(stdout, " packet_burst=%d",
 						maxburst);
 				    if (udp) {
 					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
-					fprintf(stdout," pps_rate=%llu",
+					fprintf(stdout, " pps_rate=%llu",
 					    ppsrate);
 				    }
 				}
 				if (tos)
-				    fprintf(stdout," tos=0x%X", tos);
+				    fprintf(stdout, " tos=0x%X", tos);
 				if ((rate != MAXRATE) || tos)
-				    fprintf(stdout,"\n");
+				    fprintf(stdout, "\n");
 			    }
 			    else if (brief <= 0) {
-				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
+				fprintf(stdout, "nuttcp-t%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%llu, ", nbuf);
-				fprintf(stdout,"nstream=%d, port=%d %s -> %s",
+				    fprintf(stdout, "nbuf=%llu, ", nbuf);
+				fprintf(stdout, "nstream=%d, port=%d %s -> %s",
 				    nstream, port,
 				    udp?"udp":"tcp",
 				    host);
@@ -4620,72 +4658,72 @@ doit:
 				    fprintf(stdout, " ttl=%d", multicast);
 				fprintf(stdout, "\n");
 				if (timeout)
-				    fprintf(stdout,"nuttcp-t%s: time limit = %.2f second%s\n",
+				    fprintf(stdout, "nuttcp-t%s: time limit = %.2f second%s\n",
 					ident, timeout,
 					(timeout == 1.0)?"":"s");
 				if ((rate != MAXRATE) || tos)
-				    fprintf(stdout,"nuttcp-t%s:", ident);
+				    fprintf(stdout, "nuttcp-t%s:", ident);
 				if (rate != MAXRATE) {
-				    fprintf(stdout," rate limit = %.3f Mbps (%s)",
+				    fprintf(stdout, " rate limit = %.3f Mbps (%s)",
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (maxburst > 1)
-					fprintf(stdout,", packet burst = %d",
+					fprintf(stdout, ", packet burst = %d",
 						maxburst);
 				    if (udp) {
 					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
-					fprintf(stdout,", %llu pps", ppsrate);
+					fprintf(stdout, ", %llu pps", ppsrate);
 				    }
 				    if (tos)
-					fprintf(stdout,",");
+					fprintf(stdout, ",");
 				}
 				if (tos)
-				    fprintf(stdout," tos = 0x%X", tos);
+				    fprintf(stdout, " tos = 0x%X", tos);
 				if ((rate != MAXRATE) || tos)
-				    fprintf(stdout,"\n");
+				    fprintf(stdout, "\n");
 			    }
 			} else {
 			    if ((brief <= 0) && (format & PARSE)) {
-				fprintf(stdout,"nuttcp-r%s: buflen=%d ",
+				fprintf(stdout, "nuttcp-r%s: buflen=%d ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%llu ", nbuf);
-				fprintf(stdout,"nstream=%d port=%d mode=%s\n",
+				    fprintf(stdout, "nbuf=%llu ", nbuf);
+				fprintf(stdout, "nstream=%d port=%d mode=%s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
 				if (tos)
-				    fprintf(stdout,"nuttcp-r%s: tos=0x%X\n",
+				    fprintf(stdout, "nuttcp-r%s: tos=0x%X\n",
 					ident, tos);
 				if (interval)
-				    fprintf(stdout,"nuttcp-r%s: reporting_interval=%.2f\n",
+				    fprintf(stdout, "nuttcp-r%s: reporting_interval=%.2f\n",
 					ident, interval);
 			    }
 			    else if (brief <= 0) {
-				fprintf(stdout,"nuttcp-r%s: buflen=%d, ",
+				fprintf(stdout, "nuttcp-r%s: buflen=%d, ",
 					ident, buflen);
 				if (nbuf != INT_MAX)
-				    fprintf(stdout,"nbuf=%llu, ", nbuf);
-				fprintf(stdout,"nstream=%d, port=%d %s\n",
+				    fprintf(stdout, "nbuf=%llu, ", nbuf);
+				fprintf(stdout, "nstream=%d, port=%d %s\n",
 				    nstream, port,
 				    udp?"udp":"tcp");
 				if (tos)
-				    fprintf(stdout,"nuttcp-r%s: tos = 0x%X\n",
+				    fprintf(stdout, "nuttcp-r%s: tos = 0x%X\n",
 					ident, tos);
 				if (interval)
-				    fprintf(stdout,"nuttcp-r%s: interval reporting every %.2f second%s\n",
+				    fprintf(stdout, "nuttcp-r%s: interval reporting every %.2f second%s\n",
 					ident, interval,
 					(interval == 1.0)?"":"s");
 			    }
 			}
 		}
 
-		if (stream_idx > 0)  {
+		if (stream_idx > 0) {
 		    if (trans) {
 			/* Set the transmitter options */
 			if (sendwin) {
-				if( setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
+				if (setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
 					(void *)&sendwin, sizeof(sendwin)) < 0)
 					errmes("unable to setsockopt SO_SNDBUF");
 				if (braindead && (setsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,
@@ -4693,14 +4731,14 @@ doit:
 					errmes("unable to setsockopt SO_RCVBUF");
 			}
 			if (tos) {
-				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
+				if (setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
 					(void *)&tos, sizeof(tos)) < 0)
 					err("setsockopt");
 			}
 			if (nodelay && !udp) {
 				struct protoent *p;
 				p = getprotobyname("tcp");
-				if( p && setsockopt(fd[stream_idx], p->p_proto, TCP_NODELAY,
+				if (p && setsockopt(fd[stream_idx], p->p_proto, TCP_NODELAY,
 				    (void *)&one, sizeof(one)) < 0)
 					err("setsockopt: nodelay");
 				if ((stream_idx == nstream) && (brief <= 0))
@@ -4709,7 +4747,7 @@ doit:
 		    } else {
 			/* Set the receiver options */
 			if (rcvwin) {
-				if( setsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,
+				if (setsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,
 					(void *)&rcvwin, sizeof(rcvwin)) < 0)
 					errmes("unable to setsockopt SO_RCVBUF");
 				if (braindead && (setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
@@ -4717,21 +4755,21 @@ doit:
 					errmes("unable to setsockopt SO_SNDBUF");
 			}
 			if (tos) {
-				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
+				if (setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
 					(void *)&tos, sizeof(tos)) < 0)
 					err("setsockopt");
 			}
 		    }
 		}
-		if (!udp || (stream_idx == 0))  {
+		if (!udp || (stream_idx == 0)) {
 		    if (((trans && !reverse) && (stream_idx > 0)) ||
 			((!trans && reverse) && (stream_idx > 0)) ||
 			(client && (stream_idx == 0))) {
 			/* The transmitter initiates the connection
 			 * (unless reversed by the flip option)
 			 */
-			if (options && (stream_idx > 0))  {
-				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
+			if (options && (stream_idx > 0)) {
+				if (setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
 					errmes("unable to setsockopt options");
 			}
 			usleep(20000);
@@ -4775,7 +4813,7 @@ doit:
 			else {
 			    err("unsupported AF");
 			}
-			if(error_num < 0) {
+			if (error_num < 0) {
 				if (clientserver && client && (stream_idx == 0)
 						 && ((errno == ECONNREFUSED) ||
 						     (errno == ECONNRESET))
@@ -4964,8 +5002,8 @@ doit:
 				}
 				setsid();
 			}
-			if (options && (stream_idx > 0))  {
-				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
+			if (options && (stream_idx > 0)) {
+				if (setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
 					errmes("unable to setsockopt options");
 			}
 			if (sockopterr && trans &&
@@ -5231,14 +5269,14 @@ acceptnewconn:
 			}
 #endif
 			if (format & PARSE)
-				fprintf(stdout,"nuttcp%s%s: send_window_size=%d receive_window_size=%d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+				fprintf(stdout, "nuttcp%s%s: send_window_size=%d receive_window_size=%d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
 			else
-				fprintf(stdout,"nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+				fprintf(stdout, "nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
 #if defined(linux)
 			if (format & PARSE)
-				fprintf(stdout,"nuttcp%s%s: send_window_avail=%d receive_window_avail=%d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
+				fprintf(stdout, "nuttcp%s%s: send_window_avail=%d receive_window_avail=%d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
 			else
-				fprintf(stdout,"nuttcp%s%s: available send window = %d, available receive window = %d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
+				fprintf(stdout, "nuttcp%s%s: available send window = %d, available receive window = %d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
 #endif
 		}
 	}
@@ -6240,8 +6278,8 @@ acceptnewconn:
 	}
 	if (sinkmode) {
 		register int cnt = 0;
-		if (trans)  {
-			if(udp) {
+		if (trans) {
+			if (udp) {
 				strcpy(buf, "BOD0");
 				if (multicast) {
 				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
@@ -6319,7 +6357,7 @@ acceptnewconn:
 				}
 				pollfds[0].events = save_events;
 			}
-			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
+			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1], buf, buflen)) == buflen) && !intr) {
 				if (clientserver && ((nbuf & 0x3FF) == 0)) {
 				    if (!client) {
 					/* check if client went away */
@@ -6543,7 +6581,7 @@ acceptnewconn:
 			nbytes -= buflen;
 			if (intr && (cnt > 0))
 				nbytes += cnt;
-			if(udp) {
+			if (udp) {
 				if (multicast)
 				    bcopy((char *)&save_sinhim.sin_addr.s_addr,
 					  (char *)&sinhim[1].sin_addr.s_addr,
@@ -6568,8 +6606,8 @@ acceptnewconn:
 			if (udp) {
 			    ntbytesc = 0;
 			    got_eod0 = 0;
-			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
-				    if( cnt <= 4 ) {
+			    while (((cnt=Nread(fd[stream_idx + 1], buf, buflen)) > 0) && !intr) {
+				    if (cnt <= 4) {
 					    if (strncmp(buf, "EOD0", 4) == 0) {
 						    gettimeofday(&time_eod0,
 							(struct timezone *)0);
@@ -6791,7 +6829,7 @@ acceptnewconn:
 								/ 1000000;
 			    }
 			} else {
-			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
+			    while (((cnt=Nread(fd[stream_idx + 1], buf, buflen)) > 0) && !intr) {
 				    nbytes += cnt;
 				    cnt = 0;
 				    if (first_read) {
@@ -6851,16 +6889,32 @@ acceptnewconn:
 		}
 	} else {
 		register int cnt;
-		if (trans)  {
+		if (trans) {
 #if defined(linux)
 			struct stat instat;
 
 			if (fstat(savestdin, &instat) == 0) {
-				if (!S_ISREG(instat.st_mode))
+				if (!S_ISREG(instat.st_mode)) {
 					zerocopy = 0;
+					directio = 0;
+				}
 			}
-			else
+			else {
 				zerocopy = 0;
+				directio = 0;
+			}
+
+			if (directio) {
+				flags = fcntl(savestdin, F_GETFL, 0);
+				if (flags < 0)
+					errmes("fcntl get O_DIRECT");
+				else {
+					flags |= O_DIRECT;
+					if (fcntl(savestdin,
+						  F_SETFL, flags) < 0)
+						errmes("fcntl set O_DIRECT");
+				}
+			}
 
 			if (zerocopy) {
 				while (nbuf-- &&
@@ -6877,8 +6931,8 @@ acceptnewconn:
 #endif
 			{
 				while (nbuf-- &&
-				       ((cnt=read(savestdin,buf,buflen)) > 0) &&
-				       (Nwrite(fd[stream_idx + 1],buf,cnt)
+				       ((cnt=read(savestdin, buf, buflen)) > 0) &&
+				       (Nwrite(fd[stream_idx + 1], buf, cnt)
 						== cnt)) {
 					nbytes += cnt;
 					cnt = 0;
@@ -6890,10 +6944,33 @@ acceptnewconn:
 				strcpy(buf, "EOD0");
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 			}
-		}  else  {
-			while ((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
+		} else {
+#if defined(linux)
+			struct stat outstat;
+
+			if (fstat(savestdout, &outstat) == 0) {
+				if (!S_ISREG(outstat.st_mode))
+					directio = 0;
+			}
+			else
+				directio = 0;
+
+			if (directio) {
+				flags = fcntl(savestdout, F_GETFL, 0);
+				if (flags < 0)
+					errmes("fcntl get O_DIRECT");
+				else {
+					flags |= O_DIRECT;
+					if (fcntl(savestdout,
+						  F_SETFL, flags) < 0)
+						errmes("fcntl set O_DIRECT");
+				}
+			}
+#endif
+			while ((cnt=Nread(fd[stream_idx + 1], buf, buflen)) > 0 &&
 			    ((cnt != 4) || strncmp(buf, "EOD", 3) != 0) &&
-			    write(savestdout,buf,cnt) == cnt) {
+			    mwrite(savestdout, buf, cnt,
+				   cnt != buflen) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
 				stream_idx++;
@@ -6914,8 +6991,8 @@ acceptnewconn:
 	itimer.it_interval.tv_usec = 0;
 	setitimer(ITIMER_REAL, &itimer, 0);
 	done = 1;
-	(void)read_timer(stats,sizeof(stats));
-	if(udp&&trans)  {
+	(void)read_timer(stats, sizeof(stats));
+	if (udp&&trans) {
 		usleep(500000);
 		strcpy(buf, "EOD1");
 		(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
@@ -7173,8 +7250,8 @@ acceptnewconn:
 		fflush(stdout);
 	}
 
-	if( cput <= 0.0 )  cput = 0.000001;
-	if( realt <= 0.0 )  realt = 0.000001;
+	if (cput <= 0.0)  cput = 0.000001;
+	if (realt <= 0.0)  realt = 0.000001;
 
 	if (udp && !trans) {
 		if (got_eod0)
@@ -7458,7 +7535,7 @@ acceptnewconn:
 		fprintf(stdout, fmt, trans?"-t":"-r", ident,
 			(double)nbytes/(1024*1024), realt,
 			(double)nbytes/realt/1024,
-			(double)nbytes/realt/125000 );
+			(double)nbytes/realt/125000);
 		if (clientserver && client && !trans && udp) {
 			fprintf(stdout, "nuttcp-r%s:", ident);
 			if (format & PARSE)
@@ -7508,7 +7585,7 @@ acceptnewconn:
 			fprintf(stdout, fmt,
 				trans?"-t":"-r", ident,
 				(double)nbytes/(1024*1024), cput,
-				(double)nbytes/cput/1024 );
+				(double)nbytes/cput/1024);
 		}
 		if (!udp && trans && (retransinfo > 0)) {
 			fprintf(stdout, "nuttcp%s%s: ",
@@ -7781,7 +7858,7 @@ acceptnewconn:
 					strcpy(fmt, PERF_FMT_BRIEF);
 				fprintf(stdout, fmt,
 					srvr_MB, srvr_realt, srvr_Mbps,
-					cpu_util, srvr_cpu_util );
+					cpu_util, srvr_cpu_util);
 				if ((nstream > 1) && (retransinfo == 1) &&
 				    total_retrans && !(format & NORETRANS) &&
 				    (brief & BRIEF_RETRANS_STREAMS)) {
@@ -7865,7 +7942,7 @@ acceptnewconn:
 					strcpy(fmt, PERF_FMT_BRIEF);
 				fprintf(stdout, fmt,
 					MB, realt, (double)nbytes/realt/125000,
-					srvr_cpu_util, cpu_util );
+					srvr_cpu_util, cpu_util);
 				if ((nstream > 1) && (retransinfo == 1) &&
 				    total_retrans && !(format & NORETRANS) &&
 				    (brief & BRIEF_RETRANS_STREAMS) &&
@@ -7950,7 +8027,7 @@ acceptnewconn:
 				fprintf(stdout, "%s: ", ident + 1);
 			fprintf(stdout, PERF_FMT_BRIEF2 "\n", MB,
 				realt, (double)nbytes/realt/125000, cpu_util,
-				trans?"TX":"RX" );
+				trans?"TX":"RX");
 		}
 	}
 
@@ -8121,7 +8198,7 @@ cleanup:
 	exit(0);
 
 usage:
-	fprintf(stdout,Usage);
+	fprintf(stdout, Usage);
 	exit(1);
 }
 
@@ -8130,11 +8207,11 @@ err( char *s )
 {
 	long flags, saveflags;
 
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
+	fprintf(stderr, "nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
 			ident, vers_major, vers_minor, vers_delta,
 			beta ? BETA_STR : "");
 	perror(s);
-	fprintf(stderr,"errno=%d\n",errno);
+	fprintf(stderr, "errno=%d\n", errno);
 	fflush(stderr);
 	if ((stream_idx > 0) && !done &&
 	    clientserver && !client && !trans && handle_urg) {
@@ -8157,7 +8234,7 @@ err( char *s )
 static void
 mes( char *s )
 {
-	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d%s: %s\n", trans?"-t":"-r", ident,
+	fprintf(stdout, "nuttcp%s%s: v%d.%d.%d%s: %s\n", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta,
 			beta ? BETA_STR : "", s);
 }
@@ -8165,11 +8242,11 @@ mes( char *s )
 static void
 errmes( char *s )
 {
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
+	fprintf(stderr, "nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
 			ident, vers_major, vers_minor, vers_delta,
 			beta ? BETA_STR : "");
 	perror(s);
-	fprintf(stderr,"errno=%d\n",errno);
+	fprintf(stderr, "errno=%d\n", errno);
 	fflush(stderr);
 }
 
@@ -8178,8 +8255,8 @@ pattern( register char *cp, register int cnt )
 {
 	register char c;
 	c = 0;
-	while ( cnt-- > 0 )  {
-		while ( !isprint((c&0x7F)) )  c++;
+	while (cnt-- > 0) {
+		while (!isprint((c&0x7F)))  c++;
 		*cp++ = (c++&0x7F);
 	}
 }
@@ -8225,7 +8302,7 @@ read_timer( char *str, int len )
 	tvadd( &tstart, &ru0.ru_utime, &ru0.ru_stime );
 	tvsub( &td, &tend, &tstart );
 	cput = td.tv_sec + ((double)td.tv_usec) / 1000000;
-	if( cput < 0.00001 )  cput = 0.00001;
+	if (cput < 0.00001)  cput = 0.00001;
 	return( cput );
 }
 
@@ -8251,20 +8328,20 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 	else
 		cp = "%Uuser %Ssys %Ereal %P %Xi+%Dd %Mmaxrss %F+%Rpf %Ccsw";
 
-	for (; *cp; cp++)  {
+	for ( ; *cp; cp++ ) {
 		if (*cp != '%')
 			*outp++ = *cp;
 		else if (cp[1]) switch(*++cp) {
 
 		case 'U':
 			tvsub(&tdiff, &r1->ru_utime, &r0->ru_utime);
-			sprintf(outp,"%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
+			sprintf(outp, "%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
 			END(outp);
 			break;
 
 		case 'S':
 			tvsub(&tdiff, &r1->ru_stime, &r0->ru_stime);
-			sprintf(outp,"%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
+			sprintf(outp, "%ld.%01ld", (long)tdiff.tv_sec, (long)tdiff.tv_usec/100000);
 			END(outp);
 			break;
 
@@ -8274,61 +8351,61 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 			break;
 
 		case 'P':
-			sprintf(outp,"%d%%", (int) (t*100 / ((ms ? ms : 1))));
+			sprintf(outp, "%d%%", (int) (t*100 / ((ms ? ms : 1))));
 			END(outp);
 			break;
 
 		case 'W':
 			i = r1->ru_nswap - r0->ru_nswap;
-			sprintf(outp,"%d", i);
+			sprintf(outp, "%d", i);
 			END(outp);
 			break;
 
 		case 'X':
-			sprintf(outp,"%ld", t == 0 ? 0 : (r1->ru_ixrss-r0->ru_ixrss)/t);
+			sprintf(outp, "%ld", t == 0 ? 0 : (r1->ru_ixrss-r0->ru_ixrss)/t);
 			END(outp);
 			break;
 
 		case 'D':
-			sprintf(outp,"%ld", t == 0 ? 0 :
+			sprintf(outp, "%ld", t == 0 ? 0 :
 			    (r1->ru_idrss+r1->ru_isrss-(r0->ru_idrss+r0->ru_isrss))/t);
 			END(outp);
 			break;
 
 		case 'K':
-			sprintf(outp,"%ld", t == 0 ? 0 :
+			sprintf(outp, "%ld", t == 0 ? 0 :
 			    ((r1->ru_ixrss+r1->ru_isrss+r1->ru_idrss) -
 			    (r0->ru_ixrss+r0->ru_idrss+r0->ru_isrss))/t);
 			END(outp);
 			break;
 
 		case 'M':
-			sprintf(outp,"%ld", r1->ru_maxrss/2);
+			sprintf(outp, "%ld", r1->ru_maxrss/2);
 			END(outp);
 			break;
 
 		case 'F':
-			sprintf(outp,"%ld", r1->ru_majflt-r0->ru_majflt);
+			sprintf(outp, "%ld", r1->ru_majflt-r0->ru_majflt);
 			END(outp);
 			break;
 
 		case 'R':
-			sprintf(outp,"%ld", r1->ru_minflt-r0->ru_minflt);
+			sprintf(outp, "%ld", r1->ru_minflt-r0->ru_minflt);
 			END(outp);
 			break;
 
 		case 'I':
-			sprintf(outp,"%ld", r1->ru_inblock-r0->ru_inblock);
+			sprintf(outp, "%ld", r1->ru_inblock-r0->ru_inblock);
 			END(outp);
 			break;
 
 		case 'O':
-			sprintf(outp,"%ld", r1->ru_oublock-r0->ru_oublock);
+			sprintf(outp, "%ld", r1->ru_oublock-r0->ru_oublock);
 			END(outp);
 			break;
 		case 'C':
-			sprintf(outp,"%ld+%ld", r1->ru_nvcsw-r0->ru_nvcsw,
-				r1->ru_nivcsw-r0->ru_nivcsw );
+			sprintf(outp, "%ld+%ld", r1->ru_nvcsw-r0->ru_nvcsw,
+				r1->ru_nivcsw-r0->ru_nivcsw);
 			END(outp);
 			break;
 		}
@@ -8363,19 +8440,19 @@ psecs( long l, register char *cp )
 
 	i = l / 3600;
 	if (i) {
-		sprintf(cp,"%d:", i);
+		sprintf(cp, "%d:", i);
 		END(cp);
 		i = l % 3600;
-		sprintf(cp,"%d%d", (i/60) / 10, (i/60) % 10);
+		sprintf(cp, "%d%d", (i/60) / 10, (i/60) % 10);
 		END(cp);
 	} else {
 		i = l;
-		sprintf(cp,"%d", i / 60);
+		sprintf(cp, "%d", i / 60);
 		END(cp);
 	}
 	i %= 60;
 	*cp++ = ':';
-	sprintf(cp,"%d%d", i / 10, i % 10);
+	sprintf(cp, "%d%d", i / 10, i % 10);
 }
 
 /*
@@ -8388,11 +8465,11 @@ Nread( int fd, char *buf, int count )
 	socklen_t len = sizeof(from);
 	struct timeval timed;	/* time delta */
 	register int cnt;
-	if( udp )  {
+	if (udp) {
 		cnt = recvfrom( fd, buf, count, 0, (struct sockaddr *)&from, &len );
 		numCalls++;
 	} else {
-		if( b_flag )
+		if (b_flag)
 			cnt = mread( fd, buf, count );	/* fill buf */
 		else {
 			cnt = read( fd, buf, count );
@@ -8483,7 +8560,7 @@ Nwrite( int fd, char *buf, int count )
 			gettimeofday(&timedol, (struct timezone *)0);
 			tvsub( &td, &timedol, &time0 );
 			realt = td.tv_sec + ((double)td.tv_usec) / 1000000;
-			if( realt <= 0.0 )  realt = 0.000001;
+			if (realt <= 0.0)  realt = 0.000001;
 		}
 	}
 	if (do_owd && (count > 4)) {
@@ -8496,7 +8573,7 @@ Nwrite( int fd, char *buf, int count )
 		bcopy(&secs, buf + 8, 4);
 		bcopy(&usecs, buf + 12, 4);
 	}
-	if( udp )  {
+	if (udp) {
 again:
 		if (af == AF_INET) {
 			cnt = sendto( fd, buf, count, 0, (struct sockaddr *)&sinhim[stream_idx + 1], sizeof(sinhim[stream_idx + 1]) );
@@ -8510,7 +8587,7 @@ again:
 			err("unsupported AF");
 		}
 		numCalls++;
-		if( cnt<0 && errno == ENOBUFS )  {
+		if (cnt<0 && errno == ENOBUFS) {
 			delay(18000);
 			errno = 0;
 			goto again;
@@ -8551,15 +8628,58 @@ mread( int fd, register char *bufp, unsigned n )
 	do {
 		nread = read(fd, bufp, n-count);
 		numCalls++;
-		if(nread < 0)  {
+		if (nread < 0) {
 			if (errno != EINTR)
 				perror("nuttcp_mread");
 			return(-1);
 		}
-		if(nread == 0)
+		if (nread == 0)
 			return((int)count);
 		count += (unsigned)nread;
 		bufp += nread;
+	 } while (count < n);
+
+	return((int)count);
+}
+
+/*
+ *			M W R I T E
+ *
+ * This function performs the function of a write(II) but will
+ * call write(II) multiple times in order to put the requested
+ * number of characters.  This can be necessary because
+ * piped connections may not be able to deliver data with
+ * the full requested count.
+ */
+int
+mwrite( int fd, register char *bufp, unsigned n, int last_write )
+{
+	register unsigned	count = 0;
+	register int		nwrite;
+#if defined(linux)
+	long			flags;
+
+	if (directio && last_write) {
+		flags = fcntl(savestdout, F_GETFL, 0);
+		if (flags < 0)
+			errmes("fcntl get O_DIRECT");
+		else {
+			flags &= ~O_DIRECT;
+			if (fcntl(savestdout, F_SETFL, flags) < 0)
+				errmes("fcntl set O_DIRECT");
+		}
+	}
+#endif
+	do {
+		nwrite = write(fd, bufp, n-count);
+		numCalls++;
+		if (nwrite < 0) {
+			if (errno != EINTR)
+				perror("nuttcp_mwrite");
+			return(-1);
+		}
+		count += (unsigned)nwrite;
+		bufp += nwrite;
 	 } while (count < n);
 
 	return((int)count);
