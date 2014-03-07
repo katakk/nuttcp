@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v7.1.4
+ *	N U T T C P . C						v7.1.5
  *
  * Copyright(c) 2000 - 2011 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2011 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 7.1.5, Rob Scott, 19-Jul-11
+ *	Not every system has ERESTART added in 7.1.4, wrapped in ifdef
  * 7.1.4, Bill Fink, 30-May-11
  *	Updated Copyright notice
  *	Use -DHAVE_SS_FAMILY to override _AIX workaround for newer AIX
@@ -576,7 +578,7 @@ typedef int socklen_t;
 #define ss_family sa_family
 #endif /* old sparc */
 
-#if defined(_AIX) && !defined(HAVE_SS_FAMILY) 
+#if defined(_AIX) && !defined(HAVE_SS_FAMILY)
 #define ss_family __ss_family
 #endif
 
@@ -823,7 +825,7 @@ void print_tcpinfo();
 
 int vers_major = 7;
 int vers_minor = 1;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -6900,7 +6902,10 @@ acceptnewconn:
 		}
 	}
 	if (errno && (errno != EAGAIN)) {
-		if ((errno != EINTR) && (errno != ERESTART) &&
+		if ((errno != EINTR) &&
+#ifdef ERESTART
+		    (errno != ERESTART) &&
+#endif
 		    (!clientserver || client)) err("IO");
 	}
 	itimer.it_value.tv_sec = 0;
