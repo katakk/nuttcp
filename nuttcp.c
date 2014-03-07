@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.7
+ *	N U T T C P . C						v5.1.8
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.8, Bill Fink, 22-May-04
+ *	Allow 'd|D' suffix to "-T" option to specify days
+ *	Fix compiler warning about unused variable cp in getoptvalp routine
+ *	Interval value check against timeout value should be >=
  * V5.1.7, Bill Fink, 29-Apr-04
  *	Drop "-nb" option in favor of "-n###[k|m|g|t|p]"
  * V5.1.6, Bill Fink, 25-Apr-04
@@ -410,7 +414,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 7;
+int vers_delta = 8;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1084,6 +1088,8 @@ optlen = sizeof(maxseg);
 				timeout *= 60.0;
 			else if ((ch == 'h') || (ch == 'H'))
 				timeout *= 3600.0;
+			else if ((ch == 'd') || (ch == 'D'))
+				timeout *= 86400.0;
 			itimer.it_value.tv_sec = timeout;
 			itimer.it_value.tv_usec =
 				(timeout - itimer.it_value.tv_sec)*1000000;
@@ -1416,8 +1422,8 @@ optlen = sizeof(maxseg);
 		exit(1);
 	}
 
-	if (timeout && (interval > timeout)) {
-		fprintf(stderr, "ignoring interval = %f which is greater than timeout = %f\n", interval, timeout);
+	if (timeout && (interval >= timeout)) {
+		fprintf(stderr, "ignoring interval=%f which is greater than or equal timeout=%f\n", interval, timeout);
 		fflush(stderr);
 		interval = 0;
 	}
@@ -3925,7 +3931,6 @@ getoptvalp( char **argv, int index, int reqval, int *skiparg )
 {
 	struct sockaddr_storage dummy;
 	char **nextarg;
-	char *cp;
 
 	*skiparg = 0;
 	nextarg = argv + 1;
