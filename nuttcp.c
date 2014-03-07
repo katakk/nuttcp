@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.5.4
+ *	N U T T C P . C						v5.5.5
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 5.5.5, Bill Fink, 30-Jan-07
+ *	Change default MC addr to be based on client addr instead of xmit addr
  * 5.5.4, Bill Fink, 3-Nov-06
  *	Fix bug with negative loss causing huge drop counts on interval reports
  *	Updated Copyright notice and added GPL license notice
@@ -543,7 +545,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 5;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -2813,9 +2815,23 @@ doit:
 				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
 					(char *)&save_sinhim.sin_addr.s_addr,
 					sizeof(struct in_addr));
-				    bcopy((char *)&me.sin_addr.s_addr,
+				    if (!client && (irvers >= 50505)) {
+					struct sockaddr_in peer;
+					socklen_t peerlen = sizeof(peer);
+					if (getpeername(fd[0],
+						      (struct sockaddr *) &peer, 
+						      &peerlen) < 0) {
+						err("getpeername");
+					}
+					bcopy((char *)&peer.sin_addr.s_addr,
+					    (char *)&sinhim[1].sin_addr.s_addr,
+					    sizeof(struct in_addr));
+				    }
+				    else {
+					bcopy((char *)&me.sin_addr.s_addr,
 					(char *)&sinhim[1].sin_addr.s_addr,
 					sizeof(struct in_addr));
+				    }
 				    sinhim[1].sin_addr.s_addr &=
 					htonl(0xFFFFFF);
 				    sinhim[1].sin_addr.s_addr |=
@@ -3803,9 +3819,22 @@ doit:
 					&peerlen) < 0) {
 				err("getpeername");
 			}
-			bcopy((char *)&peer.sin_addr.s_addr,
-			      (char *)&mc_group.imr_multiaddr.s_addr,
-			      sizeof(struct in_addr));
+			if (client && (irvers >= 50505)) {
+				struct sockaddr_in me;
+				socklen_t melen = sizeof(me);
+				if (getsockname(fd[0], (struct sockaddr *) &me, 
+						&melen) < 0) {
+					err("getsockname");
+				}
+				bcopy((char *)&me.sin_addr.s_addr,
+				      (char *)&mc_group.imr_multiaddr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else {
+				bcopy((char *)&peer.sin_addr.s_addr,
+				      (char *)&mc_group.imr_multiaddr.s_addr,
+				      sizeof(struct in_addr));
+			}
 			mc_group.imr_multiaddr.s_addr &= htonl(0xFFFFFF);
 			mc_group.imr_multiaddr.s_addr |= htonl(HI_MC << 24);
 			if (setsockopt(fd[1], IPPROTO_IP, IP_ADD_MEMBERSHIP,

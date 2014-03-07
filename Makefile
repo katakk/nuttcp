@@ -1,19 +1,28 @@
-APP = nuttcp-v5.1.11
-EXTRAVERSION=
-CC = gcc
+APP = nuttcp-5.5.5
+EXTRAVERSION=-pre1
+CC = gcc -Wall
 #OPT = -g -O0
 OPT = -O3
-CFLAGS = $(OPT) -I. -Imissing
+CFLAGS = $(OPT) $(NOIPV6)
 LIBS = 
-APPEXT =
+ifneq ($(NOIPV6),)
+APPEXTV6=-noipv6
+endif
+APPEXT = $(APPEXTV6)
 
-CFLAGS.MISSING = $(CFLAGS) -DHAVE_CONFIG_H
+CFLAGS.MISSING = -Imissing -DHAVE_CONFIG_H
 OBJS.GETADD = getaddrinfo.o
 OBJS.INETFUN = inet_ntop.o inet_pton.o inet_aton.o 
 
-TAR = gtar
+TAR = tar
 
-all: $(APP)$(APPEXT)
+all: $(APP)$(EXTRAVERSION)$(APPEXT)
+
+uniosx:
+	$(MAKE) OPT="-O3 -arch i386 -arch ppc"
+
+sgicc32:
+	$(MAKE) CC="cc -n32" OPT="-O -OPT:Olimit=0"
 
 sgicc:
 	$(MAKE) CC=cc OPT="-O -OPT:Olimit=0"
@@ -25,16 +34,16 @@ sol28cc:
 	$(MAKE) CC=cc OPT=-O LIBS="-lsocket -lnsl"
 
 sol26:
-	$(MAKE) LIBS="$(OBJS.GETADD) $(OBJS.INETFUN) -lsocket -lnsl"
+	$(MAKE) CFLAGS="$(CFLAGS) $(CFLAGS.MISSING)" LIBS="$(OBJS.GETADD) $(OBJS.INETFUN) -lsocket -lnsl"
 
 sol26cc:
-	$(MAKE) CC=cc OPT=-O LIBS="$(OBJS.GETADD) $(OBJS.INETFUN) -lsocket -lnsl"
+	$(MAKE) CC=cc OPT=-O CFLAGS="-O $(NOIPV6) $(CFLAGS.MISSING)" LIBS="$(OBJS.GETADD) $(OBJS.INETFUN) -lsocket -lnsl"
 
 cyg:
 	$(MAKE) APPEXT=".exe"
 
 oldcyg:
-	$(MAKE) LIBS="$(OBJS.GETADD) $(OBJS.INETFUN)" APPEXT=".exe"
+	$(MAKE) CFLAGS="$(CFLAGS) $(CFLAGS.MISSING)" LIBS="$(OBJS.GETADD) $(OBJS.INETFUN)" APPEXT=".exe"
 
 win32:
 	$(MAKE) LIBS="$(OBJS.INETFUN) -Lwin32 -llibc.a -Bstatic" APPEXT=".exe"
@@ -43,7 +52,7 @@ icc:
 	$(MAKE) CC=icc OPT=-O2
 #	$(MAKE) CC=icc OPT="-w -O3 -parallel -unroll -align -xM -vec_report -par_report2"
 
-$(APP)$(APPEXT): $(APP)$(EXTRAVERSION).c $(LIBS)
+$(APP)$(EXTRAVERSION)$(APPEXT): $(APP)$(EXTRAVERSION).c $(LIBS)
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 inet_ntop.o: missing/inet_ntop.c missing/config.h
 	$(CC) $(CFLAGS.MISSING) -o $@ -c $<
@@ -55,7 +64,8 @@ getaddrinfo.o: missing/getaddrinfo.c missing/config.h
 	$(CC) $(CFLAGS.MISSING) -o $@ -c $<
 
 clean:
-	rm  -f $(APP)$(APPEXT) $(APP).o $(OBJS.GETADD) $(OBJS.INETFUN)
+	rm  -f $(APP)$(EXTRAVERSION)$(APPEXT) $(APP)$(EXTRAVERSION).o $(OBJS.GETADD) $(OBJS.INETFUN)
 
 tar:
-	(cd ..; $(TAR) cfz $(APP)$(EXTRAVERSION).tar.gz --exclude old --exclude bin $(APP))
+	(cd ..; $(TAR) cfj $(APP)$(EXTRAVERSION).tar.bz2 --exclude $(APP)/bin --exclude $(APP)/cygwin/*.bz2 --exclude $(APP)/rpm $(APP)$(EXTRAVERSION)$(APPEXT))
+	(cd ..; $(TAR) cfj $(APP)$(EXTRAVERSION).rpm.tar.bz2 --exclude $(APP)/bin --exclude $(APP)/cygwin  --exclude $(APP)/missing --exclude $(APP)/rpm $(APP)$(EXTRAVERSION)$(APPEXT))

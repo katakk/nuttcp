@@ -8,12 +8,12 @@ NNAAMMEE
 SSYYNNOOPPSSIISS
        nnuuttttccpp --hh
        nnuuttttccpp --VV
-       nnuuttttccpp --tt [ --bbddDDssuuvv ] [ --ll_b_u_f_f_e_r___l_e_n ] [ --nn_n_u_m___b_u_f_s ]
+       nnuuttttccpp --tt [ --bbddDDssuuvv ] [ --cc_d_s_c_p___v_a_l_u_e ] [ --ll_b_u_f_f_e_r___l_e_n ] [ --nn_n_u_m___b_u_f_s ]
                  [ --ww_w_i_n_d_o_w___s_i_z_e ] [ --wwss_s_e_r_v_e_r___w_i_n_d_o_w ] [ --wwbb ]
                  [ --pp_d_a_t_a___p_o_r_t ] [ --PP_c_o_n_t_r_o_l___p_o_r_t ]
                  [ --NN_n_u_m___s_t_r_e_a_m_s ] [ --RR_x_m_i_t___r_a_t_e___l_i_m_i_t [m|g] ]
                  [ --TT_x_m_i_t___t_i_m_e_o_u_t [m] ] _h_o_s_t [ << _i_n_p_u_t ]
-       nnuuttttccpp --rr [ --bbBBddssuuvv ] [ --ll_b_u_f_f_e_r___l_e_n ] [ --nn_n_u_m___b_u_f_s ]
+       nnuuttttccpp --rr [ --bbBBddssuuvv ] [ --cc_d_s_c_p___v_a_l_u_e ] [ --ll_b_u_f_f_e_r___l_e_n ] [ --nn_n_u_m___b_u_f_s ]
                  [ --ww_w_i_n_d_o_w___s_i_z_e ] [ --wwss_s_e_r_v_e_r___w_i_n_d_o_w ] [ --wwbb ]
                  [ --pp_d_a_t_a___p_o_r_t ] [ --PP_c_o_n_t_r_o_l___p_o_r_t ]
                  [ --NN_n_u_m___s_t_r_e_a_m_s ] [ --RR_x_m_i_t___r_a_t_e___l_i_m_i_t [m|g] ]
@@ -27,7 +27,7 @@ DDEESSCCRRIIPPTTIIOONN
        raw  TCP  (or  UDP)  network  layer  throughput  by transferring memory
        buffers from a source system across an  interconnecting  network  to  a
        destination  system,  either  transferring  data  for  a specified time
-       interval, or alternatively transferring a specified number of  buffers.
+       interval, or alternatively transferring a specified  number  of  bytes.
        In  addition  to  reporting  the  achieved  network throughput in Mbps,
        nuttcp also provides additional useful information related to the  data
        transfer  such  as  user,  system, and wall-clock time, transmitter and
@@ -40,132 +40,139 @@ DDEESSCCRRIIPPTTIIOONN
        version to place in the first BSD Unix  release.   nuttcp  has  several
        useful  features beyond those of the basic ttcp/nttcp, such as a server
        mode, rate limiting, multiple parallel streams, and timer based  usage.
-       nuttcp is also continuing to evolve to meet new requirements that arise
-       and to add desired new features.  nuttcp has been  successfully  tested
-       and  used  on a variety of Solaris, SGI, and PPC/X86 Linux systems, and
-       should probably work fine on most flavors of Unix.
+       More recent changes include IPv6 support, IPv4 multicast, and the abil-
+       ity to set the maximum segment size or TOS/DSCP bits.  nuttcp  is  con-
+       tinuing  to  evolve  to  meet  new  requirements  that arise and to add
+       desired new features.  nuttcp has been successfully built and run on  a
+       variety of Solaris, SGI, and PPC/X86 Linux systems, and should probably
+       work fine on most flavors of Unix.  It has also been used  successfully
+       on various versions of the Windows operating system.
 
-       There are two basic modes of operation for  nuttcp.   The  original  or
-       classic  mode  is  the transmitter/receiver mode, which is also the way
-       the original ttcp and nttcp worked.  In this mode, a receiver is  first
-       initiated  on the destination host using "nuttcp -r", and then a trans-
+       There  are  two  basic  modes of operation for nuttcp.  The original or
+       classic mode is the transmitter/receiver mode, which is  also  the  way
+       the  original ttcp and nttcp worked.  In this mode, a receiver is first
+       initiated on the destination host using "nuttcp -r", and then a  trans-
        mitter must be started on the source host using "nuttcp -t".  This mode
-       is  somewhat  deprecated  and is no longer recommended for general use.
-       The preferred and recommended mode of operation for nuttcp is  the  new
-       client/server  mode.   With this mode, a server is first started on one
+       is somewhat deprecated and is no longer recommended  for  general  use.
+       The  preferred  and recommended mode of operation for nuttcp is the new
+       client/server mode.  With this mode, a server is first started  on  one
        system using "nuttcp -S" (or "nuttcp -1"), and then a client may either
-       transmit  data  to  (using  "nuttcp  -t")  or  receive data from (using
+       transmit data to (using  "nuttcp  -t")  or  receive  data  from  (using
        "nuttcp -r") the server system.  All the information provided by nuttcp
-       is  reported  by the client, including the information from the server,
-       thus providing a full snapshot of both  the  transmitter  and  receiver
+       is reported by the client, including the information from  the  server,
+       thus  providing  a  full  snapshot of both the transmitter and receiver
        ends of the data transfer.
 
-       The  server  may be started by a normal, non-privileged user by issuing
-       either a "nuttcp -S" or a "nuttcp -1" command.   However,  the  optimal
-       and  recommended  method  of running a server is to run "nuttcp -S" via
-       the  inetd/xinetd  daemon.   This  method   has   several   significant
-       advantages, including being more robust, allowing multiple simultaneous
-       connections, and providing for access control over who  is  allowed  to
-       use  the  nuttcp  server via the hosts.allow (and hosts.deny) file.  By
-       default, the nuttcp server listens for commands on port 5000,  and  the
+       The server may be started by a normal, non-privileged user  by  issuing
+       either  a  "nuttcp  -S" or a "nuttcp -1" command.  However, the optimal
+       and recommended method of running a server is to run  "nuttcp  -S"  via
+       the  inetd/xinetd  daemon.   This method has several significant advan-
+       tages, including being more robust, allowing multiple simultaneous con-
+       nections,  and  providing for access control over who is allowed to use
+       the nuttcp server  via  the  hosts.allow  (and  hosts.deny)  file.   By
+       default,  the  nuttcp server listens for commands on port 5000, and the
        actual nuttcp data transfers take place on port 5001.
 
-       The  _h_o_s_t parameter must be specified for the transmitter, and provides
-       the host name or IP address of  the  receiver.   In  classic  transmit-
-       ter/receiver  mode,  the  _h_o_s_t  parameter  may not be specified for the
-       receiver.  In client/server mode, when the client is the receiver,  the
+       The _h_o_s_t parameter must be specified for the transmitter, and  provides
+       the  host  name  or  IP  address of the receiver.  In classic transmit-
+       ter/receiver mode, the _h_o_s_t parameter may  not  be  specified  for  the
+       receiver.   In client/server mode, when the client is the receiver, the
        _h_o_s_t parameter specifies the host name or IP address of the transmitter
        (server).
 
-       Normally, a nuttcp data  transfer  is  memory-to-memory.   However,  by
-       using  the  "-s" option, it is possible to also perform memory-to-disk,
+       Normally,  a  nuttcp  data  transfer  is memory-to-memory.  However, by
+       using the "-s" option, it is possible to also  perform  memory-to-disk,
        disk-to-memory, and disk-to-disk data transfers.  Using the "-s" option
-       with  the transmitter will cause nuttcp to read its data from the stan-
-       dard input instead of using a prefabricated memory buffer, while  using
-       the  "-s"  option  on  the  receiver causes nuttcp to write its data to
-       standard output.  All these types of data transfers are  possible  with
-       the  classic transmitter/receiver mode.  For security reasons, the "-s"
-       option is disabled on the server, so it is not possible to  access  the
+       with the transmitter will cause nuttcp to read its data from the  stan-
+       dard  input instead of using a prefabricated memory buffer, while using
+       the "-s" option on the receiver causes nuttcp  to  write  its  data  to
+       standard  output.   All these types of data transfers are possible with
+       the classic transmitter/receiver mode.  For security reasons, the  "-s"
+       option  is  disabled on the server, so it is not possible to access the
        disk on the server side of a data transfer.
 
        The allowed options to nuttcp are:
 
 OOPPTTIIOONNSS
-       --hh     Print  out  a usage statement.  Running nuttcp with no arguments
+       --hh     Print out a usage statement.  Running nuttcp with  no  arguments
               will also produce a usage statement.
 
-       --VV     Prints the nuttcp version number.  The nuttcp  version  is  also
-              printed  as  part of the normal nuttcp output when the "-v" ver-
-              bose output is used (but not when using the default  brief  out-
-              put).   In  client/server  mode,  the version number of both the
+       --VV     Prints  the  nuttcp  version number.  The nuttcp version is also
+              printed as part of the normal nuttcp output when the  "-v"  ver-
+              bose  output  is used (but not when using the default brief out-
+              put).  In client/server mode, the version  number  of  both  the
               client and server is identified.
 
        --tt     Indicates that this nuttcp is the transmitter.  In client/server
-              mode,  this  means the server specified by the _h_o_s_t parameter is
+              mode, this means the server specified by the _h_o_s_t  parameter  is
               the receiver.
 
-       --rr     Indicates that this nuttcp is the  receiver.   In  client/server
-              mode,  this  means the server specified by the _h_o_s_t parameter is
+       --rr     Indicates  that  this  nuttcp is the receiver.  In client/server
+              mode, this means the server specified by the _h_o_s_t  parameter  is
               the transmitter.
 
-       --SS     Indicates that this nuttcp is the server.  The only option  that
-              may  be specified to the server is the "-P" option, which allows
+       --SS     Indicates  that this nuttcp is the server.  The only option that
+              may be specified to the server is the "-P" option, which  allows
               one to change the control port used by the server, but only when
-              the  server  is  started by a normal, non-privileged user.  When
+              the server is started by a normal,  non-privileged  user.   When
               the server is initiated by inetd/xinetd, the server control port
               should be specified in the _s_e_r_v_i_c_e_s file.
 
-       --11     Basically  the same as the "-S" option, but indicates a one-shot
+       --11     Basically the same as the "-S" option, but indicates a  one-shot
               server, i.e. the server exits after the first data transfer ini-
-              tiated  by  a  client.  The "-1" option should only be used when
-              the server is started by a normal,  non-privileged  user.   This
-              option  will  probably rarely need to be used, but can be useful
+              tiated by a client.  The "-1" option should only  be  used  when
+              the  server  is  started by a normal, non-privileged user.  This
+              option will probably rarely need to be used, but can  be  useful
               for a quick test and eliminates the possibilty of leaving a non-
               access controlled nuttcp server running on the system (which can
-              happen when using the "-S" option and  forgetting  to  kill  the
+              happen  when  using  the  "-S" option and forgetting to kill the
               nuttcp server after finishing a series of tests).
 
        --bb     Produce brief one-line output, which includes the amount of data
               transferred in MB (1024**2 bytes), the time interval in seconds,
-              the  TCP  (or  UDP) network throughput in Mbps (millions of bits
-              per second), the transmitter and/or  receiver  CPU  utilization,
+              the TCP (or UDP) network throughput in Mbps  (millions  of  bits
+              per  second),  the  transmitter and/or receiver CPU utilization,
               and for UDP data transfers also outputs the loss percentage.  In
-              client/server mode, most of the printed statistics are from  the
+              client/server  mode, most of the printed statistics are from the
               viewpoint of the receiver.  This is the default output format.
 
-       --BB     This  option  is  only  valid  for  the receiver, and forces the
-              receiver to read a full buffer (as specified by the "-l"  buffer
-              length  option)  from  the network.  It is mainly intended to be
-              used with the "-s" option to only output full buffers  to  stan-
-              dard  output (e.g. for use with tar).  It is also implicitly set
-              whenever the number of streams as specified by the  "-N"  option
+       --BB     This option is only valid  for  the  receiver,  and  forces  the
+              receiver  to read a full buffer (as specified by the "-l" buffer
+              length option) from the network.  It is mainly  intended  to  be
+              used  with  the "-s" option to only output full buffers to stan-
+              dard output (e.g. for use with tar).  It is also implicitly  set
+              whenever  the  number of streams as specified by the "-N" option
               is greater than 1.  This option is not passed to the server.
 
-       --dd     For  TCP  data  transfers,  sets the SO_DEBUG option on the data
-              socket.  This option is not passed  to  the  server.   It  is  a
+       --dd     For TCP data transfers, sets the SO_DEBUG  option  on  the  data
+              socket.   This  option  is  not  passed  to the server.  It is a
               rarely used option which may possibly be removed or renamed in a
               future version of nuttcp.
 
-       --DD     This option is only valid for the transmitter, and only for  TCP
-              data  transfers, in which case it sets the TCP_NODELAY option on
-              the data socket, which turns off  the  Nagle  algorithm  causing
-              data  packets to be sent as soon as possible without introducing
-              any unnecessary delays.   This  option  is  not  passed  to  the
-              server.   It  is  a  rarely  used  option  which may possibly be
+       --DD     This  option is only valid for the transmitter, and only for TCP
+              data transfers, in which case it sets the TCP_NODELAY option  on
+              the  data  socket,  which  turns off the Nagle algorithm causing
+              data packets to be sent as soon as possible without  introducing
+              any  unnecessary  delays.   This  option  is  not  passed to the
+              server.  It is a  rarely  used  option  which  may  possibly  be
               removed or renamed in a future version of nuttcp.
 
-       --ss     Setting the "-s" option causes nuttcp to either  read  its  data
-              from  standard  input  rather  than  using  prefabricated memory
-              buffers (for "nuttcp -t"), or to write its data out to  standard
+       --ss     Setting  the  "-s"  option causes nuttcp to either read its data
+              from standard  input  rather  than  using  prefabricated  memory
+              buffers  (for "nuttcp -t"), or to write its data out to standard
               output (for "nuttcp -r").  The "-s" option is disabled for secu-
               rity reasons on the server.
 
        --uu     Use UDP for the data transfer instead of the default of TCP.
 
        --vv     Verbose output that provides some additional information related
-              to  the  data  transfer.   In  client/server mode, the server is
-              always verbose (implicit "-v" option), but the  client  controls
+              to the data transfer.  In  client/server  mode,  the  server  is
+              always  verbose  (implicit "-v" option), but the client controls
               the extent and type of output via the "-v" and "-b" options.
+
+       --cc_d_s_c_p___v_a_l_u_e
+              Sets the socket option to support  COS.   Either  takes  a  dscp
+              value or with the t|T modifier it takes the full TOS field.
 
        --ll_b_u_f_f_e_r___l_e_n
               Length  of the network write/read buffer in bytes for the trans-
@@ -261,15 +268,15 @@ OOPPTTIIOONNSS
               side of the connection so the "%TX"  stats  are  not  meaningful
               when  using the rate limit option.  By default the rate limit is
               applied to the average rate of the data transfer in  real  time,
-              and  not  in  CPU  time,  so  if  nuttcp  is switched out of the
-              processor for any reason, when it is switched  back  in,  it  is
-              possible  that the instantaneous rate may momentarily exceed the
-              specified value.  There is an 'i' qualifier to  the  rate  limit
-              option (specified as "-Ri") that will restrict the instantaneous
-              rate at any given point in time to the specified value, although
-              in  this case the final rate reported by nuttcp may be less than
-              the specified value since nuttcp won't attempt to  catch  up  if
-              other processes gain control of the CPU.  The default is no rate
+              and not in CPU time, so if nuttcp is switched out of the proces-
+              sor for any reason, when it is switched back in, it is  possible
+              that the instantaneous rate may momentarily exceed the specified
+              value.  There is an 'i'  qualifier  to  the  rate  limit  option
+              (specified  as  "-Ri") that will restrict the instantaneous rate
+              at any given point in time to the specified value,  although  in
+              this case the final rate reported by nuttcp may be less than the
+              specified value since nuttcp won't attempt to catch up if  other
+              processes  gain  control  of  the  CPU.   The default is no rate
               limit.  Note another way to throttle the throughput of TCP  data
               streams is to reduce the window size.
 
@@ -315,4 +322,4 @@ BBUUGGSS
 
 
 
-nuttcp-v5.1.3                    16 April 2004                       NUTTCP(8)
+nuttcp-v5.5.5                   3 February 2007                      NUTTCP(8)
