@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.5
+ *	N U T T C P . C						v5.1.6
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.6, Bill Fink, 25-Apr-04
+ *	Fix bug with using interval option without timeout
  * V5.1.5, Bill Fink, 23-Apr-04
  *	Modification to allow space between option parameter and its value
  *	Permit 'k' or 'm' suffix on "-l" option
@@ -406,7 +408,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 5;
+int vers_delta = 6;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1406,7 +1408,7 @@ optlen = sizeof(maxseg);
 		exit(1);
 	}
 
-	if (interval > timeout) {
+	if (timeout && (interval > timeout)) {
 		fprintf(stderr, "ignoring interval = %f which is greater than timeout = %f\n", interval, timeout);
 		fflush(stderr);
 		interval = 0;
