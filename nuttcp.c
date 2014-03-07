@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.4.1
+ *	N U T T C P . C						v5.4.2
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.4.2, Bill Fink, 1-Jul-06
+ *	Fix bug with interrupted UDP receive reporting negative packet loss
+ *	Make sure errors (or debug) from server are propagated to the client
+ *	Make setsockopt SO_SNDBUF/SO_RCVBUF error not be fatal to server
+ *	Don't send stderr to client if nofork is set (manually started server)
  * V5.4.1, Bill Fink, 30-Jun-06
  *	Fix bug with UDP reporting > linerate because of bad correction
  *	Send 2nd UDP BOD packet in case 1st is lost, e.g. waiting for ARP reply
@@ -502,7 +507,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 4;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -2163,7 +2168,7 @@ doit:
 				}
 				if (irvers < 30403)
 					udplossinfo = 0;
-				if (udp && (irvers >= 50401)) {
+				if (irvers >= 50401) {
 					two_bod = 1;
 					handle_urg = 1;
 				}
@@ -2201,8 +2206,10 @@ doit:
 					savestdout=dup(1);
 					close(1);
 					dup(fd[0]);
-					close(2);
-					dup(1);
+					if (!nofork) {
+						close(2);
+						dup(1);
+					}
 				}
 				fgets(buf, mallocsize, ctlconn);
 				if (sscanf(buf, HELO_FMT, &rvers_major,
@@ -2427,7 +2434,7 @@ doit:
 				if (udp && interval && (buflen >= 32) &&
 					(irvers >= 30403))
 					udplossinfo = 1;
-				if (udp && (irvers >= 50401)) {
+				if (irvers >= 50401) {
 					two_bod = 1;
 					handle_urg = 1;
 				}
@@ -2754,10 +2761,10 @@ doit:
 			if (sendwin) {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
 					(void *)&sendwin, sizeof(sendwin)) < 0)
-					err("setsockopt");
+					errmes("unable to setsockopt SO_SNDBUF");
 				if (braindead && (setsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,
 					(void *)&rcvwin, sizeof(rcvwin)) < 0))
-					err("setsockopt");
+					errmes("unable to setsockopt SO_RCVBUF");
 			}
 			if (tos) {
 				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
@@ -2778,10 +2785,10 @@ doit:
 			if (rcvwin) {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,
 					(void *)&rcvwin, sizeof(rcvwin)) < 0)
-					err("setsockopt");
+					errmes("unable to setsockopt SO_RCVBUF");
 				if (braindead && (setsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,
 					(void *)&sendwin, sizeof(sendwin)) < 0))
-					err("setsockopt");
+					errmes("unable to setsockopt SO_SNDBUF");
 			}
 			if (tos) {
 				if( setsockopt(fd[stream_idx], IPPROTO_IP, IP_TOS,
@@ -3738,10 +3745,10 @@ doit:
 					if ((poll(pollfds, 1, 0) > 0)
 						&& (pollfds[0].revents &
 							(POLLIN | POLLPRI)))
-						break;
+						intr = 1;
 					pollfds[0].events = save_events;
 				    }
-				    else if (udp && !interval && handle_urg) {
+				    else if (handle_urg) {
 					/* check for urgent TCP data
 					 * on control connection */
 					pollfds[0].fd = fileno(ctlconn);
@@ -3825,7 +3832,11 @@ doit:
 					else if (strncmp(intervalbuf, "nuttcp-r", 8) == 0) {
 						if ((brief <= 0) ||
 						    strstr(intervalbuf,
-							    "Warning")) {
+							    "Warning") ||
+						    strstr(intervalbuf,
+							    "Error") ||
+						    strstr(intervalbuf,
+							    "Debug")) {
 							if (*ident) {
 								fputs("nuttcp-r", stdout);
 								fputs(ident, stdout);
@@ -4160,8 +4171,13 @@ doit:
 			if (strncmp(tmpbuf, "nuttcp-", 7) == 0)
 				sprintf(cp1, "nuttcp-%c%s%s",
 					tmpbuf[7], ident, tmpbuf + 8);
-			if (strstr(cp1, "Warning") && (brief > 0))
+			if ((strstr(cp1, "Warning") ||
+			     strstr(cp1, "Error") ||
+			     strstr(cp1, "Debug"))
+					&& (brief > 0)) {
 				fputs(cp1, stdout);
+				fflush(stdout);
+			}
 			cp1 += strlen(cp1);
 		}
 		got_srvr_output = 1;
@@ -4392,8 +4408,10 @@ cleanup:
 				dup(savestdout);
 				close(savestdout);
 				fflush(stderr);
-				close(2);
-				dup(1);
+				if (!nofork) {
+					close(2);
+					dup(1);
+				}
 			}
 		}
 		fclose(ctlconn);
@@ -4483,10 +4501,17 @@ usage:
 static void
 err( char *s )
 {
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: Error: ", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta);
 	perror(s);
 	fprintf(stderr,"errno=%d\n",errno);
+	fflush(stderr);
+	if ((stream_idx > 0) && !done &&
+	    clientserver && !client && !trans && handle_urg) {
+		/* send 'A' for ABORT as urgent TCP data
+		 * on control connection (don't block) */
+		send(fd[0], "A", 1, MSG_OOB | MSG_DONTWAIT);
+	}
 	exit(1);
 }
 
@@ -4500,9 +4525,11 @@ mes( char *s )
 static void
 errmes( char *s )
 {
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: Error: ", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta);
 	perror(s);
+	fprintf(stderr,"errno=%d\n",errno);
+	fflush(stderr);
 }
 
 void
