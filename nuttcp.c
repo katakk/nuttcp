@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.10
+ *	N U T T C P . C						v5.1.11
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.11, Rob Scott, 25-Jun-04
+ *	Add support for scoped ipv6 addresses
  * V5.1.10, Bill Fink, 16-Jun-04
  *	Allow 'b' suffix on "-w" option to specify window size in bytes
  * V5.1.9, Bill Fink, 23-May-04
@@ -424,7 +426,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 10;
+int vers_delta = 11;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -445,8 +447,6 @@ struct sockaddr_storage frominet;
 int domain = PF_UNSPEC;
 int af = AF_UNSPEC;
 int explicitaf = 0;		/* address family explicit specified (-4|-6) */
-int numeric4addr = 0;		/* IPv4 address specified on command line */
-int numeric6addr = 0;		/* IPv6 address specified on command line */
 int fd[MAXSTREAM + 1];		/* fd array of network sockets */
 int nfd;			/* fd for accept call */
 struct pollfd pollfds[MAXSTREAM + 4];	/* used for reading interval reports */
@@ -557,6 +557,7 @@ struct in_addr clientaddr;	/* IP address of client connecting to server */
 
 #ifdef AF_INET6
 struct in6_addr clientaddr6;	/* IP address of client connecting to server */
+uint32_t clientscope6;		/* scope part of IP address of client */
 #endif
 
 struct hostent *addr;
@@ -1318,6 +1319,7 @@ optlen = sizeof(maxseg);
 
 #ifdef AF_INET6
 	bzero((char *)&clientaddr6, sizeof(clientaddr6));
+	clientscope6 = 0;
 #endif
 
 	if (!nbuf) {
@@ -1344,19 +1346,14 @@ optlen = sizeof(maxseg);
 
 		host = argv[0];
 
-		if (inet_pton(AF_INET,  host, &dummy) > 0) numeric4addr = 1;
-#ifdef AF_INET6
-		if (inet_pton(AF_INET6, host, &dummy) > 0) numeric6addr = 1;
-#endif
-		if (!(numeric4addr || numeric6addr)) {
-			bzero(&hints, sizeof(hints));
-			res = NULL;
-			if (explicitaf) hints.ai_family = af;
-			if (error_num = getaddrinfo(host, NULL, &hints, &res)) {
-				fprintf(stderr, "bad hostname: %s\n", gai_strerror(error_num));
-				exit(1);
-			}
-			af = res->ai_family;
+		bzero(&hints, sizeof(hints));
+		res = NULL;
+		if (explicitaf) hints.ai_family = af;
+		if (error_num = getaddrinfo(host, NULL, &hints, &res)) {
+			fprintf(stderr, "bad hostname or address: %s\n", gai_strerror(error_num));
+			exit(1);
+		}
+		af = res->ai_family;
 /*
  * At the moment PF_ matches AF_ but are maintained seperate and the socket
  * call is supposed to be PF_
@@ -1365,20 +1362,7 @@ optlen = sizeof(maxseg);
  * ever get changed to not match some code will have to go here to find the
  * domain appropriate for the family
  */
-			domain = af;
-		}
-
-		if (!explicitaf)
-			if (numeric4addr) {
-				domain = PF_INET;
-				af = AF_INET;
-			}
-#ifdef AF_INET6
-			else if (numeric6addr) {
-				domain = PF_INET6;
-				af = AF_INET6;
-			}
-#endif
+		domain = af;
 	}
 
 #ifdef AF_INET6
@@ -1408,8 +1392,9 @@ optlen = sizeof(maxseg);
 			}
 		}
 #endif
-		else
+		else {
 			err("unsupported AF");
+		}
 	}
 
 	if (!ctlport) {
@@ -1431,8 +1416,9 @@ optlen = sizeof(maxseg);
 			}
 		}
 #endif
-		else
+		else {
 			err("unsupported AF");
+		}
 	}
 
 	if ((port < 5000) || ((port + nstream - 1) > 65535)) {
@@ -1488,6 +1474,7 @@ optlen = sizeof(maxseg);
 		  if (!force_server && getpeername(0, (struct sockaddr *) &peer,
 				&peerlen) == 0) {
 			clientaddr6 = peer.sin6_addr;
+			clientscope6 = peer.sin6_scope_id;
 			inetd = 1;
 			oneshot = 1;
 			start_idx = 1;
@@ -2039,38 +2026,23 @@ doit:
 		    (client && (stream_idx == 0))) {
 			/* xmitr initiates connections (unless reversed) */
 			if (client) {
-				if (numeric4addr || numeric6addr)  {
-					if (af == AF_INET) {
-						sinhim[stream_idx].sin_family = af;
-						inet_pton(af, host, &sinhim[stream_idx].sin_addr.s_addr);
-					}
+				if (af == AF_INET) {
+				    sinhim[stream_idx].sin_family = af;
+				    bcopy((char *)&(((struct sockaddr_in *)res->ai_addr)->sin_addr),
+					  (char *)&sinhim[stream_idx].sin_addr.s_addr,
+					  sizeof(sinhim[stream_idx].sin_addr.s_addr));
+				}
 #ifdef AF_INET6
-					else if (af == AF_INET6) {
-						sinhim6[stream_idx].sin6_family = af;
-						inet_pton(af, host, sinhim6[stream_idx].sin6_addr.s6_addr);
-					}
+				else if (af == AF_INET6) {
+				    sinhim6[stream_idx].sin6_family = af;
+				    bcopy((char *)&(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr),
+					  (char *)&sinhim6[stream_idx].sin6_addr.s6_addr,
+					  sizeof(sinhim6[stream_idx].sin6_addr.s6_addr));
+				    sinhim6[stream_idx].sin6_scope_id = ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
+				}
 #endif
-					else {
-						err("unsupported AF");
-					}
-				} else {
-					if (af == AF_INET) {
-					    sinhim[stream_idx].sin_family = af;
-					    bcopy((char *)&(((struct sockaddr_in *)res->ai_addr)->sin_addr),
-					          (char *)&sinhim[stream_idx].sin_addr.s_addr,
-						  sizeof(sinhim[stream_idx].sin_addr.s_addr));
-					}
-#ifdef AF_INET6
-					else if (af == AF_INET6) {
-					    sinhim6[stream_idx].sin6_family = af;
-					    bcopy((char *)&(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr),
-					          (char *)&sinhim6[stream_idx].sin6_addr.s6_addr,
-						  sizeof(sinhim6[stream_idx].sin6_addr.s6_addr));
-					}
-#endif
-					else {
-						err("unsupported AF");
-					}
+				else {
+					err("unsupported AF");
 				}
 			} else {
 				sinhim[stream_idx].sin_family = af;
@@ -2078,6 +2050,7 @@ doit:
 #ifdef AF_INET6
 				sinhim6[stream_idx].sin6_family = af;
 				sinhim6[stream_idx].sin6_addr = clientaddr6;
+				sinhim6[stream_idx].sin6_scope_id = clientscope6;
 #endif
 			}
 			if (stream_idx == 0) {
@@ -2484,7 +2457,10 @@ doit:
 					trans?"-t":"-r", ident,
 					tmphost);
 			    }
-			    if (stream_idx == 0) clientaddr6 = peer.sin6_addr;
+			    if (stream_idx == 0) {
+			    	clientaddr6 = peer.sin6_addr;
+			    	clientscope6 = peer.sin6_scope_id;
+			    }
 			}
 #endif
 			else {
@@ -3558,6 +3534,7 @@ cleanup:
 		bzero((char *)&clientaddr, sizeof(clientaddr));
 #ifdef AF_INET6
 		bzero((char *)&clientaddr6, sizeof(clientaddr));
+		clientscope6 = 0;
 #endif
 		cput = 0.000001;
 		realt = 0.000001;
