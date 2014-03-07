@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.2
+ *	N U T T C P . C						v6.2.3
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.3, Bill Fink, 5-Apr-09
+ *	Add "-xc" option to set CPU affinity (Linux only)
+ *	Fix Usage: statement: "--idle-data-timeout" both server & client option
+ *	Don't reset priority on server cleanup
+ *	Fix priority output for "-fparse"
  * 6.2.2, Bill Fink, 3-Apr-09
  *	Fix bad third party bug causing >= 1 minute transfers to silently fail
  *	Fix Usage: statement: "--idle-data-timeout" not just a server option
@@ -445,6 +450,11 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #define HAVE_SETPRIO
 #endif
 
+#if defined(linux)
+#define HAVE_SETAFFINITY
+#define __USE_GNU
+#endif
+
 #if !defined(_WIN32) && (!defined(__MACH__) || defined(_SOCKLEN_T))
 #define HAVE_POLL
 #endif
@@ -460,6 +470,14 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <sys/poll.h>
 #else
 #include "fakepoll.h"			/* from missing */
+#endif
+
+#ifdef HAVE_SETAFFINITY
+#include <sched.h>
+#endif
+
+#ifndef CPU_SETSIZE
+#undef HAVE_SETAFFINITY
 #endif
 
 /*
@@ -653,7 +671,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -832,6 +850,12 @@ struct group_source_req group_source_req;  /* holds multicast SSM group and */
 int priority = 0;		/* nuttcp process priority */
 #endif
 
+#ifdef HAVE_SETAFFINITY
+int affinity = -1;		/* nuttcp process CPU affinity */
+int ncores = 1;			/* number of CPU cores */
+cpu_set_t cpu_set;		/* processor CPU set */
+#endif
+
 long timeout_sec = 0;
 struct itimerval itimer;	/* for setitimer */
 int srvr_helo = 1;		/* set to 0 if server doesn't send HELO */
@@ -901,6 +925,9 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
+#ifdef HAVE_SETAFFINITY
+"	-xc##	set nuttcp process CPU affinity\n"
+#endif
 "	-d	set TCP SO_DEBUG option on data socket\n\
 	-v[v]	verbose [or very verbose] output\n\
 	-b	brief output (default)\n\
@@ -925,6 +952,11 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
+#ifdef HAVE_SETAFFINITY
+"	-xc##	set nuttcp process CPU affinity\n"
+#endif
+"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
+"		     server timeout in seconds for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
 "	--single-threaded  make manually started server be single threaded\n"
@@ -1815,9 +1847,24 @@ main( int argc, char **argv )
 				brief = 1;
 			}
 #ifdef HAVE_SETPRIO
-			else if (argv[0][2] == 'P')
+			else if (argv[0][2] == 'P') {
 				priority = atoi(getoptvalp(argv, 3, reqval,
 						&skiparg));
+			}
+#endif
+#ifdef HAVE_SETAFFINITY
+			else if (argv[0][2] == 'c') {
+				affinity = atoi(getoptvalp(argv, 3, reqval,
+						&skiparg));
+				if ((affinity < 0) ||
+				    (affinity >= CPU_SETSIZE)) {
+					fprintf(stderr,
+						"invalid affinity = %d\n",
+						affinity);
+					fflush(stderr);
+					exit(1);
+				}
+			}
 #endif
 			else {
 				if (argv[0][2]) {
@@ -2289,6 +2336,17 @@ main( int argc, char **argv )
 	if (priority) {
 		if (setpriority(PRIO_PROCESS, 0, priority) != 0)
 			err("couldn't change priority");
+	}
+#endif
+
+#ifdef HAVE_SETAFFINITY
+	if (affinity >= 0) {
+		if ((ncores = sysconf(_SC_NPROCESSORS_CONF)) <= 0)
+			err("sysconf: couldn't get _SC_NPROCESSORS_CONF");
+		CPU_ZERO(&cpu_set);
+		CPU_SET(affinity, &cpu_set);
+		if (sched_setaffinity(0, sizeof(cpu_set_t), &cpu_set) != 0)
+			err("couldn't change CPU affinity");
 	}
 #endif
 
@@ -3265,11 +3323,52 @@ doit:
 				priority = getpriority(PRIO_PROCESS, 0);
 				if (errno)
 					mes("couldn't get priority");
-				else
-					fprintf(stdout,
-						"nuttcp%s%s: priority = %d\n",
-						trans ? "-t" : "-r", ident,
-						priority);
+				else {
+					if (format & PARSE)
+						fprintf(stdout,
+							"nuttcp%s%s: "
+							"priority=%d\n",
+							trans ? "-t" : "-r",
+							ident, priority);
+					else
+						fprintf(stdout,
+							"nuttcp%s%s: "
+							"priority = %d\n",
+							trans ? "-t" : "-r",
+							ident, priority);
+				}
+			}
+#endif
+#ifdef HAVE_SETAFFINITY
+			if ((affinity >= 0) && (brief <= 0)) {
+				int cpu_affinity;
+
+				errno = 0;
+				sched_getaffinity(0, sizeof(cpu_set_t),
+					 &cpu_set);
+				if (errno)
+					mes("couldn't get affinity");
+				else {
+					for (cpu_affinity = 0;
+					     cpu_affinity < ncores;
+					     cpu_affinity++) {
+						if (CPU_ISSET(cpu_affinity,
+							      &cpu_set))
+							break;
+					}
+					if (format & PARSE)
+						fprintf(stdout,
+							"nuttcp%s%s: "
+							"cpu_affinity=%d\n",
+							trans ? "-t" : "-r",
+							ident, cpu_affinity);
+					else
+						fprintf(stdout,
+							"nuttcp%s%s: "
+							"affinity = CPU %d\n",
+							trans ? "-t" : "-r",
+							ident, cpu_affinity);
+				}
 			}
 #endif
 			if (trans) {
@@ -5905,11 +6004,6 @@ cleanup:
 		thirdparty = 0;
 		nbuf_bytes = 0;
 		rate_pps = 0;
-
-#ifdef HAVE_SETPRIO
-		priority = 0;
-#endif
-
 		brief = 0;
 		done = 0;
 		got_begin = 0;
