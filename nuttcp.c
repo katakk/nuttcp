@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.9
+ *	N U T T C P . C						v6.2.10
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,12 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.10, Bill Fink, 3-Aug-09
+ *	Change ctl/data port checks to < 1024 instead of < 5000
+ *	Fix "--idle-data-timeout" Usage: statement for new default minimum
+ *	Improve transmit performance with "-i" by setting poll() timeout to 0
+ *	Remove commented out code for unused normal_eod
+ *	Don't output interval retrans info if non-sinkmode (for nuttscp)
  * 6.2.9, Bill Fink, 24-Jun-09
  *	Make retrans info reporting work again on newer Linux distros
  *	Skip check for unACKed data at end of transfer if -DBROKEN_UNACKED
@@ -711,7 +717,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 9;
+int vers_delta = 10;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -807,8 +813,8 @@ int send_retrans = 1;		/* set to 0 if no need to send retrans info */
 int do_retrans = 0;		/* set to 1 for client transmitter */
 int read_retrans = 1;		/* set to 0 if no need to read retrans info */
 int got_0retrans = 0;		/* set to 1 by client transmitter after
-				   processing initial server output
-				   having "0 retrans" */
+				 * processing initial server output
+				 * having "0 retrans" */
 
 int need_swap;			/* client and server are different endian */
 int options = 0;		/* socket options */
@@ -993,7 +999,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-D	xmit only: don't buffer TCP writes (sets TCP_NODELAY sockopt)\n\
 	-B	recv only: only output full blocks of size from -l## (for TAR)\n"
 "	--packet-burst packet burst value for instantaneous rate limit option\n"
-"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
+"	--idle-data-timeout <value|minimum/default/maximum>  (default: 15/30/60)\n"
 "		     client timeout in seconds for idle data connection\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
@@ -1015,7 +1021,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETAFFINITY
 "	-xc##	set nuttcp server process CPU affinity\n"
 #endif
-"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
+"	--idle-data-timeout <value|minimum/default/maximum>  (default: 15/30/60)\n"
 "		     server timeout in seconds for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
@@ -1176,7 +1182,6 @@ sigalarm( int signum )
 	uint64_t deltarbytes, deltatbytes;
 	double fractloss;
 	int nodata;
-/*	int normal_eod;							*/
 	int i;
 	char *cp1, *cp2;
 	short save_events;
@@ -1210,7 +1215,6 @@ sigalarm( int signum )
 		socklen_t peerlen = sizeof(peer);
 
 		nodata = 0;
-/*		normal_eod = 0;						*/
 
 		if (getpeername(fd[0], (struct sockaddr *)&peer, &peerlen) < 0)
 			nodata = 1;
@@ -1225,7 +1229,6 @@ sigalarm( int signum )
 			if ((poll(pollfds, 1, 0) > 0) &&
 			    (pollfds[0].revents & (POLLIN | POLLPRI))) {
 				nodata = 1;
-/*				normal_eod = 1;				*/
 			}
 			pollfds[0].events = save_events;
 		}
@@ -1249,10 +1252,6 @@ sigalarm( int signum )
 			/* Don't just exit anymore so can get partial results
 			 * (shouldn't be a problem but keep an eye out that
 			 * servers don't start hanging again) */
-/*			following code untested after recent changes	*/
-/*			if ((inetd  || (!nofork && !single_threaded))	*/
-/*					&& !normal_eod)			*/
-/*				exit(1);				*/
 			if (!client && udp && !interval && handle_urg) {
 				/* send 'A' for ABORT as urgent TCP data
 				 * on control connection (don't block)
@@ -1359,7 +1358,7 @@ sigalarm( int signum )
 					fprintf(stdout, fmt, fractloss * 100);
 				}
 			}
-			if (read_retrans) {
+			if (read_retrans && sinkmode) {
 				if (format & PARSE)
 					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
 						((retransinfo == 1) ||
@@ -1412,7 +1411,7 @@ sigalarm( int signum )
 							fractloss * 100);
 					}
 				}
-				if (read_retrans) {
+				if (read_retrans && sinkmode) {
 					if (format & PARSE)
 						fprintf(stdout,
 							P_RETRANS_FMT_INTERVAL,
@@ -1686,7 +1685,7 @@ main( int argc, char **argv )
 		case 'p':
 			reqval = 1;
 			tmpport = atoi(getoptvalp(argv, 2, reqval, &skiparg));
-			if ((tmpport < 5001) || (tmpport > 65535)) {
+			if ((tmpport < 1024) || (tmpport > 65535)) {
 				fprintf(stderr, "invalid port = %d\n", tmpport);
 				fflush(stderr);
 				exit(1);
@@ -1697,7 +1696,7 @@ main( int argc, char **argv )
 			reqval = 1;
 			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
 			tmpport = atoi(cp1);
-			if ((tmpport < 5000) || (tmpport > 65535)) {
+			if ((tmpport < 1024) || (tmpport > 65535)) {
 				fprintf(stderr,
 					"invalid ctlport = %d\n", tmpport);
 				fflush(stderr);
@@ -1706,7 +1705,7 @@ main( int argc, char **argv )
 			ctlport = tmpport;
 			if ((cp2 = strchr(cp1, '/'))) {
 				tmpport = atoi(cp2 + 1);
-				if ((tmpport < 5000) || (tmpport > 65535)) {
+				if ((tmpport < 1024) || (tmpport > 65535)) {
 					fprintf(stderr,
 						"invalid third party "
 						"ctlport = %d\n", tmpport);
@@ -2386,7 +2385,7 @@ main( int argc, char **argv )
 		}
 	}
 
-	if ((port < 5000) || ((port + nstream - 1) > 65535)) {
+	if ((port < 1024) || ((port + nstream - 1) > 65535)) {
 		fprintf(stderr, "invalid port/nstream = %d/%d\n", port, nstream);
 		fflush(stderr);
 		exit(1);
@@ -3308,7 +3307,7 @@ doit:
 				itimer.it_value.tv_usec =
 					(timeout - itimer.it_value.tv_sec)
 						*1000000;
-				if ((port < 5000) || ((port + nstream - 1) > 65535)) {
+				if ((port < 1024) || ((port + nstream - 1) > 65535)) {
 					fputs("KO\n", stdout);
 					mes("invalid port/nstream");
 					fprintf(stdout, "port/nstream = %hu/%d\n", port, nstream);
@@ -3322,7 +3321,7 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
-				if (host3 && ctlport3 && (ctlport3 < 5000)) {
+				if (host3 && ctlport3 && (ctlport3 < 1024)) {
 					fputs("KO\n", stdout);
 					mes("invalid ctlport3");
 					fprintf(stdout, "ctlport3 = %hu\n",
@@ -5584,7 +5583,7 @@ acceptnewconn:
 				stream_idx++;
 				stream_idx = stream_idx % nstream;
 				if (do_poll &&
-				       ((pollst = poll(pollfds, nstream + 1, 5000))
+				       ((pollst = poll(pollfds, nstream + 1, 0))
 						> 0) &&
 				       (pollfds[0].revents & (POLLIN | POLLPRI)) && !intr) {
 					/* check for server output */
@@ -5702,7 +5701,7 @@ acceptnewconn:
 						    *cp1 = '\0';
 						}
 						fputs(intervalbuf, stdout);
-						if (do_retrans) {
+						if (do_retrans && sinkmode) {
 						    nretrans =
 						      get_retrans(fd[stream_idx
 									+ 1]);
@@ -6048,7 +6047,7 @@ acceptnewconn:
 						intervalbuf[strlen(intervalbuf)
 								- 1] = '\0';
 						fputs(intervalbuf, stdout);
-						if (do_retrans) {
+						if (do_retrans && sinkmode) {
 						    nretrans =
 						      get_retrans(
 							    fd[stream_idx]);
@@ -6195,7 +6194,7 @@ acceptnewconn:
 				fprintf(stdout, "%s: ", ident + 1);
 			intervalbuf[strlen(intervalbuf) - 1] = '\0';
 			fputs(intervalbuf, stdout);
-			if (do_retrans) {
+			if (do_retrans && sinkmode) {
 				nretrans = get_retrans(fd[1]);
 				nretrans -= iretrans;
 				if (format & PARSE)
