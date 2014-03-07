@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.2
+ *	N U T T C P . C						v6.0.3
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.3, Bill Fink, 17-Jul-08
+ *	A better (and accurate) way to get RTT info (and not just Linux)
  * 6.0.2, Bill Fink, 16-Jul-08
  *	Add RTT info to brief output for Linux
  * 6.0.1, Bill Fink, 17-Dec-07
@@ -329,7 +331,6 @@
  *	Bidirectional option
  *	Graphical interface
  *	OWD info
- *	RTT info
  *	Jitter info
  *	MTU info
  *	Warning for window size limiting throughput
@@ -440,7 +441,7 @@ typedef int socklen_t;
 #endif
 
 #define BETA_STR	"-beta"
-#define BETA_FEATURES	"retrans/RTT"
+#define BETA_FEATURES	"retrans"
 
 static struct	timeval time0;	/* Time at which timing started */
 static struct	timeval timepk;	/* Time at which last packet sent */
@@ -476,8 +477,8 @@ static struct	sigaction savesigact;
 #define RETRANS_FMT_BRIEF " %d %sretrans"
 #define RETRANS_FMT_INTERVAL " %5d %sretrans"
 #define RETRANS_FMT_IN	"retrans = %d"
-#define RTT_FMT		"data transfer RTT = %.3f ms"
-#define RTT_FMT_BRIEF	" %d msRTT"
+#define RTT_FMT		"RTT = %.3f ms"
+#define RTT_FMT_BRIEF	" %.2f msRTT"
 #define RTT_FMT_IN	"RTT = %lf"
 #define SIZEOF_TCP_INFO_RETRANS		104
 
@@ -515,9 +516,9 @@ static struct	sigaction savesigact;
 #define P_RETRANS_FMT_BRIEF	" %sretrans=%d"
 #define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
 #define P_RETRANS_FMT_IN	"retrans=%d"
-#define P_RTT_FMT		"xfer_rtt_ms=%.3f"
-#define P_RTT_FMT_BRIEF		" xfer_rtt_ms=%d"
-#define P_RTT_FMT_IN		"xfer_rtt_ms=%lf"
+#define P_RTT_FMT		"rtt_ms=%.3f"
+#define P_RTT_FMT_BRIEF		" rtt_ms=%.2f"
+#define P_RTT_FMT_IN		"rtt_ms=%lf"
 
 #define HELO_FMT	"HELO nuttcp v%d.%d.%d\n"
 
@@ -556,7 +557,7 @@ static struct	sigaction savesigact;
 #define	DEBUGRETRANS		0x200	/* output info for debugging collection
 					 * of TCP retransmission info */
 #define	NOBETAMSG		0x400	/* suppress beta version message */
-#define	WANTRTT			0x800	/* output RTT info if available */
+#define	WANTRTT			0x800	/* output RTT info */
 
 #ifdef NO_IPV6				/* Build without IPv6 support */
 #undef AF_INET6
@@ -591,7 +592,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -861,7 +862,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-f-percentloss	don't give %%loss info on brief output (UDP)\n\
 	-fparse		generate key=value parsable output\n\
 	-f-beta		suppress beta version message\n\
-	-frtt		add transfer RTT info if available\n\
+	-frtt		add RTT info \n\
 ";	
 
 char stats[128];
@@ -877,7 +878,7 @@ uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
 				 * being received by server (presumably because
 				 * client transmitter went away */
 
-uint32_t xfer_rtt = 0;		/* data transfer RTT */
+double rtt = 0.0;		/* RTT between client and server in ms */
 uint32_t nretrans = 0;		/* number of TCP retransmissions */
 uint32_t iretrans = 0;		/* initial number of TCP retransmissions */
 uint32_t pretrans = 0;		/* previous number of TCP retransmissions */
@@ -893,7 +894,6 @@ int retry_server = 0;		/* set to retry control connect() to server */
 int num_connect_tries = 0;	/* tracks attempted connects to server */
 int single_threaded = 0;	/* set to make server single threaded */
 double srvr_MB;
-double srvr_RTT;
 double srvr_realt;
 double srvr_KBps;
 double srvr_Mbps;
@@ -1238,6 +1238,9 @@ main( int argc, char **argv )
 	struct timeval time_eod;	/* time EOD packet was received */
 	struct timeval timepkrcv;	/* time last data packet received */
 	struct timeval timed;		/* time delta */
+	struct timeval timeconn1;	/* time before connect() for RTT */
+	struct timeval timeconn2;	/* time after connect() for RTT */
+	struct timeval timeconn;	/* time to connect() == RTT */
 	short save_events;
 	int skiparg;
 	int reqval;
@@ -3260,6 +3263,8 @@ doit:
 						err("unable to set maximum segment size");
 			}
 			num_connect_tries++;
+			if (stream_idx == 1)
+				gettimeofday(&timeconn1, (struct timezone *)0);
 			if (af == AF_INET) {
 				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
 			}
@@ -3352,6 +3357,12 @@ doit:
 					}
 					fflush(stderr);
 				}
+			}
+			if (stream_idx == 1) {
+				gettimeofday(&timeconn2, (struct timezone *)0);
+				tvsub( &timeconn, &timeconn2, &timeconn1 );
+				rtt = timeconn.tv_sec*1000 +
+						((double)timeconn.tv_usec)/1000;
 			}
 			if (sockopterr && trans &&
 			    (stream_idx > 0) && datamss) {
@@ -4606,10 +4617,7 @@ doit:
 				       (void *)&tcpinf, &optlen) < 0) {
 				mes("couldn't collect TCP info\n");
 				retransinfo = -1;
-				xfer_rtt = 0;
 			}
-			else
-				xfer_rtt = tcpinf.tcpinfo_rtt;
 			while (tcpinf.tcpinfo_unacked) {
 				if (format & DEBUGRETRANS)
 					print_tcpinfo();
@@ -4777,12 +4785,9 @@ doit:
 					sscanf(cp2, RETRANS_FMT_IN, &nretrans);
 				if ((cp2 = strstr(cp1, "RTT"))) {
 					if (format & PARSE)
-						sscanf(cp2, P_RTT_FMT_IN,
-						       &srvr_RTT);
+						sscanf(cp2, P_RTT_FMT_IN, &rtt);
 					else
-						sscanf(cp2, RTT_FMT_IN,
-						       &srvr_RTT);
-					xfer_rtt = srvr_RTT*1000;
+						sscanf(cp2, RTT_FMT_IN, &rtt);
 				}
 			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
@@ -4848,7 +4853,7 @@ doit:
 				(double)nbytes/cput/1024 );
 		}
 		if (!udp && trans) {
-			if (xfer_rtt || (retransinfo > 0)) {
+			if (rtt || (retransinfo > 0)) {
 				fprintf(stdout, "nuttcp-t%s: ", ident);
 				if (beta) {
 					if (format & PARSE)
@@ -4858,15 +4863,15 @@ doit:
 						fprintf(stdout, "Beta info: ");
 				}
 			}
-			if (xfer_rtt) {
+			if (rtt) {
 				if (format & PARSE)
 					strcpy(fmt, P_RTT_FMT);
 				else
 					strcpy(fmt, RTT_FMT);
-				fprintf(stdout, fmt, (double)xfer_rtt/1000);
+				fprintf(stdout, fmt, rtt);
 			}
 			if (retransinfo > 0) {
-				if (xfer_rtt) {
+				if (rtt) {
 					if (format & PARSE)
 						strcpy(fmt, " ");
 					else
@@ -4882,7 +4887,7 @@ doit:
 					retransinfo == 1 ? "" : "host-",
 					nretrans);
 			}
-			if (xfer_rtt || (retransinfo > 0))
+			if (rtt || (retransinfo > 0))
 				fprintf(stdout, "\n");
 		}
 
@@ -5038,12 +5043,12 @@ doit:
 						retransinfo == 1 ?
 							"" : "host-");
 				}
-				if ((format & WANTRTT) && xfer_rtt) {
+				if ((format & WANTRTT) && rtt) {
 					if (format & PARSE)
 						strcpy(fmt, P_RTT_FMT_BRIEF);
 					else
 						strcpy(fmt, RTT_FMT_BRIEF);
-					fprintf(stdout, fmt, xfer_rtt/1000);
+					fprintf(stdout, fmt, rtt);
 				}
 				fprintf(stdout, "\n");
 			}
@@ -5068,12 +5073,12 @@ doit:
 						retransinfo == 1 ?
 							"" : "host-");
 				}
-				if ((format & WANTRTT) && xfer_rtt) {
+				if ((format & WANTRTT) && rtt) {
 					if (format & PARSE)
 						strcpy(fmt, P_RTT_FMT_BRIEF);
 					else
 						strcpy(fmt, RTT_FMT_BRIEF);
-					fprintf(stdout, fmt, xfer_rtt/1000);
+					fprintf(stdout, fmt, rtt);
 				}
 				fprintf(stdout, "\n");
 			}
@@ -5182,7 +5187,7 @@ cleanup:
 		udplossinfo = 0;
 		retransinfo = 0;
 		force_retrans = 0;
-		xfer_rtt = 0;
+		rtt = 0.0;
 		nretrans = 0;
 		iretrans = 0;
 		pretrans = 0;
