@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.8
+ *	N U T T C P . C						v6.2.9
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.9, Bill Fink, 24-Jun-09
+ *	Make retrans info reporting work again on newer Linux distros
+ *	Skip check for unACKed data at end of transfer if -DBROKEN_UNACKED
  * 6.2.8, Bill Fink, 8-Jun-09
  *	Play nice with iperf (change default data port to 5101)
  *	Delay sending of server "OK" until after successful server bind()
@@ -574,7 +577,15 @@ static struct	sigaction savesigact;
 
 /* define NEW_TCP_INFO if struct tcp_info in /usr/include/netinet/tcp.h
  * contains tcpi_total_retrans member
+ *
+ * tcpi_rcv_rtt, tcpi_rcv_space, & tcpi_total_retrans were added
+ * in glibc-headers-2.7 (Fedora 8) which fortunately also defined
+ * TCP_MD5SIG at the same time, so key off of that
  */
+#if defined(linux) && defined(TCP_MD5SIG)
+#define NEW_TCP_INFO
+#endif
+
 #ifndef NEW_TCP_INFO
 #define OLD_TCP_INFO
 #endif
@@ -700,7 +711,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 8;
+int vers_delta = 9;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -5943,7 +5954,11 @@ acceptnewconn:
 
 	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 		if (!udp && trans) {
-#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS) && !defined(BROKEN_UNACKED)
+			/* if -DBROKEN_UNACKED skip check for unACKed data
+			 * (workaround motivated by possible bug encountered
+			 * on a Suse Linux 10.1 system)
+			 */
 			struct timeval timeunack, timec, timed;
 			long flags;
 
