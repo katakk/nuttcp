@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.13
+ *	N U T T C P . C						v5.2.1
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,21 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.2.1, Bill Fink, 12-May-06
+ *	Pass "-M" option to server so it also works for receives
+ *	Make "-uu" be a shortcut for "-u -Ru"
+ * V5.1.14, Bill Fink, 11-May-06
+ *	Fix cancellation of UDP receives to work properly
+ *	Allow easy building without IPv6 support
+ *	Set default UDP buflen to largest 2^n less than MSS of ctlconn
+ *	Add /usr/local/sbin and /usr/etc to path
+ *	Allow specifying rate in pps by using 'p' suffix
+ *	Give warning if actual send/receive window size is less than requested
+ *	Make UDP transfers have a default rate limit of 1 Mbps
+ *	Allow setting MSS for client transmitter TCP transfers with "-M" option
+ *	Give more precision on reporting small UDP percentage data loss
+ *	Disallow UDP transfers in "classic" mode
+ *	Notify when using "classic" mode
  * V5.1.13, Bill Fink, 8-Apr-06
  *	Make "-Ri" instantaneous rate limit for very high rates more accurate
  *	(including compensating for microsecond gettimeofday() granularity)
@@ -358,6 +373,9 @@ static struct	sigaction savesigact;
 #define LOSS_FMT	" %.2f%% data loss"
 #define LOSS_FMT_BRIEF	" %.2f %%loss"
 #define LOSS_FMT_INTERVAL " %5.2f ~%%loss"
+#define LOSS_FMT5	" %.5f%% data loss"
+#define LOSS_FMT_BRIEF5	" %.5f %%loss"
+#define LOSS_FMT_INTERVAL5 " %7.5f ~%%loss"
 #define DROP_FMT	" %lld / %lld drop/pkt"
 #define DROP_FMT_BRIEF	" %lld / %lld drop/pkt"
 #define DROP_FMT_INTERVAL " %5lld / %5lld ~drop/pkt"
@@ -379,9 +397,9 @@ static struct	sigaction savesigact;
 #define P_CPU_STATS_FMT_IN  "user=%*f system=%*f elapsed=%*d:%*d cpu=%d%%"
 #define P_CPU_STATS_FMT_IN2 "user=%*f system=%*f elapsed=%*d:%*d:%*d cpu=%d%%"
 
-#define P_LOSS_FMT		" data_loss=%.2f"
-#define P_LOSS_FMT_BRIEF	" data_loss=%.2f"
-#define P_LOSS_FMT_INTERVAL	" data_loss=%.2f" 
+#define P_LOSS_FMT		" data_loss=%.5f"
+#define P_LOSS_FMT_BRIEF	" data_loss=%.5f"
+#define P_LOSS_FMT_INTERVAL	" data_loss=%.5f" 
 #define P_DROP_FMT		" drop=%lld pkt=%lld"
 #define P_DROP_FMT_BRIEF	" drop=%lld pkt=%lld"
 #define P_DROP_FMT_INTERVAL	" drop=%lld pkt=%lld"
@@ -394,7 +412,7 @@ static struct	sigaction savesigact;
 #define DEFAULT_NBUF		2048
 #define DEFAULT_NBYTES		134217728	/* 128 MB */
 #define DEFAULT_TIMEOUT		10.0
-#define DEFAULT_MC_RATE		1000
+#define DEFAULT_UDP_RATE		1000
 #define DEFAULTUDPBUFLEN	8192
 #define DEFAULT_MC_UDPBUFLEN	1024
 #define MAXUDPBUFLEN		65507
@@ -413,6 +431,12 @@ static struct	sigaction savesigact;
 #define DEBUGPOLL		0x20	/* add info to assist with debugging
 					 * polling for interval reports */
 #define PARSE			0x40	/* generate key=value parsable output */
+#define DEBUGMTU		0x80	/* debug info for MTU/MSS code */
+
+#ifdef NO_IPV6				/* Build without IPv6 support */
+#undef AF_INET6
+#undef IPV6_V6ONLY
+#endif
 
 void sigpipe( int signum );
 void sigint( int signum );
@@ -435,8 +459,8 @@ int mread( int fd, char *bufp, unsigned n);
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
-int vers_minor = 1;
-int vers_delta = 13;
+int vers_minor = 2;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -472,7 +496,7 @@ int nbuf_bytes = 0;		/* set to 1 if nbuf is actually bytes */
 /*  nick code  */
 int sendwin=0, sendwinval=0, origsendwin=0;
 socklen_t optlen;
-int rcvwin=0, rcvwinval=0, origrcvwin=0, maxseg;
+int rcvwin=0, rcvwinval=0, origrcvwin=0;
 int srvrwin=0;
 /*  end nick code  */
 
@@ -520,9 +544,12 @@ int irate = 0;			/* instantaneous rate limit if set */
 uint64_t irate_pk_usec;		/* packet transmission time in microseconds */
 double irate_pk_nsec;		/* nanosecond portion of pkt xmit time */
 double irate_cum_nsec = 0.0;	/* cumulative nanaseconds over several pkts */
+int rate_pps = 0;		/* set to 1 if rate is given as pps */
 double timeout = 0.0;		/* timeout interval in seconds */
 double interval = 0.0;		/* interval timer in seconds */
 double chk_interval = 0.0;	/* timer (in seconds) for checking client */
+int ctlconnmss;			/* control connection maximum segment size */
+int datamss = 0;		/* data connection maximum segment size */
 char intervalbuf[256+2];	/* buf for interval reporting */
 char linebuf[256+2];		/* line buffer */
 int do_poll = 0;		/* set to read interval reports (client xmit) */
@@ -556,6 +583,7 @@ int brief3 = 1;			/* for third party nuttcp */
 int done = 0;			/* don't output interval report if done */
 int got_begin = 0;		/* don't output interval report if not begun */
 int buflenopt = 0;		/* whether or not user specified buflen */
+int haverateopt = 0;		/* whether or not user specified rate */
 int clientserver = 0;		/* client server mode (use control channel) */
 int client = 0;			/* 0=server side, 1=client (initiator) side */
 int oneshot = 0;		/* 1=run server only once */
@@ -587,7 +615,7 @@ Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
 #endif
-"	-l##	length of network write|read buf (default 8192/udp, 65536/tcp)\n\
+"	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n\
 	-s	use stdin|stdout for data input|output instead of pattern data\n\
 	-n##	number of source bufs written to network (default unlimited)\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
@@ -597,8 +625,9 @@ Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
 	-P##	port number for control connection (default 5000)\n\
 	-u	use UDP instead of TCP\n\
 	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
+	-M##	MSS for data connection (TCP)\n\
 	-N##	number of streams (starting at port number), implies -B\n\
-	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
+	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps or (p)ps)\n\
 	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
 	-i##	receiver interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
@@ -683,7 +712,10 @@ sigint( int signum )
 {
 	signal(SIGINT, SIG_DFL);
 	fputs("\n*** transfer interrupted ***\n", stdout);
-	intr = 1;
+	if (clientserver && client && !host3 && udp && !trans)
+		shutdown(0, SHUT_WR);
+	else
+		intr = 1;
 	done++;
 	return;
 }
@@ -702,6 +734,8 @@ sigalarm( int signum )
 /*	beginnings of timestamps - not ready for prime time */
 /*	struct	timeval timet; */	/* Transmitter time */
 	uint64_t nrbytes;
+	uint64_t deltarbytes, deltatbytes;
+	double fractloss;
 	int nodata;
 	int i;
 	char *cp1, *cp2;
@@ -800,16 +834,23 @@ sigalarm( int signum )
 						(ntbytes - ptbytes)/buflen);
 				}
 				if (!(format & NOPERCENTLOSS)) {
+					deltarbytes = nrbytes - pbytes;
+					deltatbytes = ntbytes - ptbytes;
+					fractloss = (deltatbytes ?
+						1.0 -
+						    (double)deltarbytes
+							/(double)deltatbytes :
+						0.0);
 					if (format & PARSE)
 						strcpy(fmt,
 						       P_LOSS_FMT_INTERVAL);
+					else if ((fractloss != 0.0) &&
+						 (fractloss < 0.001))
+						strcpy(fmt,
+							LOSS_FMT_INTERVAL5);
 					else
 						strcpy(fmt, LOSS_FMT_INTERVAL);
-					fprintf(stdout, fmt,
-						ntbytes == ptbytes ? 0.0 :
-						((1 - (double)(nrbytes - pbytes)
-						  /(double)(ntbytes - ptbytes))
-							*100));
+					fprintf(stdout, fmt, fractloss * 100);
 				}
 			}
 			if (format & RUNNINGTOTAL) {
@@ -834,17 +875,23 @@ sigalarm( int signum )
 							ntbytes/buflen);
 					}
 					if (!(format & NOPERCENTLOSS)) {
+						fractloss = (ntbytes ?
+							1.0 -
+							    (double)nrbytes
+							      /(double)ntbytes :
+							0.0);
 						if (format & PARSE)
 							strcpy(fmt,
 							  P_LOSS_FMT_INTERVAL);
+						else if ((fractloss != 0.0) &&
+							 (fractloss < 0.001))
+							strcpy(fmt,
+							  LOSS_FMT_INTERVAL5);
 						else
 							strcpy(fmt,
 							  LOSS_FMT_INTERVAL);
 						fprintf(stdout, fmt,
-							ntbytes == 0 ? 0.0 :
-							((1 - (double)nrbytes
-							  /(double)ntbytes)
-								*100));
+							fractloss * 100);
 					}
 				}
 			}
@@ -899,6 +946,7 @@ main( int argc, char **argv )
 {
 	double MB;
 	double rate_opt;
+	double fractloss;
 	int cpu_util;
 	int first_read;
 	int correction = 0;
@@ -907,16 +955,13 @@ main( int argc, char **argv )
 	char *cp1, *cp2;
 	char ch;
 	int error_num;
+	int sockopterr;
 	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res = NULL;
 	short save_events;
 	int skiparg;
 	int reqval;
-
-/*  nick code  */
-optlen = sizeof(maxseg);
-/* end of nick code  */
 
 	sendwin = 0;
 	rcvwin = 0;
@@ -1108,6 +1153,10 @@ optlen = sizeof(maxseg);
 		case 'u':
 			udp = 1;
 			if (!buflenopt) buflen = DEFAULTUDPBUFLEN;
+			if (argv[0][2] == 'u') {
+				haverateopt = 1;
+				rate = MAXRATE;
+			}
 			break;
 		case 'v':
 			brief = 0;
@@ -1131,10 +1180,15 @@ optlen = sizeof(maxseg);
 			break;
 		case 'R':
 			reqval = 0;
+			haverateopt = 1;
 			if (argv[0][2] == 'i') {
 				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
 				sscanf(cp1, "%lf", &rate_opt);
 				irate = 1;
+			}
+			else if (argv[0][2] == 'u') {
+				rate_opt = 0.0;
+				cp1 = &argv[0][3];
 			}
 			else {
 				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
@@ -1148,6 +1202,16 @@ optlen = sizeof(maxseg);
 				rate_opt *= 1000;
 			else if ((ch == 'g') || (ch == 'G'))
 				rate_opt *= 1000000;
+			else if (ch == 'p') {
+				rate_pps = 1;
+				if (strlen(cp1) >= 2) {
+					ch = *(cp1 + strlen(cp1) - 2);
+					if ((ch == 'k') || (ch == 'K'))
+						rate_opt *= 1000;
+					if ((ch == 'm') || (ch == 'M'))
+						rate_opt *= 1000000;
+				}
+			}
 			rate = rate_opt;
 			if (rate == 0)
 				rate = MAXRATE;
@@ -1251,6 +1315,8 @@ optlen = sizeof(maxseg);
 				format |= NODROPS;
 			else if (strcmp(&argv[0][2], "debugpoll") == 0)
 				format |= DEBUGPOLL;
+			else if (strcmp(&argv[0][2], "debugmtu") == 0)
+				format |= DEBUGMTU;
 			else if (strcmp(&argv[0][2], "parse") == 0)
 				format |= PARSE;
 			else {
@@ -1307,6 +1373,15 @@ optlen = sizeof(maxseg);
 				exit(1);
 			}
 			multicast = mc_param;
+			break;
+		case 'M':
+			reqval = 0;
+			datamss = atoi(getoptvalp(argv, 2, reqval, &skiparg));
+			if (datamss < 0) {
+				fprintf(stderr, "invalid datamss = %d\n", datamss);
+				fflush(stderr);
+				exit(1);
+			}
 			break;
 		case '-':
 			if (strcmp(&argv[0][2], "nofork") == 0) {
@@ -1367,9 +1442,10 @@ optlen = sizeof(maxseg);
 		udp = 1;
 		if (!buflenopt) buflen = DEFAULT_MC_UDPBUFLEN;
 		nstream = 1;
-		if (rate == MAXRATE)
-			rate = DEFAULT_MC_RATE;
 	}
+
+	if (udp && !haverateopt)
+		rate = DEFAULT_UDP_RATE;
 
 	bzero((char *)&frominet, sizeof(frominet));
 	bzero((char *)&clientaddr, sizeof(clientaddr));
@@ -1607,7 +1683,13 @@ optlen = sizeof(maxseg);
 
 	if (nbuf_bytes) {
 		nbuf /= buflen;
-		nbuf_bytes = 0;
+	}
+
+	if ((rate != MAXRATE) && rate_pps) {
+		uint64_t llrate = rate;
+
+		llrate *= ((double)buflen * 8 / 1000);
+		rate = llrate;
 	}
 
 	if (udp && interval)
@@ -1635,6 +1717,34 @@ doit:
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			if (client) {
+				if (udp) {
+					optlen = sizeof(ctlconnmss);
+					if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
+						err("get ctlconn maximum segment size didn't work\n");
+					if (format & DEBUGMTU)
+						fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
+					if (buflenopt) {
+						if (buflen > ctlconnmss) {
+							if (format & PARSE)
+								fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+							else
+								fprintf(stderr, "nuttcp%s%s: Warning: IP frags or no data reception since buflen=%d > ctlconnmss=%d\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+							fflush(stderr);
+						}
+					}
+					else {
+						while (buflen > ctlconnmss) {
+							buflen >>= 1;
+							if (nbuf_bytes)
+								nbuf <<= 1;
+							if ((rate != MAXRATE) &&
+							    rate_pps)
+								rate >>= 1;
+						}
+					}
+					if (format & DEBUGMTU)
+						fprintf(stderr, "buflen = %d\n", buflen);
+				}
 				if (!(ctlconn = fdopen(fd[0], "w")))
 					err("fdopen: ctlconn for writing");
 				close(0);
@@ -1806,6 +1916,21 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 50201) {
+					fprintf(ctlconn, " , datamss = %d", datamss);
+				}
+				else {
+					if (datamss && !trans) {
+						fprintf(stdout, "nuttcp%s%s: mss option not supported by server version %d.%d.%d, need >= 5.2.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						datamss = 0;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -1955,6 +2080,13 @@ doit:
 				else {
 					mc_param = 0;
 				}
+				if (irvers >= 50201) {
+					sscanf(strstr(buf, ", datamss =") + 12,
+						"%d", &datamss);
+				}
+				else {
+					datamss = 0;
+				}
 				trans = !trans;
 				if (nbuflen != buflen) {
 					buflen = nbuflen;
@@ -2041,9 +2173,16 @@ doit:
 					udp = 1;
 					nstream = 1;
 					if (rate == MAXRATE)
-						rate = DEFAULT_MC_RATE;
+						rate = DEFAULT_UDP_RATE;
 				}
 				multicast = mc_param;
+				if (datamss < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid datamss");
+					fprintf(stdout, "datamss = %d\n", datamss);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
 				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
 						vers_minor, vers_delta);
 				fflush(stdout);
@@ -2220,10 +2359,19 @@ doit:
 				if (timeout)
 				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n", 
 				    ident, timeout);
-				if (rate != MAXRATE)
-				    fprintf(stdout,"nuttcp-t%s: rate_limit = %.3f rate_unit=Mbps rate_mode=%s\n",
+				if (rate != MAXRATE) {
+				    fprintf(stdout,"nuttcp-t%s: rate_limit = %.3f rate_unit=Mbps rate_mode=%s",
 					ident, (double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
+				    if (udp) {
+					uint64_t ppsrate =
+					    ((uint64_t)rate * 1000)/8/buflen;
+
+					fprintf(stdout," pps_rate=%lld",
+					    ppsrate);
+				    }
+				    fprintf(stdout,"\n");
+				}
 			    }
 			    else if (brief <= 0) {
 				fprintf(stdout,"nuttcp-t%s: buflen=%d, ",
@@ -2241,10 +2389,18 @@ doit:
 				    fprintf(stdout,"nuttcp-t%s: time limit = %.2f second%s\n",
 					ident, timeout,
 					(timeout == 1.0)?"":"s");
-				if (rate != MAXRATE)
-				    fprintf(stdout,"nuttcp-t%s: rate limit = %.3f Mbps (%s)\n",
+				if (rate != MAXRATE) {
+				    fprintf(stdout,"nuttcp-t%s: rate limit = %.3f Mbps (%s)",
 					ident, (double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
+				    if (udp) {
+					uint64_t ppsrate =
+					    ((uint64_t)rate * 1000)/8/buflen;
+
+					fprintf(stdout,", %lld pps", ppsrate);
+				    }
+				    fprintf(stdout,"\n");
+				}
 			    }
 			} else {
 			    if ((brief <= 0) && (format & PARSE)) {
@@ -2344,6 +2500,12 @@ doit:
 					errmes("unable to setsockopt options");
 			}
 			usleep(20000);
+			if (trans && (stream_idx > 0) && datamss) {
+				optlen = sizeof(datamss);
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+					if (errno != EINVAL)
+						err("unable to set maximum segment size\n");
+			}
 			if (af == AF_INET) {
 				error_num = connect(fd[stream_idx], (struct sockaddr *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
 			}
@@ -2405,7 +2567,42 @@ doit:
 						fflush(stderr);
 						exit(1);
 					}
+					if (udp) {
+						perror("connect failed");
+						fprintf(stderr, "UDP transfers only supported for client/server mode\n");
+						fflush(stderr);
+						exit(1);
+					}
+					if (format & PARSE) {
+						fprintf(stderr, "nuttcp%s%s: Info=\"attempting_to_switch_to_deprecated_classic_mode\"\n",
+							trans?"-t":"-r", ident);
+						fprintf(stderr, "nuttcp%s%s: Info=\"will_use_less_reliable_transmitter_side_statistics\"\n",
+							trans?"-t":"-r", ident);
+					}
+					else {
+						fprintf(stderr, "nuttcp%s%s: Info: attempting to switch to deprecated \"classic\" mode\n",
+							trans?"-t":"-r", ident);
+						fprintf(stderr, "nuttcp%s%s: Info: will use less reliable transmitter side statistics\n",
+							trans?"-t":"-r", ident);
+					}
+					fflush(stderr);
 				}
+			}
+			if (sockopterr && trans &&
+			    (stream_idx > 0) && datamss) {
+				optlen = sizeof(datamss);
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+					if (errno != EINVAL)
+						err("unable to set maximum segment size\n");
+					else
+						err("setting maximum segment size not supported on this OS\n");
+			}
+			if (stream_idx == nstream) {
+				optlen = sizeof(datamss);
+				if (getsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, &optlen) < 0)
+					err("get dataconn maximum segment size didn't work\n");
+				if (format & DEBUGMTU)
+					fprintf(stderr, "datamss = %d\n", datamss);
 			}
 			if ((stream_idx == nstream) && (brief <= 0)) {
 				char tmphost[ADDRSTRLEN] = "\0";
@@ -2423,25 +2620,47 @@ doit:
 				    err("unsupported AF");
 				}
 
-				if (format & PARSE)
+				if (format & PARSE) {
 					fprintf(stdout,
-						"nuttcp%s%s: connect=%s\n", 
+						"nuttcp%s%s: connect=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-				else
+					if (trans)
+						fprintf(stdout, " mss=%d",
+							datamss);
+				}
+				else {
 					fprintf(stdout,
-						"nuttcp%s%s: connect to %s\n", 
+						"nuttcp%s%s: connect to %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
+					if (trans)
+						fprintf(stdout, " with mss=%d",
+							datamss);
+				}
+				fprintf(stdout, "\n");
 			}
 		    } else {
 			/* The receiver listens for the connection
 			 * (unless reversed by the flip option)
 			 */
+			if (trans && (stream_idx > 0) && datamss) {
+				optlen = sizeof(datamss);
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+					if (errno != EINVAL)
+						err("unable to set maximum segment size\n");
+			}
 			listen(fd[stream_idx],1);   /* allow a queue of 1 */
 			if (options && (stream_idx > 0))  {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
 					errmes("unable to setsockopt options");
+			}
+			if (sockopterr && trans &&
+			    (stream_idx > 0) && datamss) {
+				optlen = sizeof(datamss);
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+					if (errno != EINVAL)
+						err("unable to set maximum segment size\n");
 			}
 			if (clientserver && !client && (stream_idx > 0)) {
 				sigact.sa_handler = ignore_alarm;
@@ -2473,6 +2692,22 @@ doit:
 			af = frominet.ss_family;
 			close(fd[stream_idx]);
 			fd[stream_idx]=nfd;
+			if (sockopterr && trans &&
+			    (stream_idx > 0) && datamss) {
+				optlen = sizeof(datamss);
+				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
+					if (errno != EINVAL)
+						err("unable to set maximum segment size\n");
+					else
+						err("setting maximum segment size not supported on this OS\n");
+			}
+			if (stream_idx == nstream) {
+				optlen = sizeof(datamss);
+				if (getsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, &optlen) < 0)
+					err("get dataconn maximum segment size didn't work\n");
+				if (format & DEBUGMTU)
+					fprintf(stderr, "datamss = %d\n", datamss);
+			}
 			if (af == AF_INET) {
 			    struct sockaddr_in peer;
 			    socklen_t peerlen = sizeof(peer);
@@ -2485,16 +2720,25 @@ doit:
 				inet_ntop(af, &peer.sin_addr.s_addr,
 					  tmphost, sizeof(tmphost));
 
-				if (format & PARSE)
+				if (format & PARSE) {
 					fprintf(stdout,
-						"nuttcp%s%s: accept=%s\n", 
+						"nuttcp%s%s: accept=%s", 
 						trans?"-t":"-r", ident,
 						tmphost);
-				else
+					if (trans)
+						fprintf(stdout, " mss=%d",
+							datamss);
+				}
+				else {
 					fprintf(stdout,
-						"nuttcp%s%s: accept from %s\n", 
+						"nuttcp%s%s: accept from %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
+					if (trans)
+						fprintf(stdout, " with mss=%d",
+							datamss);
+				}
+				fprintf(stdout, "\n");
 			    }
 			    if (stream_idx == 0) clientaddr = peer.sin_addr;
 			}
@@ -2510,9 +2754,24 @@ doit:
 				char tmphost[ADDRSTRLEN] = "\0";
 				inet_ntop(af, peer.sin6_addr.s6_addr,
 					  tmphost, sizeof(tmphost));
-				fprintf(stdout,"nuttcp%s%s: accept from %s\n", 
-					trans?"-t":"-r", ident,
-					tmphost);
+				if (format & PARSE) {
+				    fprintf(stdout,
+					    "nuttcp%s%s: accept=%s", 
+					    trans?"-t":"-r", ident,
+					    tmphost);
+				    if (trans)
+					fprintf(stdout, " mss=%d", datamss);
+				}
+				else {
+				    fprintf(stdout,
+					    "nuttcp%s%s: accept from %s", 
+					    trans?"-t":"-r", ident,
+					    tmphost);
+				    if (trans)
+					fprintf(stdout, " with mss=%d",
+						datamss);
+				}
+				fprintf(stdout, "\n");
 			    }
 			    if (stream_idx == 0) {
 			    	clientaddr6 = peer.sin6_addr;
@@ -2525,12 +2784,42 @@ doit:
 			}
 		    }
 		}
-		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,  (void *)&sendwinval,
-			 &optlen) < 0)
-				err("get send window size didn't work\n");
-		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,  (void *)&rcvwinval,
-			 &optlen) < 0)
-				err("Get recv. window size didn't work\n");
+		optlen = sizeof(sendwinval);
+		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,  (void *)&sendwinval, &optlen) < 0)
+			err("get send window size didn't work\n");
+#if defined(linux)
+		sendwinval /= 2;
+#endif
+		if ((stream_idx > 0) && sendwin && (trans || braindead) &&
+		    (sendwinval < (0.98 * sendwin))) {
+			if (format & PARSE)
+				fprintf(stderr, "nuttcp%s%s: Warning=\"send_window_size_%d_<_requested_window_size_%d\"\n",
+					trans?"-t":"-r", ident,
+					sendwinval, sendwin);
+			else
+				fprintf(stderr, "nuttcp%s%s: Warning: send window size %d < requested window size %d\n",
+					trans?"-t":"-r", ident,
+					sendwinval, sendwin);
+			fflush(stderr);
+		}
+		optlen = sizeof(rcvwinval);
+		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_RCVBUF,  (void *)&rcvwinval, &optlen) < 0)
+			err("Get recv. window size didn't work\n");
+#if defined(linux)
+		rcvwinval /= 2;
+#endif
+		if ((stream_idx > 0) && rcvwin && (!trans || braindead) &&
+		    (rcvwinval < (0.98 * rcvwin))) {
+			if (format & PARSE)
+				fprintf(stderr, "nuttcp%s%s: Warning=\"receive_window_size_%d_<_requested_window_size_%d\"\n",
+					trans?"-t":"-r", ident,
+					rcvwinval, rcvwin);
+			else
+				fprintf(stderr, "nuttcp%s%s: Warning: receive window size %d < requested window size %d\n",
+					trans?"-t":"-r", ident,
+					rcvwinval, rcvwin);
+			fflush(stderr);
+		}
 
 		if ((stream_idx == nstream) && (brief <= 0)) {
 			if (format & PARSE)
@@ -2710,9 +2999,18 @@ doit:
 			}
 			if (traceroute)
 				cmdargs[i++] = "-xt";
+			if (datamss) {
+				sprintf(tmpargs[j], "-M%d", datamss);
+				cmdargs[i++] = tmpargs[j++];
+			}
 			cmdargs[i++] = host3;
 			cmdargs[i] = NULL;
 			execvp(cmd, cmdargs);
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/local/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
 			if (errno == ENOENT) {
 				strcpy(path, "/usr/local/bin/");
 				strcat(path, cmd);
@@ -2725,6 +3023,11 @@ doit:
 			}
 			if (errno == ENOENT) {
 				strcpy(path, "/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/etc/");
 				strcat(path, cmd);
 				execv(path, cmdargs);
 			}
@@ -2782,6 +3085,11 @@ doit:
 				cmdargs[i] = NULL;
 				execvp(cmd, cmdargs);
 				if (errno == ENOENT) {
+					strcpy(path, "/usr/local/sbin/");
+					strcat(path, cmd);
+					execv(path, cmdargs);
+				}
+				if (errno == ENOENT) {
 					strcpy(path, "/usr/local/bin/");
 					strcat(path, cmd);
 					execv(path, cmdargs);
@@ -2793,6 +3101,11 @@ doit:
 				}
 				if (errno == ENOENT) {
 					strcpy(path, "/sbin/");
+					strcat(path, cmd);
+					execv(path, cmdargs);
+				}
+				if (errno == ENOENT) {
+					strcpy(path, "/usr/etc/");
 					strcat(path, cmd);
 					execv(path, cmdargs);
 				}
@@ -2864,6 +3177,11 @@ doit:
 			cmdargs[i] = NULL;
 			execvp(cmd, cmdargs);
 			if (errno == ENOENT) {
+				strcpy(path, "/usr/local/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if (errno == ENOENT) {
 				strcpy(path, "/usr/local/bin/");
 				strcat(path, cmd);
 				execv(path, cmdargs);
@@ -2875,6 +3193,11 @@ doit:
 			}
 			if (errno == ENOENT) {
 				strcpy(path, "/sbin/");
+				strcat(path, cmd);
+				execv(path, cmdargs);
+			}
+			if (errno == ENOENT) {
+				strcpy(path, "/usr/etc/");
 				strcat(path, cmd);
 				execv(path, cmdargs);
 			}
@@ -3336,12 +3659,16 @@ doit:
 						(uint64_t)((MB*1024*1024)
 							/buflen + 0.5));
 					cp2 += strlen(cp2);
+					fractloss = ((MB != 0.0) ?
+						1 - srvr_MB/MB : 0.0);
 					if (format & PARSE)
 						strcpy(fmt, P_LOSS_FMT);
+					else if ((fractloss != 0.0) &&
+						 (fractloss < 0.001))
+						strcpy(fmt, LOSS_FMT5);
 					else
 						strcpy(fmt, LOSS_FMT);
-					sprintf(cp2, fmt,
-						((1 - srvr_MB/MB)*100));
+					sprintf(cp2, fmt, fractloss * 100);
 					cp2 += strlen(cp2);
 					sprintf(cp2, "\n");
 				}
@@ -3400,11 +3727,14 @@ doit:
 				(int64_t)(((srvr_MB - MB)*1024*1024)
 					/buflen + 0.5),
 				(uint64_t)((srvr_MB*1024*1024)/buflen + 0.5));
+			fractloss = ((srvr_MB != 0.0) ? 1 - MB/srvr_MB : 0.0);
 			if (format & PARSE)
 				strcpy(fmt, P_LOSS_FMT);
+			else if ((fractloss != 0.0) && (fractloss < 0.001))
+				strcpy(fmt, LOSS_FMT5);
 			else
 				strcpy(fmt, LOSS_FMT);
-			fprintf(stdout, fmt, ((1 - MB/srvr_MB)*100));
+			fprintf(stdout, fmt, fractloss * 100);
 			fprintf(stdout, "\n");
 		}
 		if (verbose) {
@@ -3477,12 +3807,16 @@ doit:
 							/buflen + 0.5));
 				}
 				if (!(format & NOPERCENTLOSS)) {
+					fractloss = ((MB != 0.0) ?
+						1 - srvr_MB/MB : 0.0);
 					if (format & PARSE)
 						strcpy(fmt, P_LOSS_FMT_BRIEF);
+					else if ((fractloss != 0.0) &&
+						 (fractloss < 0.001))
+						strcpy(fmt, LOSS_FMT_BRIEF5);
 					else
 						strcpy(fmt, LOSS_FMT_BRIEF);
-					fprintf(stdout, fmt,
-						(1 - srvr_MB/MB)*100);
+					fprintf(stdout, fmt, fractloss * 100);
 				}
 				if (format & XMITSTATS) {
 					if (format & PARSE)
@@ -3515,12 +3849,16 @@ doit:
 							/buflen + 0.5));
 				}
 				if (!(format & NOPERCENTLOSS)) {
+					fractloss = ((srvr_MB != 0.0) ?
+						1 - MB/srvr_MB : 0.0);
 					if (format & PARSE)
 						strcpy(fmt, P_LOSS_FMT_BRIEF);
+					else if ((fractloss != 0.0) &&
+						 (fractloss < 0.001))
+						strcpy(fmt, LOSS_FMT_BRIEF5);
 					else
 						strcpy(fmt, LOSS_FMT_BRIEF);
-					fprintf(stdout, fmt,
-						(1 - MB/srvr_MB)*100);
+					fprintf(stdout, fmt, fractloss * 100);
 				}
 				if (format & XMITSTATS) {
 					if (format & PARSE)
@@ -3630,6 +3968,7 @@ cleanup:
 		timeout = 0.0;
 		interval = 0.0;
 		chk_interval = 0.0;
+		datamss = 0;
 		do_poll = 0;
 		pbytes = 0;
 		ptbytes = 0;
