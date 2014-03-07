@@ -1,11 +1,18 @@
 /*
- *	N U T T C P . C						v5.5.3
+ *	N U T T C P . C						v5.5.4
  *
- * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
+ * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
+ * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
+ *
+ * nuttcp is free, opensource software.  You can redistribute it and/or
+ * modify it under the terms of Version 2 of the GNU General Public
+ * License (GPL), as published by the GNU Project (http://www.gnu.org).
+ * A copy of the license can also be found in the LICENSE file.
  *
  * This program is distributed in the hope that it will be useful, but WITHOUT
  * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * for more details.
  *
  * Based on nttcp
  * Developed by Bill Fink, billfink@mindspring.com
@@ -22,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 5.5.4, Bill Fink, 3-Nov-06
+ *	Fix bug with negative loss causing huge drop counts on interval reports
+ *	Updated Copyright notice and added GPL license notice
  * 5.5.3, Bill Fink, 23-Oct-06
  *	Fix bug with "-Ri" instantaneous rate limiting not working properly
  * 5.5.2, Bill Fink, 25-Jul-06
@@ -321,10 +331,11 @@
  *	nuttcp network idle time
  *
  * Distribution Status -
- *	Public Domain.  Distribution Unlimited.
  *	OpenSource(tm)
- *	Derivative works must be sent to authors and redistributed with 
- *	a modified source and executable name.
+ *	Licensed under version 2 of the GNU GPL
+ *	Please send source modifications back to the authors
+ *	Derivative works should be redistributed with a modified
+ *	source and executable name
  */
 
 /*
@@ -532,7 +543,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 5;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -760,9 +771,9 @@ char stats[128];
 char srvrbuf[4096];
 char tmpbuf[257];
 uint64_t nbytes = 0;		/* bytes on net */
-uint64_t pbytes = 0;		/* previous bytes - for interval reporting */
-uint64_t ntbytes = 0;		/* bytes sent by transmitter */
-uint64_t ptbytes = 0;		/* previous bytes sent by transmitter */
+int64_t pbytes = 0;		/* previous bytes - for interval reporting */
+int64_t ntbytes = 0;		/* bytes sent by transmitter */
+int64_t ptbytes = 0;		/* previous bytes sent by transmitter */
 uint64_t ntbytesc = 0;		/* bytes sent by transmitter that have
 				 * been counted */
 uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
@@ -820,7 +831,7 @@ sigalarm( int signum )
 	struct	timeval timed;	/* Delta time */
 /*	beginnings of timestamps - not ready for prime time */
 /*	struct	timeval timet; */	/* Transmitter time */
-	uint64_t nrbytes;
+	int64_t nrbytes;
 	uint64_t deltarbytes, deltatbytes;
 	double fractloss;
 	int nodata;
@@ -926,7 +937,7 @@ sigalarm( int signum )
 		if (clientserver) {
 			nrbytes = nbytes;
 			if (udplossinfo) {
-				ntbytes = *(unsigned long long *)(buf + 24);
+				ntbytes = *(int64_t *)(buf + 24);
 				if (need_swap) {
 					cp1 = (char *)&ntbytes;
 					cp2 = buf + 31;
