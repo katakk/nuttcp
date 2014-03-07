@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.5.5
+ *	N U T T C P . C						v6.0.1
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,14 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.1, Bill Fink, 17-Dec-07
+ *	Add reporting of TCP retransmissions (interval reports on Linux TX only)
+ *	Add reporting of data transfer RTT for verbose Linux output
+ *	Add beta version messages and "-f-beta" option to suppress
+ *	Automatically switch "classic" mode to oneshot server mode
+ *	Fix UDP loss info bug not updating stream_idx when not need_swap
+ *	Fix compiler warning doing sprintf of timeout
+ *	Correct comment on NODROPS define
  * 5.5.5, Bill Fink, 1-Feb-07
  *	Change default MC addr to be based on client addr instead of xmit addr
  * 5.5.4, Bill Fink, 3-Nov-06
@@ -429,6 +437,9 @@ typedef int socklen_t;
 #include "addrinfo.h"			/* from missing */
 #endif
 
+#define BETA_STR	"-beta"
+#define BETA_FEATURES	"retrans"
+
 static struct	timeval time0;	/* Time at which timing started */
 static struct	timeval timepk;	/* Time at which last packet sent */
 static struct	timeval timep;	/* Previous time - for interval reporting */
@@ -459,6 +470,19 @@ static struct	sigaction savesigact;
 #define DROP_FMT	" %lld / %lld drop/pkt"
 #define DROP_FMT_BRIEF	" %lld / %lld drop/pkt"
 #define DROP_FMT_INTERVAL " %5lld / %5lld ~drop/pkt"
+#define RETRANS_FMT	"%sretrans = %d"
+#define RETRANS_FMT_BRIEF " %d %sretrans"
+#define RETRANS_FMT_INTERVAL " %5d %sretrans"
+#define RETRANS_FMT_IN	"retrans = %d"
+#define RTT_FMT		"data transfer RTT = %.3f ms"
+#define SIZEOF_TCP_INFO_RETRANS		104
+
+/* define NEW_TCP_INFO if struct tcp_info in /usr/include/netinet/tcp.h
+ * contains tcpi_total_retrans member
+ */
+#ifndef NEW_TCP_INFO
+#define OLD_TCP_INFO
+#endif
 
 /* Parsable output formats */
 
@@ -483,6 +507,11 @@ static struct	sigaction savesigact;
 #define P_DROP_FMT		" drop=%lld pkt=%lld"
 #define P_DROP_FMT_BRIEF	" drop=%lld pkt=%lld"
 #define P_DROP_FMT_INTERVAL	" drop=%lld pkt=%lld"
+#define P_RETRANS_FMT		"%sretrans=%d"
+#define P_RETRANS_FMT_BRIEF	" %sretrans=%d"
+#define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
+#define P_RETRANS_FMT_IN	"retrans=%d"
+#define P_RTT_FMT		"xfer_rtt_ms=%.3f"
 
 #define HELO_FMT	"HELO nuttcp v%d.%d.%d\n"
 
@@ -511,12 +540,16 @@ static struct	sigaction savesigact;
 #define DEBUGINTERVAL		0x2	/* add info to assist with
 					 * debugging interval reports */
 #define	RUNNINGTOTAL		0x4	/* give cumulative stats for "-i" */
-#define	NODROPS			0x8	/* give packet drop stats for "-i" */
+#define	NODROPS			0x8	/* no packet drop stats for "-i" */
 #define	NOPERCENTLOSS		0x10	/* don't give percent loss for "-i" */
 #define DEBUGPOLL		0x20	/* add info to assist with debugging
 					 * polling for interval reports */
 #define PARSE			0x40	/* generate key=value parsable output */
 #define DEBUGMTU		0x80	/* debug info for MTU/MSS code */
+#define	NORETRANS		0x100	/* no retrans stats for "-i" */
+#define	DEBUGRETRANS		0x200	/* output info for debugging collection
+					 * of TCP retransmission info */
+#define	NOBETAMSG		0x400	/* suppress beta version message */
 
 #ifdef NO_IPV6				/* Build without IPv6 support */
 #undef AF_INET6
@@ -543,14 +576,21 @@ int delay( int us );
 int mread( int fd, char *bufp, unsigned n);
 char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
-int vers_major = 5;
-int vers_minor = 5;
-int vers_delta = 5;
+int get_retrans( int sockfd );
+
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+void print_tcpinfo();
+#endif
+
+int vers_major = 6;
+int vers_minor = 0;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
 int rvers_delta = 0;
 int irvers;
+int beta = 1;
 
 struct sockaddr_in sinme[MAXSTREAM + 1];
 struct sockaddr_in sinhim[MAXSTREAM + 1];
@@ -585,9 +625,54 @@ int rcvwin=0, rcvwinval=0, origrcvwin=0;
 int srvrwin=0;
 /*  end nick code  */
 
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+#ifdef OLD_TCP_INFO
+struct tcpinfo {		/* for collecting TCP retransmission info */
+	struct tcp_info	_tcpinf;
+	/* add missing structure elements */
+	u_int32_t	tcpi_rcv_rtt;
+	u_int32_t	tcpi_rcv_space;
+	u_int32_t	tcpi_total_retrans;
+} tcpinf;
+#define tcpinfo_state		_tcpinf.tcpi_state
+#define tcpinfo_ca_state	_tcpinf.tcpi_ca_state
+#define tcpinfo_retransmits	_tcpinf.tcpi_retransmits
+#define tcpinfo_unacked		_tcpinf.tcpi_unacked
+#define tcpinfo_sacked		_tcpinf.tcpi_sacked
+#define tcpinfo_lost		_tcpinf.tcpi_lost
+#define tcpinfo_retrans		_tcpinf.tcpi_retrans
+#define tcpinfo_fackets		_tcpinf.tcpi_fackets
+#define tcpinfo_rtt		_tcpinf.tcpi_rtt
+#define tcpinfo_rttvar		_tcpinf.tcpi_rttvar
+#define tcpinfo_snd_ssthresh	_tcpinf.tcpi_snd_ssthresh
+#define tcpinfo_snd_cwnd	_tcpinf.tcpi_snd_cwnd
+#else
+struct tcp_info tcpinf;
+#define tcpinfo_state		tcpi_state
+#define tcpinfo_ca_state	tcpi_ca_state
+#define tcpinfo_retransmits	tcpi_retransmits
+#define tcpinfo_unacked		tcpi_unacked
+#define tcpinfo_sacked		tcpi_sacked
+#define tcpinfo_lost		tcpi_lost
+#define tcpinfo_retrans		tcpi_retrans
+#define tcpinfo_fackets		tcpi_fackets
+#define tcpinfo_rtt		tcpi_rtt
+#define tcpinfo_rttvar		tcpi_rttvar
+#define tcpinfo_snd_ssthresh	tcpi_snd_ssthresh
+#define tcpinfo_snd_cwnd	tcpi_snd_cwnd
+#endif
+#endif
+
 int udp = 0;			/* 0 = tcp, !0 = udp */
 int udplossinfo = 0;		/* set to 1 to give UDP loss info for
 				 * interval reporting */
+
+int retransinfo = 0;		/* set to 1 to give TCP retransmission info
+				 * for interval reporting */
+int force_retrans = 0;		/* set to force sending retrans info */
+int send_retrans = 1;		/* set to 0 if no need to send retrans info */
+int read_retrans = 1;		/* set to 0 if no need to read retrans info */
+
 int need_swap;			/* client and server are different endian */
 int options = 0;		/* socket options */
 int one = 1;                    /* for 4.3 BSD style setsockopt() */
@@ -765,8 +850,10 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-fxmitstats	also give transmitter stats (MB) with -i (UDP only)\n\
 	-frunningtotal	also give cumulative stats on interval reports\n\
 	-f-drops	don't give packet drop info on brief output (UDP)\n\
+	-f-retrans	don't give retrans info on brief output (TCP)\n\
 	-f-percentloss	don't give %%loss info on brief output (UDP)\n\
 	-fparse		generate key=value parsable output\n\
+	-f-beta		suppress beta version message\n\
 ";	
 
 char stats[128];
@@ -781,11 +868,18 @@ uint64_t ntbytesc = 0;		/* bytes sent by transmitter that have
 uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
 				 * being received by server (presumably because
 				 * client transmitter went away */
+
+uint32_t xfer_rtt = 0;		/* data transfer RTT */
+uint32_t nretrans = 0;		/* number of TCP retransmissions */
+uint32_t iretrans = 0;		/* initial number of TCP retransmissions */
+uint32_t pretrans = 0;		/* previous number of TCP retransmissions */
+uint32_t sretrans = 0;		/* number of system TCP retransmissions */
+
 int numCalls = 0;		/* # of NRead/NWrite calls. */
 int nstream = 1;		/* number of streams */
 int stream_idx = 0;		/* current stream */
 int start_idx = 1;		/* set to use or bypass control channel */
-int b_flag = 0;			/* use mread() */
+int b_flag = 1;			/* use mread() */
 int got_srvr_output = 0;	/* set when server output has been read */
 int retry_server = 0;		/* set to retry control connect() to server */
 int num_connect_tries = 0;	/* tracks attempted connects to server */
@@ -954,6 +1048,15 @@ sigalarm( int signum )
 					/* yes they were counted */
 					nrbytes -= buflen;
 			}
+			if (read_retrans) {
+				nretrans = *(uint32_t *)(buf + 24);
+				if (need_swap) {
+					cp1 = (char *)&nretrans;
+					cp2 = buf + 27;
+					for ( i = 0; i < 4; i++ )
+						*cp1++ = *cp2--;
+				}
+			}
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
 			if (format & PARSE)
@@ -996,6 +1099,14 @@ sigalarm( int signum )
 					fprintf(stdout, fmt, fractloss * 100);
 				}
 			}
+			if (read_retrans) {
+				if (format & PARSE)
+					strcpy(fmt, P_RETRANS_FMT_INTERVAL);
+				else
+					strcpy(fmt, RETRANS_FMT_INTERVAL);
+				fprintf(stdout, fmt, (nretrans - pretrans),
+					retransinfo == 1 ?  "" : "host-");
+			}
 			if (format & RUNNINGTOTAL) {
 				if (format & PARSE)
 					strcpy(fmt, P_PERF_FMT_INTERVAL2);
@@ -1037,6 +1148,17 @@ sigalarm( int signum )
 							fractloss * 100);
 					}
 				}
+				if (read_retrans) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_RETRANS_FMT_INTERVAL);
+					else
+						strcpy(fmt,
+						       RETRANS_FMT_INTERVAL);
+					fprintf(stdout, fmt, nretrans,
+						retransinfo == 1 ?
+							"" : "host-");
+				}
 			}
 			if (udplossinfo && (format & XMITSTATS)) {
 				if (format & PARSE)
@@ -1077,6 +1199,7 @@ sigalarm( int signum )
 			timep.tv_usec = timec.tv_usec;
 			pbytes = nrbytes;
 			ptbytes = ntbytes;
+			pretrans = nretrans;
 		}
 	}
 	else
@@ -1109,6 +1232,7 @@ main( int argc, char **argv )
 	short save_events;
 	int skiparg;
 	int reqval;
+	int got_srvr_retrans;
 	double idle_data_min = IDLE_DATA_MIN;
 	double idle_data_max = IDLE_DATA_MAX;
 	double default_idle_data = DEFAULT_IDLE_DATA;
@@ -1328,7 +1452,12 @@ main( int argc, char **argv )
 				    nstream, MAXSTREAM);
 				nstream = MAXSTREAM;
 			}
-			if (nstream > 1) b_flag = 1;
+			if (nstream > 1) {
+				b_flag = 1;
+				retransinfo = -1;
+				send_retrans = 0;
+				read_retrans = 0;
+			}
 			break;
 		case 'R':
 			reqval = 0;
@@ -1451,8 +1580,9 @@ main( int argc, char **argv )
 			verbose = 1;
 			break;
 		case 'V':
-			fprintf(stdout, "nuttcp-%d.%d.%d\n", vers_major,
-					vers_minor, vers_delta);
+			fprintf(stdout, "nuttcp-%d.%d.%d%s\n", vers_major,
+					vers_minor, vers_delta,
+					beta ? BETA_STR : "");
 			exit(0);
 		case 'f':
 			if (strcmp(&argv[0][2], "xmitstats") == 0)
@@ -1465,12 +1595,18 @@ main( int argc, char **argv )
 				format |= NOPERCENTLOSS;
 			else if (strcmp(&argv[0][2], "-drops") == 0)
 				format |= NODROPS;
+			else if (strcmp(&argv[0][2], "-retrans") == 0)
+				format |= NORETRANS;
+			else if (strcmp(&argv[0][2], "debugretrans") == 0)
+				format |= DEBUGRETRANS;
 			else if (strcmp(&argv[0][2], "debugpoll") == 0)
 				format |= DEBUGPOLL;
 			else if (strcmp(&argv[0][2], "debugmtu") == 0)
 				format |= DEBUGMTU;
 			else if (strcmp(&argv[0][2], "parse") == 0)
 				format |= PARSE;
+			else if (strcmp(&argv[0][2], "-beta") == 0)
+				format |= NOBETAMSG;
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid format option \"%s\"\n", &argv[0][2]);
@@ -1661,6 +1797,20 @@ main( int argc, char **argv )
 	if (argc > 2) goto usage;
 	if (trans && (argc < 1)) goto usage;
 	if (clientserver && (argc != 0)) goto usage;
+
+	if (!clientserver && !trans && (argc < 1)) {
+		fprintf(stderr,
+			"nuttcp: Warning: Using obsolete \"classic\" mode:\n");
+		fprintf(stderr,
+			"                 Automatically switching to "
+					  "oneshot server mode "
+					  "(\"nuttcp -1\")\n");
+		oneshot = 1;
+		trans = 0;
+		clientserver = 1;
+		brief = 0;
+		verbose = 1;
+	}
 
 	host3 = NULL;
 	if (argc == 2) {
@@ -2003,6 +2153,15 @@ main( int argc, char **argv )
 			fprintf(stderr, "Unable to print interval loss information if UDP buflen < 32\n");
 	}
 
+	if (!udp && trans) {
+		if (buflen >= 32) {
+			retransinfo = 1;
+			b_flag = 1;
+		}
+		else
+			fprintf(stderr, "Unable to print retransmission information if TCP buflen < 32\n");
+	}
+
 	ivers = vers_major*10000 + vers_minor*100 + vers_delta;
 
 	mallocsize = buflen;
@@ -2018,9 +2177,28 @@ main( int argc, char **argv )
 
 	signal(SIGINT, sigint);
 
+	if (clientserver && client && !thirdparty &&
+	    beta && !(format & NOBETAMSG)) {
+		fprintf(stdout, "nuttcp-%d.%d.%d: ",
+				vers_major, vers_minor, vers_delta);
+		fprintf(stdout, "Using beta version: %s interface/output "
+				"subject to change\n", BETA_FEATURES);
+		fprintf(stdout, "              (to suppress this message "
+				"use \"-f-beta\")\n\n");
+		fflush(stdout);
+	}
+
 doit:
+	if (!udp && trans && (format & DEBUGRETRANS)) {
+		sretrans = get_retrans(-1);
+		fprintf(stdout, "initial system retrans = %d\n", sretrans);
+	}
+	nretrans = 0;
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
+			retransinfo = 0;
+			send_retrans = 1;
+			read_retrans = 1;
 			if (client) {
 				if (udp && !host3 && !traceroute) {
 					ctlconnmss = 0;
@@ -2342,6 +2520,12 @@ doit:
 					two_bod = 1;
 					handle_urg = 1;
 				}
+				if (udp || (buflen < 32) || (irvers < 60001)) {
+					if (trans)
+						send_retrans = 0;
+					else
+						read_retrans = 0;
+				}
 				if (strncmp(buf, "OK", 2) != 0) {
 					mes("error from server");
 					fprintf(stderr, "server ");
@@ -2582,7 +2766,12 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
-				if (nstream > 1) b_flag = 1;
+				if (nstream > 1) {
+					b_flag = 1;
+					retransinfo = -1;
+					send_retrans = 0;
+					read_retrans = 0;
+				}
 				if (rate == 0)
 					rate = MAXRATE;
 				if (timeout < 0) {
@@ -2680,8 +2869,19 @@ doit:
 					two_bod = 1;
 					handle_urg = 1;
 				}
+				if (udp || (buflen < 32) || (irvers < 60001)) {
+					if (trans)
+						send_retrans = 0;
+					else
+						read_retrans = 0;
+				}
 				if ((trans && !reverse) || (!trans && reverse))
 					usleep(50000);
+			}
+			if (!udp && trans && (nstream == 1)) {
+				nretrans = get_retrans(fd[0]);
+				if (retransinfo > 0)
+					b_flag = 1;
 			}
 		}
 
@@ -3359,6 +3559,10 @@ doit:
 			}
 		    }
 		}
+		if (!udp && trans && (stream_idx >= 1) && (retransinfo > 0)) {
+			nretrans = get_retrans(fd[stream_idx]);
+			iretrans = nretrans;
+		}
 		optlen = sizeof(sendwinval);
 		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,  (void *)&sendwinval, &optlen) < 0)
 			err("get send window size didn't work");
@@ -3559,7 +3763,7 @@ doit:
 			if (braindead)
 				cmdargs[i++] = "-wb";
 			if (timeout && (timeout != DEFAULT_TIMEOUT)) {
-				sprintf(tmpargs[j], "-T%lf", timeout);
+				sprintf(tmpargs[j], "-T%f", timeout);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (udp) {
@@ -3585,6 +3789,8 @@ doit:
 					cmdargs[i++] = "-f-percentloss";
 				if (format & NODROPS)
 					cmdargs[i++] = "-f-drops";
+				if (format & NORETRANS)
+					cmdargs[i++] = "-f-retrans";
 				if (format & PARSE)
 					cmdargs[i++] = "-fparse";
 			}
@@ -3989,6 +4195,24 @@ doit:
 			}
 			if (udplossinfo)
 				bcopy(&nbytes, buf + 24, 8);
+			if (!udp && interval && !(format & NORETRANS) &&
+			    ((retransinfo == 1) ||
+			     ((retransinfo >= 2) &&
+			      (force_retrans >= retransinfo)))) {
+				uint32_t tmp;
+
+				if (retransinfo == 1)
+					tmp = 0x5254524Eu;	/* "RTRN" */
+				else
+					tmp = 0x48525452u;	/* "HRTR" */
+				bcopy(&nretrans, buf + 24, 4);
+				bcopy(&tmp, buf + 28, 4);
+			}
+			else {
+				send_retrans = 0;
+				if (!udp)
+					bzero(buf + 24, 8);
+			}
 			if (nbuf == INT_MAX)
 				nbuf = ULLONG_MAX;
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
@@ -4033,6 +4257,12 @@ doit:
 				cnt = 0;
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
+				if (send_retrans) {
+					nretrans = get_retrans(
+							fd[stream_idx + 1]);
+					nretrans -= iretrans;
+					bcopy(&nretrans, buf + 24, 4);
+				}
 				stream_idx++;
 				stream_idx = stream_idx % nstream;
 				if (do_poll &&
@@ -4133,11 +4363,11 @@ doit:
 				(void)Nwrite( fd[stream_idx + 1], buf, 4 ); /* rcvr end */
 			}
 		} else {
+			first_read = 1;
+			need_swap = 0;
+			bzero(buf + 24, 8);
 			if (udp) {
-			    bzero(buf + 24, 8);
 			    ntbytesc = 0;
-			    first_read = 1;
-			    need_swap = 0;
 			    got_eod0 = 0;
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    if( cnt <= 4 ) {
@@ -4192,8 +4422,13 @@ doit:
 						    first_read = 0;
 						    if (ntbytesc > 0x100000000ull)
 							    need_swap = 1;
-						    if (!need_swap)
+						    if (!need_swap) {
+							    stream_idx++;
+							    stream_idx =
+								stream_idx
+								    % nstream;
 							    continue;
+						    }
 					    }
 					    if (!need_swap)
 						    bcopy(buf + 24, &ntbytesc,
@@ -4220,6 +4455,54 @@ doit:
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    nbytes += cnt;
 				    cnt = 0;
+				    if (first_read) {
+					if (interval && !(format & NORETRANS)) {
+					    uint32_t tmp;
+
+					    first_read = 0;
+					    bcopy(buf + 24, &nretrans, 4);
+					    bcopy(buf + 28, &tmp, 4);
+					    if (tmp == 0x5254524Eu) {
+						    /* "RTRN" */
+						    retransinfo = 1;
+						    b_flag = 1;
+					    }
+					    else if (tmp == 0x48525452u) {
+						    /* "HRTR" */
+						    retransinfo = 2;
+						    b_flag = 1;
+					    }
+					    else if (tmp == 0x4E525452u) {
+						    /* "NRTR" */
+						    need_swap = 1;
+						    retransinfo = 1;
+						    b_flag = 1;
+					    }
+					    else if (tmp == 0x52545248u) {
+						    /* "RTRH" */
+						    need_swap = 1;
+						    retransinfo = 2;
+						    b_flag = 1;
+					    }
+					    else {
+						    retransinfo = -1;
+						    read_retrans = 0;
+					    }
+					}
+					else
+					    read_retrans = 0;
+				    }
+				    if (read_retrans) {
+					    if (!need_swap)
+						    bcopy(buf + 24, &nretrans,
+								4);
+					    else {
+						    cp1 = (char *)&nretrans;
+						    cp2 = buf + 27;
+						    for ( i = 0; i < 4; i++ )
+							    *cp1++ = *cp2--;
+					    }
+				    }
 				    stream_idx++;
 				    stream_idx = stream_idx % nstream;
 			    }
@@ -4298,8 +4581,54 @@ doit:
 		}
 	}
 
-	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ )
+	if (!udp && trans && (format & DEBUGRETRANS)) {
+		sretrans = get_retrans(-1);
+		fprintf(stdout, "before closing system retrans = %d\n",
+			sretrans);
+	}
+
+	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
+		if (!udp && trans) {
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+			optlen = sizeof(tcpinf);
+			if (getsockopt(fd[stream_idx], SOL_TCP, TCP_INFO,
+				       (void *)&tcpinf, &optlen) < 0) {
+				mes("couldn't collect TCP info\n");
+				retransinfo = -1;
+				xfer_rtt = 0;
+			}
+			else
+				xfer_rtt = tcpinf.tcpinfo_rtt;
+			while (tcpinf.tcpinfo_unacked) {
+				if (format & DEBUGRETRANS)
+					print_tcpinfo();
+				if (format & DEBUGRETRANS)
+					usleep(100000);
+				else
+					usleep(1000);
+				optlen = sizeof(tcpinf);
+				if (getsockopt(fd[stream_idx],
+					       SOL_TCP, TCP_INFO,
+					       (void *)&tcpinf, &optlen) < 0) {
+					mes("couldn't collect TCP info\n");
+					retransinfo = -1;
+				}
+			}
+			if (format & DEBUGRETRANS)
+				print_tcpinfo();
+#endif
+			if (retransinfo > 0) {
+				nretrans = get_retrans(fd[stream_idx]);
+				nretrans -= iretrans;
+			}
+		}
 		close(fd[stream_idx]);
+	}
+	if (!udp && trans && (format & DEBUGRETRANS)) {
+		sretrans = get_retrans(-1);
+		fprintf(stdout, "after closing system retrans = %d\n",
+			sretrans);
+	}
 
 	if (interval && clientserver && !client && !trans) {
 		fprintf(stdout, "DONE\n");
@@ -4352,6 +4681,7 @@ doit:
 
 	if (clientserver && client) {
 		cp1 = srvrbuf;
+		got_srvr_retrans = 0;
 		while (fgets(cp1, sizeof(srvrbuf) - (cp1 - srvrbuf), stdin)) {
 			if (*(cp1 + strlen(cp1) - 1) != '\n') {
 				*cp1 = '\0';
@@ -4424,6 +4754,17 @@ doit:
 					       &srvr_cpu_util);
 				}
 			}
+			else if ((cp2 = strstr(cp1, "retrans"))) {
+				got_srvr_retrans = 1;
+				retransinfo = 1;
+				if (strstr(cp1, "host-retrans"))
+					retransinfo = 2;
+				if (format & PARSE)
+					sscanf(cp2, P_RETRANS_FMT_IN,
+					       &nretrans);
+				else
+					sscanf(cp2, RETRANS_FMT_IN, &nretrans);
+			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
 				continue;
 			strncpy(tmpbuf, cp1, 256);
@@ -4441,6 +4782,8 @@ doit:
 			cp1 += strlen(cp1);
 		}
 		got_srvr_output = 1;
+		if (!udp && !trans && !got_srvr_retrans)
+			retransinfo = -1;
 	}
 
 	if (brief <= 0) {
@@ -4483,6 +4826,44 @@ doit:
 				trans?"-t":"-r", ident,
 				(double)nbytes/(1024*1024), cput,
 				(double)nbytes/cput/1024 );
+		}
+		if (!udp && trans) {
+			if (xfer_rtt || (retransinfo > 0)) {
+				fprintf(stdout, "nuttcp-t%s: ", ident);
+				if (beta) {
+					if (format & PARSE)
+						fprintf(stdout,
+							"beta_info=true ");
+					else
+						fprintf(stdout, "Beta info: ");
+				}
+			}
+			if (xfer_rtt) {
+				if (format & PARSE)
+					strcpy(fmt, P_RTT_FMT);
+				else
+					strcpy(fmt, RTT_FMT);
+				fprintf(stdout, fmt, (double)xfer_rtt/1000);
+			}
+			if (retransinfo > 0) {
+				if (xfer_rtt) {
+					if (format & PARSE)
+						strcpy(fmt, " ");
+					else
+						strcpy(fmt, ", ");
+				}
+				else
+					strcpy(fmt, "");
+				if (format & PARSE)
+					strcat(fmt, P_RETRANS_FMT);
+				else
+					strcat(fmt, RETRANS_FMT);
+				fprintf(stdout, fmt,
+					retransinfo == 1 ? "" : "host-",
+					nretrans);
+			}
+			if (xfer_rtt || (retransinfo > 0))
+				fprintf(stdout, "\n");
 		}
 
 		strcpy(fmt, "nuttcp%s%s: ");
@@ -4608,16 +4989,36 @@ doit:
 		}
 		else
 			if (trans) {
+				if ((retransinfo > 0) &&
+				    (!(format & NORETRANS))) {
+					if (format & DEBUGRETRANS) {
+					    sretrans = get_retrans(-1);
+					    fprintf(stdout,
+						"report system retrans = %d\n",
+						sretrans);
+					}
+				}
 				if (*ident)
 					fprintf(stdout, "%s: ", ident + 1);
 				if (format & PARSE)
 					strcpy(fmt, P_PERF_FMT_BRIEF);
 				else
 					strcpy(fmt, PERF_FMT_BRIEF);
-				strcat(fmt, "\n");
 				fprintf(stdout, fmt,
 					srvr_MB, srvr_realt, srvr_Mbps,
 					cpu_util, srvr_cpu_util );
+				if ((retransinfo > 0) &&
+				    (!(format & NORETRANS))) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_RETRANS_FMT_BRIEF);
+					else
+						strcpy(fmt, RETRANS_FMT_BRIEF);
+					fprintf(stdout, fmt, nretrans,
+						retransinfo == 1 ?
+							"" : "host-");
+				}
+				fprintf(stdout, "\n");
 			}
 			else {
 				if (*ident)
@@ -4626,10 +5027,21 @@ doit:
 					strcpy(fmt, P_PERF_FMT_BRIEF);
 				else
 					strcpy(fmt, PERF_FMT_BRIEF);
-				strcat(fmt, "\n");
 				fprintf(stdout, fmt,
 					MB, realt, (double)nbytes/realt/125000,
 					srvr_cpu_util, cpu_util );
+				if ((retransinfo > 0) &&
+				    (!(format & NORETRANS))) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_RETRANS_FMT_BRIEF);
+					else
+						strcpy(fmt, RETRANS_FMT_BRIEF);
+					fprintf(stdout, fmt, nretrans,
+						retransinfo == 1 ?
+							"" : "host-");
+				}
+				fprintf(stdout, "\n");
 			}
 	}
 	else {
@@ -4677,6 +5089,13 @@ cleanup:
 		fclose(ctlconn);
 		if (!inetd)
 			close(fd[0]);
+		if (!udp && trans && (retransinfo > 0)) {
+			if (format & DEBUGRETRANS) {
+				sretrans = get_retrans(-1);
+				fprintf(stdout, "final system retrans = %d\n",
+					sretrans);
+			}
+		}
 	}
 	if (clientserver && !client) {
 		itimer.it_value.tv_sec = 0;
@@ -4705,7 +5124,7 @@ cleanup:
 		sendwin = origsendwin;
 		rcvwin = origrcvwin;
 		nstream = 1;
-		b_flag = 0;
+		b_flag = 1;
 		rate = MAXRATE;
 		irate = 0;
 		irate_cum_nsec = 0.0;
@@ -4727,6 +5146,13 @@ cleanup:
 		braindead = 0;
 		udp = 0;
 		udplossinfo = 0;
+		retransinfo = 0;
+		force_retrans = 0;
+		xfer_rtt = 0;
+		nretrans = 0;
+		iretrans = 0;
+		pretrans = 0;
+		sretrans = 0;
 		got_srvr_output = 0;
 		reverse = 0;
 		format = 0;
@@ -4769,8 +5195,9 @@ err( char *s )
 {
 	long flags, saveflags;
 
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: Error: ", trans?"-t":"-r", ident,
-			vers_major, vers_minor, vers_delta);
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
+			ident, vers_major, vers_minor, vers_delta,
+			beta ? BETA_STR : "");
 	perror(s);
 	fprintf(stderr,"errno=%d\n",errno);
 	fflush(stderr);
@@ -4795,15 +5222,17 @@ err( char *s )
 static void
 mes( char *s )
 {
-	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d: %s\n", trans?"-t":"-r", ident,
-			vers_major, vers_minor, vers_delta, s);
+	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d%s: %s\n", trans?"-t":"-r", ident,
+			vers_major, vers_minor, vers_delta,
+			beta ? BETA_STR : "", s);
 }
 
 static void
 errmes( char *s )
 {
-	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: Error: ", trans?"-t":"-r", ident,
-			vers_major, vers_minor, vers_delta);
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d%s: Error: ", trans?"-t":"-r",
+			ident, vers_major, vers_minor, vers_delta,
+			beta ? BETA_STR : "");
 	perror(s);
 	fprintf(stderr,"errno=%d\n",errno);
 	fflush(stderr);
@@ -5234,3 +5663,199 @@ getoptvalp( char **argv, int index, int reqval, int *skiparg )
 
 	return(*nextarg);
 }
+
+#define PROC_SNMP		"/proc/net/snmp"
+#define PROC_BUF_LEN		256
+#define PROC_BUF_LEN2		128
+#define NETSTAT			"netstat"
+
+#if defined(linux)
+#define RETRANS			"segments retransmited"
+#define NETSTAT_DIR		"/bin/"
+#define NRETRANS_BEFORE
+#elif defined(__FreeBSD__)
+#define RETRANS			"retransmitted"
+#define NETSTAT_DIR		"/usr/bin/"
+#define NRETRANS_BEFORE
+#elif defined(__APPLE__) && defined(__MACH__)
+#define RETRANS			"retransmitted"
+#define NETSTAT_DIR		"/usr/sbin/"
+#define NRETRANS_BEFORE
+#elif defined(sparc)
+#define RETRANS			"tcpRetransSegs"
+#define NETSTAT_DIR		"/usr/bin/"
+#elif defined(sgi)
+#define RETRANS			"retransmitted"
+#define NETSTAT_DIR		"/usr/etc/"
+#define NRETRANS_BEFORE
+#elif defined(__CYGWIN__) || defined(_WIN32)
+#define RETRANS			"Segments Retransmitted"
+#define NETSTAT_DIR		""
+#else
+#define RETRANS			"retransmitted"
+#define NETSTAT_DIR		"/usr/bin/"
+#define NRETRANS_BEFORE
+#endif
+
+char	proc_buf[PROC_BUF_LEN];
+char	proc_buf2[PROC_BUF_LEN2];
+
+int get_retrans( int sockfd )
+{
+	FILE	*proc_snmp;
+	char	*cp, *cp2;
+	int	num_retrans;
+	int	pipefd[2];
+	int	pidstat;
+	pid_t	pid = 0;
+	pid_t	wait_pid;
+
+	if (retransinfo < 0)
+		return(0);
+
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+	if ((retransinfo <= 1) && (sockfd >= 0)) {
+		optlen = sizeof(tcpinf);
+		if (getsockopt(sockfd, SOL_TCP, TCP_INFO, (void *)&tcpinf,
+			       &optlen) == 0) {
+			if (optlen >= SIZEOF_TCP_INFO_RETRANS) {
+				retransinfo = 1;
+				b_flag = 1;
+				return(tcpinf.tcpi_total_retrans);
+			}
+		}
+		if (retransinfo == 1) {
+			retransinfo = -1;
+			return(0);
+		}
+		retransinfo = 2;
+	}
+#endif
+
+	if ((retransinfo == 3) || (!(proc_snmp = fopen(PROC_SNMP, "r")))) {
+		retransinfo = 3;
+		if (pipe(pipefd) != 0) {
+			retransinfo = -1;
+			return(0);
+		}
+		if ((pid = fork()) == (pid_t)-1) {
+			perror("can't fork");
+			close(pipefd[0]);
+			close(pipefd[1]);
+			retransinfo = -1;
+			return(0);
+		}
+		if (pid == 0) {
+			signal(SIGINT, SIG_DFL);
+			close(1);
+			close(2);
+			dup(pipefd[1]);
+			dup(pipefd[1]);
+			close(pipefd[0]);
+			close(pipefd[1]);
+			execl(NETSTAT_DIR NETSTAT, NETSTAT, "-s", NULL);
+			perror("execl failed");
+			fprintf(stderr, "failed to execute %s%s -s\n",
+				NETSTAT_DIR, NETSTAT);
+			fflush(stdout);
+			fflush(stderr);
+			exit(0);
+		}
+		close(pipefd[1]);
+		if (!(proc_snmp = fdopen(pipefd[0], "r"))) {
+			close(pipefd[0]);
+			retransinfo = -1;
+			return(0);
+		}
+	}
+
+	errno = 0;
+	num_retrans = -1;
+	while (fgets(proc_buf, sizeof(proc_buf), proc_snmp)) {
+		if (retransinfo == 2) {
+			if (strncmp(proc_buf, "Tcp:", 4) != 0)
+				continue;
+			if ((!fgets(proc_buf2, sizeof(proc_buf2), proc_snmp))
+				|| (strncmp(proc_buf2, "Tcp:", 4) != 0))
+				break;
+			cp = proc_buf;
+			cp2 = proc_buf2;
+			while ((cp = strchr(cp, ' '))) {
+				while (*++cp == ' ')
+					;
+				if (!(*cp))
+					goto close;
+				if (!(cp2 = strchr(cp2, ' ')))
+					goto close;
+				while (*++cp2 == ' ')
+					;
+				if (!(*cp2))
+					goto close;
+				if (strncmp(cp, "RetransSegs", 11) == 0) {
+					if (!isdigit((int)(*cp2)))
+						goto close;
+					num_retrans = atoi(cp2);
+					goto close;
+				}
+				else
+					continue;
+			}
+		}
+		else {
+			if ((cp = strstr(proc_buf, RETRANS))) {
+#ifdef NRETRANS_BEFORE
+				num_retrans = atoi(proc_buf);
+#else
+				cp2 = strchr(cp, '=');
+				cp2++;
+				num_retrans = atoi(cp2);
+#endif
+				break;
+			}
+		}
+	}
+
+close:
+	fclose(proc_snmp);
+	if (retransinfo == 3) {
+		while ((wait_pid = wait(&pidstat)) != pid) {
+			if (wait_pid == (pid_t)-1) {
+				if (errno == ECHILD)
+					break;
+				err("wait failed");
+			}
+		}
+	}
+
+	if (num_retrans < 0) {
+		retransinfo = -1;
+		return(0);
+	}
+
+	return(num_retrans);
+}
+
+#if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
+
+void
+print_tcpinfo()
+{
+	fprintf(stdout, "state = %d, ca_state = %d, retransmits = %d, "
+			"unacked = %d, sacked = %d\n",
+		tcpinf.tcpinfo_state, tcpinf.tcpinfo_ca_state,
+		tcpinf.tcpinfo_retransmits, tcpinf.tcpinfo_unacked,
+		tcpinf.tcpinfo_sacked);
+	fprintf(stdout, "           lost = %d, retrans = %d, fackets = %d, "
+			"rtt = %d, rttvar = %d\n",
+		tcpinf.tcpinfo_lost, tcpinf.tcpinfo_retrans,
+		tcpinf.tcpinfo_fackets, tcpinf.tcpinfo_rtt,
+		tcpinf.tcpinfo_rttvar);
+	fprintf(stdout, "           snd_ssthresh = %d, snd_cwnd = %d, "
+			"total_retrans = %d\n",
+		tcpinf.tcpinfo_snd_ssthresh, tcpinf.tcpinfo_snd_cwnd,
+		tcpinf.tcpi_total_retrans);
+	return;
+}
+
+#endif
+
