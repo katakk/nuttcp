@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.1.4
+ *	N U T T C P . C						v6.1.5
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.1.5, Bill Fink, 5-Mar-09
+ *	Fix client lockup with third party when network problem (for scripts)
  * 6.1.4, Bill Fink, 5-Jan-09
  *	Updated Copyright notice
  *	Bugfix: set chk_idle_data on client (now also checks no data received)
@@ -641,7 +643,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 1;
-int vers_delta = 4;
+int vers_delta = 5;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1000,8 +1002,11 @@ sigalarm( int signum )
 	short save_events;
 	long flags, saveflags;
 
-	if (host3 && clientserver && !client)
+	if (host3 && clientserver) {
+		if (client)
+			intr = 1;
 		return;
+	}
 
 	if (clientserver && client && reading_srvr_info) {
 		mes("Error: not receiving server info");
@@ -3805,8 +3810,14 @@ doit:
 			if ((pid = fork()) == (pid_t)-1)
 				err("can't fork");
 			if (pid == 0) {
+				itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+				itimer.it_value.tv_usec = 0;
+				itimer.it_interval.tv_sec = 0;
+				itimer.it_interval.tv_usec = 0;
+				setitimer(ITIMER_REAL, &itimer, 0);
 				while (fgets(linebuf, sizeof(linebuf),
 					     stdin) && !intr) {
+					setitimer(ITIMER_REAL, &itimer, 0);
 					if (strncmp(linebuf, "DONE", 4)
 							== 0)
 						exit(0);
@@ -3816,6 +3827,9 @@ doit:
 					fputs(linebuf, stdout);
 					fflush(stdout);
 				}
+				itimer.it_value.tv_sec = 0;
+				itimer.it_value.tv_usec = 0;
+				setitimer(ITIMER_REAL, &itimer, 0);
 				exit(0);
 			}
 			signal(SIGINT, SIG_IGN);
