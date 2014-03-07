@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v7.0.1
+ *	N U T T C P . C						v7.1.1
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,15 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 7.1.1, Bill Fink, 24-Dec-09
+ *	Provide summary TCP retrans info for multi-stream TCP
+ *	Fix bug with retrans interval info when -fparse
+ *	Add "+stride" or "+n.n.n.n" syntax for multi-stream TCP (IPv4)
+ *	Fix third party bug with "-xc" option adding extraneous 't' character
+ *	Add optional client-side name resolution for third party host
+ *	Add "-N##m" option for multilink aggregation for multiple streams
+ *	Add "-xc#/#" and "-P#/#" options to Usage: statement
+ *	Some minor whitespace cleanup
  * 7.0.1, Bill Fink, 18-Sep-09
  *	Enable jitter measurements with "-j" option
  *	Enable one-way delay measurements with "-o" option
@@ -605,6 +614,8 @@ static struct	sigaction savesigact;
 #define OWD_FMT_IN	"OWD = %lf ms, avg-OWD = %lf ms, max-OWD = %lf ms"
 #define RETRANS_FMT	"%sretrans = %d"
 #define RETRANS_FMT_BRIEF " %d %sretrans"
+#define RETRANS_FMT_BRIEF_STR1 " %d = %d"
+#define RETRANS_FMT_BRIEF_STR2 " retrans"
 #define RETRANS_FMT_INTERVAL " %5d %sretrans"
 #define RETRANS_FMT_IN	"retrans = %d"
 #define RTT_FMT		" RTT=%.3f ms"
@@ -669,6 +680,7 @@ static struct	sigaction savesigact;
 #define P_OWD_MAX_FMT_INTERVAL	" msmaxOWD=%.4f"
 #define P_OWD_FMT_IN		"OWD=%lf msavgOWD=%lf msmaxOWD=%lf"
 #define P_RETRANS_FMT		"%sretrans=%d"
+#define P_RETRANS_FMT_STREAMS	" retrans_by_stream=%d"
 #define P_RETRANS_FMT_BRIEF	" %sretrans=%d"
 #define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
 #define P_RETRANS_FMT_IN	"retrans=%d"
@@ -716,6 +728,8 @@ static struct	sigaction savesigact;
 #if defined(linux)
 #define TCP_ADV_WIN_SCALE	"/proc/sys/net/ipv4/tcp_adv_win_scale"
 #endif
+
+#define BRIEF_RETRANS_STREAMS	0x2	/* brief per stream retrans info */
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -766,7 +780,7 @@ void print_tcpinfo();
 #endif
 
 int vers_major = 7;
-int vers_minor = 0;
+int vers_minor = 1;
 int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
@@ -880,6 +894,7 @@ unsigned short ctlport = 0;	/* control port for server connection */
 unsigned short ctlport3 = 0;	/* control port for 3rd party server conn */
 int tmpport;
 char *host;			/* ptr to name of host */
+char *stride = NULL;		/* ptr to address stride for multi-stream */
 char *host3 = NULL;		/* ptr to 3rd party host */
 int thirdparty = 0;		/* set to 1 indicates doing 3rd party nuttcp */
 int no3rd = 0;			/* set to 1 by server to disallow 3rd party */
@@ -898,9 +913,12 @@ int v4mapped = 0;		/* set to 1 to enable v4 mapping in v6 server */
 #endif
 
 #define HOSTNAMELEN	80
+#define HOST3BUFLEN	HOSTNAMELEN + 2 + ADDRSTRLEN + 1 + ADDRSTRLEN
+				/* host3=[=]host3addr[+host3stride] */
 
 char hostbuf[ADDRSTRLEN];	/* buffer to hold text of address */
-char host3buf[HOSTNAMELEN + 1];	/* buffer to hold 3rd party name or address */
+char host3addr[ADDRSTRLEN];	/* buffer to hold text of 3rd party address */
+char host3buf[HOST3BUFLEN + 1];	/* buffer to hold 3rd party name or address */
 int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
 int nofork = 0;			/* set to 1 to not fork server */
@@ -1028,6 +1046,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
 	-p##	port number to send to|listen at (default 5101)\n\
 	-P##	port number for control connection (default 5000)\n\
+	-P#/#	control port to/from 3rd-party host (default 5000)\n\
 	-u	use UDP instead of TCP\n\
 	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
 	-M##	MSS for data connection (TCP)\n\
@@ -1047,10 +1066,12 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETAFFINITY
 "	-xc##	set nuttcp client process CPU affinity\n"
 "	-xcs##	set nuttcp server process CPU affinity\n"
+"	-xc#/#	set nuttcp client/server process CPU affinity\n"
 #endif
 "	-d	set TCP SO_DEBUG option on data socket\n\
 	-v[v]	verbose [or very verbose] output\n\
 	-b	brief output (default)\n\
+	-br	add per-stream TCP retrans info to brief summary (Linux only)\n\
 	-D	xmit only: don't buffer TCP writes (sets TCP_NODELAY sockopt)\n\
 	-B	recv only: only output full blocks of size from -l## (for TAR)\n"
 "	--packet-burst packet burst value for instantaneous rate limit option\n"
@@ -1060,7 +1081,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
 #endif
-"Usage (server): nuttcp -S[f][P] [-options]\n\
+"\n\
+Usage (server): nuttcp -S[f][P] [-options]\n\
 		note server mode excludes use of -s\n\
 		'P' suboption makes 3rd party {in,out}bound control ports same\n\
 	-4	Use IPv4 (default)\n"
@@ -1085,7 +1107,17 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
 #endif
-"Format options:\n\
+"\n\
+Multilink aggregation options (TCP only):\n\
+         nuttcp [-options] -N##  [ctl_addr]/host1/host2/.../host## (xmit only)\n\
+         nuttcp [-options] -N##  [ctl_addr/]host+addr_stride (IPv4 only)\n\
+         nuttcp [-options] -N##  [ctl_addr/]host+n.n.n.n (IPv4 only)\n\
+         nuttcp [-options] -N##m [ctl_addr/]host (xmit only)\n\
+                                 where host resolves to multiple addresses\n\
+\n\
+                        separate [ctl_addr/] option available only for xmit\n\
+\n\
+Format options:\n\
 	-fxmitstats	also give transmitter stats (MB) with -i (UDP only)\n\
 	-frunningtotal	also give cumulative stats on interval reports\n\
 	-f-drops	don't give packet drop info on brief output (UDP)\n\
@@ -1112,13 +1144,14 @@ uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
 				 * client transmitter went away */
 
 double rtt = 0.0;		/* RTT between client and server in ms */
-uint32_t nretrans = 0;		/* number of TCP retransmissions */
-uint32_t iretrans = 0;		/* initial number of TCP retransmissions */
+uint32_t nretrans[MAXSTREAM+1];	/* number of TCP retransmissions */
+uint32_t iretrans[MAXSTREAM+1];	/* initial number of TCP retransmissions */
 uint32_t pretrans = 0;		/* previous number of TCP retransmissions */
 uint32_t sretrans = 0;		/* number of system TCP retransmissions */
 
 int numCalls = 0;		/* # of NRead/NWrite calls. */
 int nstream = 1;		/* number of streams */
+int multilink = 0;		/* set to use multilink aggregation */
 int stream_idx = 0;		/* current stream */
 int start_idx = 1;		/* set to use or bypass control channel */
 int b_flag = 1;			/* use mread() */
@@ -1215,7 +1248,7 @@ close_data_channels()
 #endif /* MCAST_JOIN_SOURCE_GROUP */
 	}
 
-	for (stream_idx = 1; stream_idx <= nstream; stream_idx++) {
+	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 		close(fd[stream_idx]);
 		fd[stream_idx] = -1;
 	}
@@ -1383,9 +1416,9 @@ sigalarm( int signum )
 					nrbytes -= buflen;
 			}
 			if (read_retrans) {
-				nretrans = *(uint32_t *)(buf + 24);
+				nretrans[1] = *(uint32_t *)(buf + 24);
 				if (need_swap) {
-					cp1 = (char *)&nretrans;
+					cp1 = (char *)&nretrans[1];
 					cp2 = buf + 27;
 					for ( i = 0; i < 4; i++ )
 						*cp1++ = *cp2--;
@@ -1465,10 +1498,10 @@ sigalarm( int signum )
 					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
 						((retransinfo == 1) ||
 						 !nrbytes) ?  "" : "host-",
-						(nretrans - pretrans));
+						(nretrans[1] - pretrans));
 				else
 					fprintf(stdout, RETRANS_FMT_INTERVAL,
-						(nretrans - pretrans),
+						(nretrans[1] - pretrans),
 						((retransinfo == 1) ||
 						 !nrbytes) ?  "" : "host-");
 			}
@@ -1547,11 +1580,11 @@ sigalarm( int signum )
 							((retransinfo == 1) ||
 							 !nrbytes) ?
 							    "" : "host-",
-							nretrans);
+							nretrans[1]);
 					else
 						fprintf(stdout,
 							RETRANS_FMT_INTERVAL,
-							nretrans,
+							nretrans[1],
 							((retransinfo == 1) ||
 							 !nrbytes) ?
 							    "" : "host-");
@@ -1584,7 +1617,7 @@ sigalarm( int signum )
 			timep.tv_usec = timec.tv_usec;
 			pbytes = nrbytes;
 			ptbytes = ntbytes;
-			pretrans = nretrans;
+			pretrans = nretrans[1];
 		}
 	}
 	else
@@ -1605,29 +1638,38 @@ main( int argc, char **argv )
 	double  correction = 0.0;
 	int pollst = 0;
 	int i = 0, j = 0;
-	char *cp1 = NULL, *cp2 = NULL;
+	char *cp1 = NULL, *cp2 = NULL, *cp3 = NULL;
+	char *hostaddr;
 	char ch = '\0';
 	int error_num = 0;
 	int sockopterr = 0;
 	int save_errno;
 	struct servent *sp = 0;
-	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL };
+	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL }, *host3res;
+	struct sockaddr_storage dummy;
 	struct timeval time_eod;	/* time EOD packet was received */
 	struct timeval time_eod0;	/* time EOD0 packet was received */
 	struct timeval timed;		/* time delta */
 	struct timeval timeconn1;	/* time before connect() for RTT */
 	struct timeval timeconn2;	/* time after connect() for RTT */
 	struct timeval timeconn;	/* time to connect() == RTT */
+	union {
+		unsigned char	buf[sizeof(struct in_addr)];
+		uint32_t	ip32;
+	} ipad_stride;			/* IPv4 address stride */
 	short save_events;
 	int skiparg;
 	int reqval;
 	int got_srvr_retrans;
+	uint32_t total_retrans = 0;
 	double idle_data_min = IDLE_DATA_MIN;
 	double idle_data_max = IDLE_DATA_MAX;
 	double default_idle_data = DEFAULT_IDLE_DATA;
 	char multsrc[ADDRSTRLEN] = "\0";
 	char multaddr[ADDRSTRLEN] = "\0";
 	long flags;
+	int nameinfo_flags;
+	int implicit_hostaddr;
 
 	sendwin = 0;
 	rcvwin = 0;
@@ -1876,7 +1918,10 @@ main( int argc, char **argv )
 			break;
 		case 'N':
 			reqval = 1;
-			nstream = atoi(getoptvalp(argv, 2, reqval, &skiparg));
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			nstream = atoi(cp1);
+			if (strchr(cp1, 'm'))
+				multilink = 1;
 			if (nstream < 1) {
 				fprintf(stderr, "invalid nstream = %d\n", nstream);
 				fflush(stderr);
@@ -1889,7 +1934,6 @@ main( int argc, char **argv )
 			}
 			if (nstream > 1) {
 				b_flag = 1;
-				retransinfo = -1;
 				send_retrans = 0;
 				read_retrans = 0;
 			}
@@ -2009,8 +2053,14 @@ main( int argc, char **argv )
 		case 'b':
 			reqval = 0;
 			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
-			if (*cp1)
-				brief = atoi(cp1);
+			if (*cp1) {
+				if (isalpha((int)(*cp1)))
+					brief = 1;
+				else
+					brief = atoi(cp1);
+				if (strchr(cp1, 'r'))
+					brief |= BRIEF_RETRANS_STREAMS;
+			}
 			else
 				brief = 1;
 			break;
@@ -2353,7 +2403,8 @@ main( int argc, char **argv )
 		cp1 = host3;
 		while (*cp1) {
 			if (!isalnum((int)(*cp1)) && (*cp1 != '-') && (*cp1 != '.')
-					   && (*cp1 != ':') && (*cp1 != '/')) {
+					   && (*cp1 != ':') && (*cp1 != '/')
+					   && (*cp1 != '+') && (*cp1 != '=')) {
 				fprintf(stderr, "invalid 3rd party host '%s'\n", host3);
 				fflush(stderr);
 				exit(1);
@@ -2407,8 +2458,51 @@ main( int argc, char **argv )
 		af = AF_INET;
 	}
 
+	if (multilink) {
+		if (nstream == 1) {
+			fprintf(stderr, "Warning: multilink mode not meaningful for a single stream\n");
+			fflush(stderr);
+		}
+	}
+
 	if (argc >= 1) {
 		host = argv[0];
+		if ((cp1 = strchr(host, '+'))) {
+			*cp1++ = '\0';
+			if (*cp1)
+				stride = cp1;
+		}
+		if (multilink) {
+			if (stride) {
+				fprintf(stderr, "don't use both multilink and address stride\n");
+				fflush(stderr);
+				exit(1);
+			}
+			if ((cp1 = strchr(host, '/')) && strchr(cp1 + 1, '/')) {
+				fprintf(stderr, "multilink mode not compatible with multiple hosts %s\n", host);
+				fflush(stderr);
+				exit(1);
+			}
+		}
+		hostaddr = NULL;
+		implicit_hostaddr = 0;
+		if ((cp1 = strchr(host, '='))) {
+			*cp1++ = '\0';
+			if (strchr(cp1, '/')) {
+				fprintf(stderr, "host=addr format not supported for multiple control/data paths\n");
+				fflush(stderr);
+				exit(1);
+			}
+			if (*cp1) {
+				if (*cp1 == '=') {
+					implicit_hostaddr = 1;
+					cp1++;
+				}
+				hostaddr = cp1;
+				if (!implicit_hostaddr)
+					host = hostaddr;
+			}
+		}
 		stream_idx = 0;
 		res[0] = NULL;
 		cp1 = host;
@@ -2440,6 +2534,10 @@ main( int argc, char **argv )
 			bzero(&hints, sizeof(hints));
 			res[stream_idx] = NULL;
 			if (explicitaf) hints.ai_family = af;
+			if (udp)
+				hints.ai_socktype = SOCK_DGRAM;
+			else
+				hints.ai_socktype = SOCK_STREAM;
 			if ((cp2 = strchr(cp1, '/'))) {
 				if (stream_idx == nstream) {
 					fprintf(stderr, "bad hostname or address: too many data paths for nstream=%d: %s\n", nstream, argv[0]);
@@ -2448,12 +2546,66 @@ main( int argc, char **argv )
 				}
 				*cp2 = '\0';
 			}
-			if ((error_num = getaddrinfo(cp1, NULL, &hints, &res[stream_idx]))) {
-				if (cp2)
-					*cp2++ = '/';
-				fprintf(stderr, "bad hostname or address: %s: %s\n", gai_strerror(error_num), argv[0]);
-				fflush(stderr);
-				exit(1);
+			if (!(multilink && (stream_idx > 1)) &&
+			    (error_num = getaddrinfo(cp1, NULL, &hints,
+						     &res[stream_idx]))) {
+				if (implicit_hostaddr && hostaddr) {
+					if (res[stream_idx]) {
+						freeaddrinfo(res[stream_idx]);
+						res[stream_idx] = NULL;
+					}
+					error_num =
+						getaddrinfo(hostaddr, NULL,
+							    &hints,
+							    &res[stream_idx]);
+				}
+				if (error_num) {
+					if (cp2)
+						*cp2++ = '/';
+					if (hostaddr) {
+						if (implicit_hostaddr)
+							*(hostaddr - 2) = '=';
+						else
+							*(hostaddr - 1) = '=';
+					}
+					fprintf(stderr, "bad hostname or address: %s: %s\n", gai_strerror(error_num), argv[0]);
+					fflush(stderr);
+					exit(1);
+				}
+				if (implicit_hostaddr && hostaddr &&
+				    (stream_idx == 1)) {
+					if (stride)
+						*(stride - 1) = '+';
+					cp3 = hostaddr;
+					while (*cp3) {
+						*(cp3 - 1) = *cp3;
+						cp3++;
+					}
+					*(cp3 - 1) = '\0';
+					hostaddr--;
+					implicit_hostaddr = 0;
+					if (stride) {
+						stride--;
+						*(stride - 1) = '\0';
+					}
+				}
+			}
+			else if (multilink && (stream_idx > 1)) {
+				if (res[stream_idx - 1]->ai_next)
+					res[stream_idx] =
+						res[stream_idx - 1]->ai_next;
+				else
+					res[stream_idx] = res[1];
+			}
+			else if (!(multilink && (stream_idx > 1)) &&
+				 implicit_hostaddr && hostaddr) {
+				if (stride) {
+					strcat(host, "+");
+					strncat(host, stride, ADDRSTRLEN);
+					*(hostaddr - 2) = '\0';
+					stride = hostaddr - 1;
+				}
+				hostaddr = NULL;
 			}
 			af = res[stream_idx]->ai_family;
 /*
@@ -2489,6 +2641,109 @@ main( int argc, char **argv )
 			if (cp1)
 				*cp1 = '/';
 		}
+		if (hostaddr) {
+			host = argv[0];
+			if (implicit_hostaddr)
+				*(hostaddr - 2) = '=';
+			else
+				*(hostaddr - 1) = '=';
+		}
+	}
+
+	ipad_stride.ip32 = 0;
+	if (stride) {
+		if (strlen(stride) >= ADDRSTRLEN) {
+			fprintf(stderr, "address stride '%s' too long\n", stride);
+			fflush(stderr);
+			exit(1);
+		}
+		if (nstream == 1) {
+			fprintf(stderr, "Warning: stride %s not meaningful for a single stream\n", stride);
+			fflush(stderr);
+		}
+		if (udp) {
+			fprintf(stderr, "stride %s not valid for UDP\n",
+				stride);
+			fflush(stderr);
+			exit(1);
+		}
+		if ((cp1 = strchr(argv[0], '/')) && strchr(cp1 + 1, '/')) {
+			fprintf(stderr, "stride %s not compatible with multiple hosts %s\n", stride, argv[0]);
+			fflush(stderr);
+			exit(1);
+		}
+		if (af == AF_INET) {
+			if (strchr(stride, '.')) {
+				error_num = inet_pton(AF_INET, stride,
+						ipad_stride.buf);
+				if (error_num == 0) {
+					fprintf(stderr,
+						"stride %s not in correct presentation format\n",
+						stride);
+					fflush(stderr);
+					exit(1);
+				}
+				else if (error_num < 0)
+					err("inet_pton: stride");
+			}
+			else {
+				ipad_stride.ip32 = atoi(stride);
+				ipad_stride.ip32 = htonl(ipad_stride.ip32);
+			}
+		}
+		else {
+			fprintf(stderr, "stride %s not valid for IPv6\n",
+				stride);
+			fflush(stderr);
+			exit(1);
+		}
+		*(stride - 1) = '+';
+	}
+
+	if (host3 && !strchr(host3, '=') && !strchr(host3, '/')) {
+		cp1 = strchr(host3, '+');
+		if (cp1) {
+			if (strlen(cp1 + 1) >= ADDRSTRLEN) {
+				fprintf(stderr, "3rd party address stride '%s' too long\n", cp1 + 1);
+				fflush(stderr);
+				exit(1);
+			}
+			*cp1 = '\0';
+		}
+		if (inet_pton(af, host3, &dummy) != 1) {
+			bzero(&hints, sizeof(hints));
+			hints.ai_family = af;
+			if (udp)
+				hints.ai_socktype = SOCK_DGRAM;
+			else
+				hints.ai_socktype = SOCK_STREAM;
+			host3res = NULL;
+			error_num = getaddrinfo(host3, NULL, &hints, &host3res);
+			if (error_num == 0) {
+				nameinfo_flags = NI_NUMERICHOST;
+				error_num = getnameinfo(host3res->ai_addr,
+							host3res->ai_addrlen,
+							host3addr, ADDRSTRLEN,
+							NULL, 0,
+							nameinfo_flags);
+			}
+			if (host3res) {
+				freeaddrinfo(host3res);
+				host3res = NULL;
+			}
+			if (error_num == 0) {
+				strncpy(host3buf, host3, HOSTNAMELEN);
+				strcat(host3buf, "==");
+				strncat(host3buf, host3addr, ADDRSTRLEN);
+				if (cp1) {
+					strcat(host3buf, "+");
+					strncat(host3buf, cp1 + 1, ADDRSTRLEN);
+				}
+				host3 = host3buf;
+			}
+		}
+		if (cp1)
+			*cp1 = '+';
 	}
 
 	if (!port) {
@@ -2779,18 +3034,22 @@ doit:
 		sretrans = get_retrans(-1);
 		fprintf(stdout, "initial system retrans = %d\n", sretrans);
 	}
-	nretrans = 0;
+	nretrans[0] = 0;
 
-	for (stream_idx = 1; stream_idx <= nstream; stream_idx++)
+	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 		fd[stream_idx] = -1;
+		nretrans[stream_idx] = 0;
+	}
 
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
-			send_retrans = 1;
+			if (nstream == 1) {
+				send_retrans = 1;
+				read_retrans = 1;
+			}
 			do_retrans = 0;
 			got_0retrans = 0;
-			read_retrans = 1;
 			if (client) {
 				if (udp && !host3 && !traceroute) {
 					ctlconnmss = 0;
@@ -2999,11 +3258,17 @@ doit:
 					abortconn = 1;
 				}
 				if (irvers >= 50001) {
-					fprintf(ctlconn, ", thirdparty = %.*s", HOSTNAMELEN, host3 ? host3 : "_NULL_");
+					cp1 = NULL;
+					if (host3 && (irvers < 70101) &&
+					    (cp1 = strchr(host3, '=')))
+						*cp1 = '\0';
+					fprintf(ctlconn, ", thirdparty = %.*s", HOST3BUFLEN, host3 ? host3 : "_NULL_");
 					if (host3) {
 						skip_data = 1;
 						fprintf(ctlconn, " , brief3 = %d", brief);
 					}
+					if (cp1)
+						*cp1 = '=';
 				}
 				else {
 					if (host3) {
@@ -3223,6 +3488,36 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 70101) {
+					fprintf(ctlconn, " , stride = %d", ipad_stride.ip32);
+				}
+				else {
+					if (ipad_stride.ip32) {
+						fprintf(stdout, "nuttcp%s%s: stride not supported by server version %d.%d.%d, need >= 7.1.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						ipad_stride.ip32 = 0;
+						abortconn = 1;
+					}
+				}
+				if (irvers >= 70101) {
+					fprintf(ctlconn, " , multilink = %d", multilink);
+				}
+				else {
+					if (multilink) {
+						fprintf(stdout, "nuttcp%s%s: multilink not supported by server version %d.%d.%d, need >= 7.1.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						multilink = 0;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -3344,10 +3639,10 @@ doit:
 					irate = 0;
 				}
 				if (irvers >= 50001) {
-					sprintf(fmt, "%%%ds", HOSTNAMELEN);
+					sprintf(fmt, "%%%ds", HOST3BUFLEN);
 					sscanf(strstr(buf, ", thirdparty =") + 15,
 						fmt, host3buf);
-					host3buf[HOSTNAMELEN] = '\0';
+					host3buf[HOST3BUFLEN] = '\0';
 					if (strcmp(host3buf, "_NULL_") == 0)
 						host3 = NULL;
 					else
@@ -3365,7 +3660,9 @@ doit:
 							     && (*cp1 != '-')
 							     && (*cp1 != '.')
 							     && (*cp1 != ':')
-							     && (*cp1 != '/')) {
+							     && (*cp1 != '/')
+							     && (*cp1 != '+')
+							     && (*cp1 != '=')) {
 								fputs("KO\n", stdout);
 								mes("invalid 3rd party host");
 								fprintf(stdout, "3rd party host = '%s'\n", host3);
@@ -3480,6 +3777,21 @@ doit:
 				else {
 					do_owd = 0;
 				}
+				if (irvers >= 70101) {
+					sscanf(strstr(buf, ", stride =") + 11,
+					       "%d", &ipad_stride.ip32);
+				}
+				else {
+					ipad_stride.ip32 = 0;
+				}
+				if (irvers >= 70101) {
+					sscanf(strstr(buf,
+						      ", multilink =") + 14,
+						      "%d", &multilink);
+				}
+				else {
+					multilink = 0;
+				}
 				trans = !trans;
 				if (inetd && !sinkmode) {
 					fputs("KO\n", stdout);
@@ -3528,7 +3840,6 @@ doit:
 				}
 				if (nstream > 1) {
 					b_flag = 1;
-					retransinfo = -1;
 					send_retrans = 0;
 					read_retrans = 0;
 				}
@@ -3845,9 +4156,16 @@ doit:
 			if (client) {
 				if (af == AF_INET) {
 				    sinhim[stream_idx].sin_family = af;
-				    bcopy((char *)&(((struct sockaddr_in *)res[stream_idx]->ai_addr)->sin_addr),
-					  (char *)&sinhim[stream_idx].sin_addr.s_addr,
-					  sizeof(sinhim[stream_idx].sin_addr.s_addr));
+				    if (ipad_stride.ip32 && (stream_idx > 1)) {
+					sinhim[stream_idx].sin_addr.s_addr =
+					  sinhim[stream_idx - 1].sin_addr.s_addr
+						+ ipad_stride.ip32;
+				    }
+				    else {
+					bcopy((char *)&(((struct sockaddr_in *)res[stream_idx]->ai_addr)->sin_addr),
+					      (char *)&sinhim[stream_idx].sin_addr.s_addr,
+					      sizeof(sinhim[stream_idx].sin_addr.s_addr));
+				    }
 				}
 #ifdef AF_INET6
 				else if (af == AF_INET6) {
@@ -3863,7 +4181,15 @@ doit:
 				}
 			} else {
 				sinhim[stream_idx].sin_family = af;
-				sinhim[stream_idx].sin_addr = clientaddr;
+				if (ipad_stride.ip32 && (stream_idx > 1)) {
+					sinhim[stream_idx].sin_addr.s_addr =
+					  sinhim[stream_idx - 1].sin_addr.s_addr
+						+ ipad_stride.ip32;
+				}
+				else {
+					sinhim[stream_idx].sin_addr =
+						clientaddr;
+				}
 #ifdef AF_INET6
 				sinhim6[stream_idx].sin6_family = af;
 				sinhim6[stream_idx].sin6_addr = clientaddr6;
@@ -4024,8 +4350,8 @@ doit:
 		}
 
 		if (clientserver && (stream_idx == 1)) {
-			if (!udp && trans && (nstream == 1)) {
-				nretrans = get_retrans(fd[0]);
+			if (!udp && trans) {
+				nretrans[0] = get_retrans(fd[0]);
 				if (retransinfo > 0)
 					b_flag = 1;
 			}
@@ -4066,9 +4392,9 @@ doit:
 				if (errno)
 					mes("couldn't get affinity");
 				else {
-					for (cpu_affinity = 0;
-					     cpu_affinity < ncores;
-					     cpu_affinity++) {
+					for ( cpu_affinity = 0;
+					      cpu_affinity < ncores;
+					      cpu_affinity++ ) {
 						if (CPU_ISSET(cpu_affinity,
 							      &cpu_set))
 							break;
@@ -4670,8 +4996,8 @@ acceptnewconn:
 		    }
 		}
 		if (!udp && trans && (stream_idx >= 1) && (retransinfo > 0)) {
-			nretrans = get_retrans(fd[stream_idx]);
-			iretrans = nretrans;
+			nretrans[stream_idx] = get_retrans(fd[stream_idx]);
+			iretrans[stream_idx] = nretrans[stream_idx];
 		}
 		optlen = sizeof(sendwinval);
 		if (getsockopt(fd[stream_idx], SOL_SOCKET, SO_SNDBUF,  (void *)&sendwinval, &optlen) < 0)
@@ -4879,11 +5205,11 @@ acceptnewconn:
 				}
 			}
 			if (affinity >= 0) {
-				sprintf(tmpargs[j], "-xc%dt", affinity);
+				sprintf(tmpargs[j], "-xc%d", affinity);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (srvr_affinity >= 0) {
-				sprintf(tmpargs[j], "-xcs%dt", srvr_affinity);
+				sprintf(tmpargs[j], "-xcs%d", srvr_affinity);
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (irvers < 50302) {
@@ -4916,7 +5242,8 @@ acceptnewconn:
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (nstream != 1) {
-				sprintf(tmpargs[j], "-N%d", nstream);
+				sprintf(tmpargs[j], "-N%d%s", nstream,
+					multilink ? "m" : "");
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (rate != MAXRATE) {
@@ -5014,7 +5341,13 @@ acceptnewconn:
 			}
 			if (nodelay)
 				cmdargs[i++] = "-D";
-			cmdargs[i++] = host3;
+			if (ipad_stride.ip32) {
+				sprintf(tmpargs[j], "%s+%d", host3,
+					ipad_stride.ip32);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			else
+				cmdargs[i++] = host3;
 			cmdargs[i] = NULL;
 			execvp(cmd, cmdargs);
 			if (errno == ENOENT) {
@@ -5773,6 +6106,7 @@ acceptnewconn:
 			if (udplossinfo)
 				bcopy(&nbytes, buf + 24, 8);
 			if (!udp && interval && !(format & NORETRANS) &&
+			    (nstream == 1) &&
 			    ((retransinfo == 1) ||
 			     ((retransinfo >= 2) &&
 			      (force_retrans >= retransinfo)))) {
@@ -5790,7 +6124,7 @@ acceptnewconn:
 						tmp = 0x5254524Eu;  /* "RTRN" */
 					else
 						tmp = 0x48525452u;  /* "HRTR" */
-					bcopy(&nretrans, buf + 24, 4);
+					bcopy(&nretrans[1], buf + 24, 4);
 					bcopy(&tmp, buf + 28, 4);
 					do_retrans = 0;
 				}
@@ -5859,10 +6193,10 @@ acceptnewconn:
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
 				if (send_retrans) {
-					nretrans = get_retrans(
+					nretrans[1] = get_retrans(
 							fd[stream_idx + 1]);
-					nretrans -= iretrans;
-					bcopy(&nretrans, buf + 24, 4);
+					nretrans[1] -= iretrans[1];
+					bcopy(&nretrans[1], buf + 24, 4);
 				}
 				stream_idx++;
 				stream_idx = stream_idx % nstream;
@@ -5988,32 +6322,39 @@ acceptnewconn:
 						    cp1 = strstr(intervalbuf,
 								 "Mbps") + 4;
 						    ch = '\0';
-						    if (cp1)
+						    if (cp1) {
+							if (format & PARSE) {
+							    cp1 = strchr(cp1,
+									 '.');
+							    if (cp1)
+								cp1 += 5;
+							}
 							ch = *cp1;
+						    }
 						    if (ch)
 							*cp1 = '\0';
 						}
 						fputs(intervalbuf, stdout);
 						if (do_retrans && sinkmode) {
-						    nretrans =
+						    nretrans[1] =
 						      get_retrans(fd[stream_idx
 									+ 1]);
-						    nretrans -= iretrans;
+						    nretrans[1] -= iretrans[1];
 						    if (format & PARSE)
 							fprintf(stdout,
 							 P_RETRANS_FMT_INTERVAL,
 							   (retransinfo == 1) ?
 								"" : "host-",
-							   (nretrans -
+							   (nretrans[1] -
 								pretrans));
 						    else
 							fprintf(stdout,
 							 RETRANS_FMT_INTERVAL,
-							   (nretrans -
+							   (nretrans[1] -
 								pretrans),
 							   (retransinfo == 1) ?
 								"" : "host-");
-						    pretrans = nretrans;
+						    pretrans = nretrans[1];
 						}
 						if (do_retrans && cp1 && ch) {
 						    *cp1 = ch;
@@ -6214,9 +6555,9 @@ acceptnewconn:
 						jitter = -pkt_delta;
 					    njitter++;
 					    if (jitter < jitter_min)
-					    	jitter_min = jitter;
+						jitter_min = jitter;
 					    if (jitter > jitter_max)
-					    	jitter_max = jitter;
+						jitter_max = jitter;
 					    jitter_avg += jitter;
 #ifdef DEBUG
 					    if (clientserver && client &&
@@ -6262,9 +6603,9 @@ acceptnewconn:
 						jitteri = -pkt_delta;
 					    njitteri++;
 					    if (jitteri < jitter_mini)
-					    	jitter_mini = jitteri;
+						jitter_mini = jitteri;
 					    if (jitteri > jitter_maxi)
-					    	jitter_maxi = jitteri;
+						jitter_maxi = jitteri;
 					    jitter_avgi += jitteri;
 					    timepkri = timerx;
 					    ntbytescpi = ntbytesc;
@@ -6289,7 +6630,7 @@ acceptnewconn:
 					    uint32_t tmp;
 
 					    first_read = 0;
-					    bcopy(buf + 24, &nretrans, 4);
+					    bcopy(buf + 24, &nretrans[1], 4);
 					    bcopy(buf + 28, &tmp, 4);
 					    if (tmp == 0x5254524Eu) {
 						    /* "RTRN" */
@@ -6323,10 +6664,10 @@ acceptnewconn:
 				    }
 				    if (read_retrans) {
 					    if (!need_swap)
-						    bcopy(buf + 24, &nretrans,
-								4);
+						    bcopy(buf + 24,
+							  &nretrans[1], 4);
 					    else {
-						    cp1 = (char *)&nretrans;
+						    cp1 = (char *)&nretrans[1];
 						    cp2 = buf + 27;
 						    for ( i = 0; i < 4; i++ )
 							    *cp1++ = *cp2--;
@@ -6507,32 +6848,41 @@ acceptnewconn:
 						    cp1 = strstr(intervalbuf,
 								 "Mbps") + 4;
 						    ch = '\0';
-						    if (cp1)
+						    if (cp1) {
+							if (format & PARSE) {
+							    cp1 = strchr(cp1,
+									 '.');
+							    if (cp1)
+								cp1 += 5;
+							}
 							ch = *cp1;
+						    }
 						    if (ch)
 							*cp1 = '\0';
 						}
 						fputs(intervalbuf, stdout);
 						if (do_retrans && sinkmode) {
-						    nretrans =
+						    nretrans[stream_idx] =
 						      get_retrans(
 							    fd[stream_idx]);
-						    nretrans -= iretrans;
+						    nretrans[stream_idx] -=
+							iretrans[stream_idx];
 						    if (format & PARSE)
 							fprintf(stdout,
 							 P_RETRANS_FMT_INTERVAL,
 							   (retransinfo == 1) ?
 								"" : "host-",
-							   (nretrans -
-								pretrans));
+							   (nretrans[stream_idx]
+								- pretrans));
 						    else
 							fprintf(stdout,
 							 RETRANS_FMT_INTERVAL,
-							   (nretrans -
-								pretrans),
+							   (nretrans[stream_idx]
+								- pretrans),
 							   (retransinfo == 1) ?
 								"" : "host-");
-						    pretrans = nretrans;
+						    pretrans =
+							nretrans[stream_idx];
 						}
 						if (do_retrans && cp1 && ch) {
 						    *cp1 = ch;
@@ -6587,8 +6937,9 @@ acceptnewconn:
 				print_tcpinfo();
 #endif
 			if (retransinfo > 0) {
-				nretrans = get_retrans(fd[stream_idx]);
-				nretrans -= iretrans;
+				nretrans[stream_idx] =
+					get_retrans(fd[stream_idx]);
+				nretrans[stream_idx] -= iretrans[stream_idx];
 			}
 		}
 	}
@@ -6603,7 +6954,7 @@ acceptnewconn:
 		 * may be some straggler interval reports to which we
 		 * will need to append retrans info, so just shutdown()
 		 * for writing for now */
-		for (stream_idx = 1; stream_idx <= nstream; stream_idx++)
+		for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ )
 			shutdown(fd[stream_idx], SHUT_WR);
 	}
 	else
@@ -6666,26 +7017,32 @@ acceptnewconn:
 			if (do_retrans) {
 				cp1 = strstr(intervalbuf, "Mbps") + 4;
 				ch = '\0';
-				if (cp1)
+				if (cp1) {
+					if (format & PARSE) {
+						cp1 = strchr(cp1, '.');
+						if (cp1)
+							cp1 += 5;
+					}
 					ch = *cp1;
+				}
 				if (ch)
 					*cp1 = '\0';
 			}
 			fputs(intervalbuf, stdout);
 			if (do_retrans && sinkmode) {
-				nretrans = get_retrans(fd[1]);
-				nretrans -= iretrans;
+				nretrans[1] = get_retrans(fd[1]);
+				nretrans[1] -= iretrans[1];
 				if (format & PARSE)
 					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
 						(retransinfo == 1) ?
 							"" : "host-",
-						(nretrans - pretrans));
+						(nretrans[1] - pretrans));
 				else
 					fprintf(stdout, RETRANS_FMT_INTERVAL,
-						(nretrans - pretrans),
+						(nretrans[1] - pretrans),
 						(retransinfo == 1) ?
 							"" : "host-");
-				pretrans = nretrans;
+				pretrans = nretrans[1];
 			}
 			if (do_retrans && cp1 && ch) {
 				*cp1 = ch;
@@ -6790,9 +7147,34 @@ acceptnewconn:
 					retransinfo = 2;
 				if (format & PARSE)
 					sscanf(cp2, P_RETRANS_FMT_IN,
-					       &nretrans);
+					       &total_retrans);
 				else
-					sscanf(cp2, RETRANS_FMT_IN, &nretrans);
+					sscanf(cp2, RETRANS_FMT_IN,
+					       &total_retrans);
+				if (format & PARSE) {
+					if ((cp2 = strstr(cp2,
+							"retrans_by_stream=")))
+						cp2 += 18;
+					else
+						cp2 = NULL;
+				}
+				else {
+					if ((cp2 = strstr(cp2, "( ")))
+						cp2 += 2;
+					else
+						cp2 = NULL;
+				}
+				if (cp2) {
+					sscanf(cp2, "%d", &nretrans[1]);
+					stream_idx = 2;
+					while ((stream_idx <= nstream) &&
+					       (cp2 = strchr(cp2, '+'))) {
+						cp2++;
+						sscanf(cp2, "%d",
+						       &nretrans[stream_idx]);
+						stream_idx++;
+					}
+				}
 				/* below is for compatibility with 6.0.x beta */
 				if ((cp2 = strstr(cp1, "RTT"))) {
 					if (format & PARSE)
@@ -6850,6 +7232,13 @@ acceptnewconn:
 		got_srvr_output = 1;
 		if (!udp && !trans && !got_srvr_retrans)
 			retransinfo = -1;
+	}
+
+	if (!udp && trans && (retransinfo > 0)) {
+		total_retrans = 0;
+		for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
+			total_retrans += nretrans[stream_idx];
+		}
 	}
 
 	if (brief <= 0) {
@@ -6921,7 +7310,22 @@ acceptnewconn:
 			else
 				strcpy(fmt, RETRANS_FMT);
 			fprintf(stdout, fmt,
-				retransinfo == 1 ? "" : "host-", nretrans);
+				retransinfo == 1 ? "" : "host-", total_retrans);
+			if ((nstream > 1) && (retransinfo == 1) &&
+			    total_retrans) {
+				if (format & PARSE)
+					fprintf(stdout, P_RETRANS_FMT_STREAMS,
+						nretrans[1]);
+				else
+					fprintf(stdout, " ( %d", nretrans[1]);
+				for ( stream_idx = 2; stream_idx <= nstream;
+				      stream_idx++ ) {
+					fprintf(stdout, "+%d",
+						nretrans[stream_idx]);
+				}
+				if (!(format & PARSE))
+					fprintf(stdout, " )");
+			}
 			fprintf(stdout, "\n");
 		}
 
@@ -7170,18 +7574,44 @@ acceptnewconn:
 				fprintf(stdout, fmt,
 					srvr_MB, srvr_realt, srvr_Mbps,
 					cpu_util, srvr_cpu_util );
-				if ((retransinfo > 0) &&
+				if ((nstream > 1) && (retransinfo == 1) &&
+				    total_retrans && !(format & NORETRANS) &&
+				    (brief & BRIEF_RETRANS_STREAMS)) {
+					if (format & PARSE) {
+					    fprintf(stdout, P_RETRANS_FMT_BRIEF,
+						    "", total_retrans);
+					    fprintf(stdout,
+						    P_RETRANS_FMT_STREAMS,
+						    nretrans[1]);
+					}
+					else {
+					    fprintf(stdout,
+						    RETRANS_FMT_BRIEF_STR1,
+						    total_retrans,
+						    nretrans[1]);
+					}
+					for ( stream_idx = 2;
+					      stream_idx <= nstream;
+					      stream_idx++ ) {
+					    fprintf(stdout, "+%d",
+						    nretrans[stream_idx]);
+					}
+					if (!(format & PARSE))
+					    fprintf(stdout,
+						    RETRANS_FMT_BRIEF_STR2);
+				}
+				else if ((retransinfo > 0) &&
 				    (!(format & NORETRANS))) {
 					if (format & PARSE)
 						fprintf(stdout,
 							P_RETRANS_FMT_BRIEF,
 							retransinfo == 1 ?
 								"" : "host-",
-							nretrans);
+							total_retrans);
 					else
 						fprintf(stdout,
 							RETRANS_FMT_BRIEF,
-							nretrans,
+							total_retrans,
 							retransinfo == 1 ?
 								"" : "host-");
 				}
@@ -7228,18 +7658,45 @@ acceptnewconn:
 				fprintf(stdout, fmt,
 					MB, realt, (double)nbytes/realt/125000,
 					srvr_cpu_util, cpu_util );
-				if ((retransinfo > 0) &&
+				if ((nstream > 1) && (retransinfo == 1) &&
+				    total_retrans && !(format & NORETRANS) &&
+				    (brief & BRIEF_RETRANS_STREAMS) &&
+				    (irvers >= 70101)) {
+					if (format & PARSE) {
+					    fprintf(stdout, P_RETRANS_FMT_BRIEF,
+						    "", total_retrans);
+					    fprintf(stdout,
+						    P_RETRANS_FMT_STREAMS,
+						    nretrans[1]);
+					}
+					else {
+					    fprintf(stdout,
+						    RETRANS_FMT_BRIEF_STR1,
+						    total_retrans,
+						    nretrans[1]);
+					}
+					for ( stream_idx = 2;
+					      stream_idx <= nstream;
+					      stream_idx++ ) {
+					    fprintf(stdout, "+%d",
+						    nretrans[stream_idx]);
+					}
+					if (!(format & PARSE))
+					    fprintf(stdout,
+						    RETRANS_FMT_BRIEF_STR2);
+				}
+				else if ((retransinfo > 0) &&
 				    (!(format & NORETRANS))) {
 					if (format & PARSE)
 						fprintf(stdout,
 							P_RETRANS_FMT_BRIEF,
 							retransinfo == 1 ?
 								"" : "host-",
-							nretrans);
+							total_retrans);
 					else
 						fprintf(stdout,
 							RETRANS_FMT_BRIEF,
-							nretrans,
+							total_retrans,
 							retransinfo == 1 ?
 								"" : "host-");
 				}
@@ -7339,7 +7796,7 @@ cleanup:
 		}
 	}
 	if (clientserver && !client) {
-		for (stream_idx = 1; stream_idx <= nstream; stream_idx++) {
+		for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 			fd[stream_idx] = -1;
 		}
 		itimer.it_value.tv_sec = 0;
@@ -7388,6 +7845,7 @@ cleanup:
 		ident[0] = '\0';
 		intr = 0;
 		abortconn = 0;
+		ipad_stride.ip32 = 0;
 		port = 5101;
 		trans = 0;
 		braindead = 0;
@@ -7398,8 +7856,6 @@ cleanup:
 		retransinfo = 0;
 		force_retrans = 0;
 		rtt = 0.0;
-		nretrans = 0;
-		iretrans = 0;
 		pretrans = 0;
 		sretrans = 0;
 		got_srvr_output = 0;
@@ -7421,18 +7877,22 @@ cleanup:
 		two_bod = 0;
 		handle_urg = 0;
 		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
-			if (res[stream_idx]) {
+			if (res[stream_idx] &&
+			    !(multilink && (stream_idx > 1))) {
 				freeaddrinfo(res[stream_idx]);
 				res[stream_idx] = NULL;
 			}
+			nretrans[stream_idx] = 0;
+			iretrans[stream_idx] = 0;
 		}
 		nstream = 1;
+		multilink = 0;
 		if (!oneshot)
 			goto doit;
 	}
 
 	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
-		if (res[stream_idx]) {
+		if (res[stream_idx] && !(multilink && (stream_idx > 1))) {
 			freeaddrinfo(res[stream_idx]);
 			res[stream_idx] = NULL;
 		}
