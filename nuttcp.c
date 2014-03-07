@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.5
+ *	N U T T C P . C						v6.0.6
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,13 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.6, Bill Fink, 11-Aug-08
+ *	Delay server forking until after listen() for better error status
+ *	Above suggested by Hans Blom (jblom@science.uva.nl)
+ *	Make forced server mode the default behavior
+ *	Check address family on getpeername() so "ssh host nuttcp -S" works
+ *	Add setsid() call for manually started server to create new session
+ *	Some minor code cleanup
  * 6.0.5, Bill Fink, 10-Aug-08
  *	Allow "-s" from/to stdin/stdout with "-1" oneshot server mode
  *	Switch beta vers message to stderr to not interfere with "-s" option
@@ -599,7 +606,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 5;
+int vers_delta = 6;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -701,7 +708,7 @@ char *host;			/* ptr to name of host */
 char *host3 = NULL;		/* ptr to 3rd party host */
 int thirdparty = 0;		/* set to 1 indicates doing 3rd party nuttcp */
 int no3rd = 0;			/* set to 1 by server to disallow 3rd party */
-int force_server = 0;		/* set to 1 to force server mode (for rsh) */
+int forked = 0;			/* set to 1 after server has forked */
 int pass_ctlport = 0;		/* set to 1 to use same outgoing control port
 				   as incoming with 3rd party usage */
 char *cmdargs[50];		/* command arguments array */
@@ -840,7 +847,6 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #endif
 "Usage (server): nuttcp -S[f][P] [-options]\n\
 		note server mode excludes use of -s\n\
-		'f' suboption forces server mode (useful with rsh/ssh)\n\
 		'P' suboption makes 3rd party {in,out}bound control ports same\n\
 	-4	Use IPv4 (default)\n"
 #ifdef AF_INET6
@@ -1582,8 +1588,6 @@ main( int argc, char **argv )
 				brief = 1;
 			break;
 		case 'S':
-			if (strchr(&argv[0][2], 'f'))
-				force_server = 1;
 			if (strchr(&argv[0][2], 'P'))
 				pass_ctlport = 1;
 			trans = 0;
@@ -2058,36 +2062,37 @@ main( int argc, char **argv )
 		udp = 0;
 		start_idx = 0;
 		ident[0] = '\0';
-		if (force_server) {
-			close(0);
-			close(1);
-			close(2);
-			open("/dev/null", O_RDWR);
-			dup(0);
-			dup(0);
-		}
 		if (af == AF_INET) {
 		  struct sockaddr_in peer;
 		  socklen_t peerlen = sizeof(peer);
-		  if (!force_server && getpeername(0, (struct sockaddr *) &peer,
-				&peerlen) == 0) {
-			clientaddr = peer.sin_addr;
-			inetd = 1;
-			oneshot = 1;
-			start_idx = 1;
+		  if (getpeername(0, (struct sockaddr *)&peer, &peerlen) == 0) {
+#ifndef AF_INET6
+			if (peer.sin_family == AF_INET)
+#else
+			if ((peer.sin_family == AF_INET) ||
+			    (peer.sin_family == AF_INET6))
+#endif
+			{
+				clientaddr = peer.sin_addr;
+				inetd = 1;
+				oneshot = 1;
+				start_idx = 1;
+			}
 		  }
 		}
 #ifdef AF_INET6
 		else if (af == AF_INET6) {
 		  struct sockaddr_in6 peer;
 		  socklen_t peerlen = sizeof(peer);
-		  if (!force_server && getpeername(0, (struct sockaddr *) &peer,
-				&peerlen) == 0) {
-			clientaddr6 = peer.sin6_addr;
-			clientscope6 = peer.sin6_scope_id;
-			inetd = 1;
-			oneshot = 1;
-			start_idx = 1;
+		  if (getpeername(0, (struct sockaddr *)&peer, &peerlen) == 0) {
+			if ((peer.sin6_family == AF_INET) ||
+			    (peer.sin6_family == AF_INET6)) {
+				clientaddr6 = peer.sin6_addr;
+				clientscope6 = peer.sin6_scope_id;
+				inetd = 1;
+				oneshot = 1;
+				start_idx = 1;
+			}
 		  }
 		}
 #endif
@@ -2096,19 +2101,20 @@ main( int argc, char **argv )
 		}
 	}
 
-	if (clientserver && !inetd) {
-		if (!oneshot && !sinkmode) {
-			fprintf(stderr, "option \"-s\" invalid with \"-S\" server mode\n");
-			fprintf(stderr, "option \"-s\" can be used with \"-1\" oneshot server mode\n");
-			fflush(stderr);
-			exit(1);
-		}
-		if (!nofork) {
-			if ((pid = fork()) == (pid_t)-1)
-				err("can't fork");
-			if (pid != 0)
-				exit(0);
-		}
+	if (clientserver && !inetd && sinkmode) {
+		close(0);
+		close(1);
+		close(2);
+		open("/dev/null", O_RDWR);
+		dup(0);
+		dup(0);
+	}
+
+	if (clientserver && !inetd && !oneshot && !sinkmode) {
+		fprintf(stderr, "option \"-s\" invalid with \"-S\" server mode\n");
+		fprintf(stderr, "option \"-s\" can be used with \"-1\" oneshot server mode\n");
+		fflush(stderr);
+		exit(1);
 	}
 
 #ifdef HAVE_SETPRIO
@@ -3466,6 +3472,15 @@ doit:
 						err("unable to set maximum segment size");
 			}
 			listen(fd[stream_idx],1);   /* allow a queue of 1 */
+			if (clientserver && !client && (stream_idx == 0)
+					 && !inetd && !nofork && !forked) {
+				if ((pid = fork()) == (pid_t)-1)
+					err("can't fork");
+				if (pid != 0)
+					exit(0);
+				forked = 1;
+				setsid();
+			}
 			if (options && (stream_idx > 0))  {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
 					errmes("unable to setsockopt options");
@@ -3531,8 +3546,9 @@ doit:
 			if (af == AF_INET) {
 			    struct sockaddr_in peer;
 			    socklen_t peerlen = sizeof(peer);
-			    if (getpeername(fd[stream_idx], (struct sockaddr *) &peer, 
-					&peerlen) < 0) {
+			    if (getpeername(fd[stream_idx],
+			    		    (struct sockaddr *)&peer, 
+					    &peerlen) < 0) {
 				err("getpeername");
 			    }
 			    if ((stream_idx == nstream) && (brief <= 0)) {
@@ -3568,8 +3584,9 @@ doit:
 			else if (af == AF_INET6) {
 			    struct sockaddr_in6 peer;
 			    socklen_t peerlen = sizeof(peer);
-			    if (getpeername(fd[stream_idx], (struct sockaddr *) &peer, 
-					&peerlen) < 0) {
+			    if (getpeername(fd[stream_idx],
+			    		    (struct sockaddr *)&peer, 
+					    &peerlen) < 0) {
 				err("getpeername");
 			    }
 			    if ((stream_idx == nstream) && (brief <= 0)) {
