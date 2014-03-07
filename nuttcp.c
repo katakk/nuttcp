@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.1
+ *	N U T T C P . C						v6.0.2
  *
  * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
@@ -29,6 +29,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.2, Bill Fink, 16-Jul-08
+ *	Add RTT info to brief output for Linux
  * 6.0.1, Bill Fink, 17-Dec-07
  *	Add reporting of TCP retransmissions (interval reports on Linux TX only)
  *	Add reporting of data transfer RTT for verbose Linux output
@@ -438,7 +440,7 @@ typedef int socklen_t;
 #endif
 
 #define BETA_STR	"-beta"
-#define BETA_FEATURES	"retrans"
+#define BETA_FEATURES	"retrans/RTT"
 
 static struct	timeval time0;	/* Time at which timing started */
 static struct	timeval timepk;	/* Time at which last packet sent */
@@ -475,6 +477,8 @@ static struct	sigaction savesigact;
 #define RETRANS_FMT_INTERVAL " %5d %sretrans"
 #define RETRANS_FMT_IN	"retrans = %d"
 #define RTT_FMT		"data transfer RTT = %.3f ms"
+#define RTT_FMT_BRIEF	" %d msRTT"
+#define RTT_FMT_IN	"RTT = %lf"
 #define SIZEOF_TCP_INFO_RETRANS		104
 
 /* define NEW_TCP_INFO if struct tcp_info in /usr/include/netinet/tcp.h
@@ -512,6 +516,8 @@ static struct	sigaction savesigact;
 #define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
 #define P_RETRANS_FMT_IN	"retrans=%d"
 #define P_RTT_FMT		"xfer_rtt_ms=%.3f"
+#define P_RTT_FMT_BRIEF		" xfer_rtt_ms=%d"
+#define P_RTT_FMT_IN		"xfer_rtt_ms=%lf"
 
 #define HELO_FMT	"HELO nuttcp v%d.%d.%d\n"
 
@@ -550,6 +556,7 @@ static struct	sigaction savesigact;
 #define	DEBUGRETRANS		0x200	/* output info for debugging collection
 					 * of TCP retransmission info */
 #define	NOBETAMSG		0x400	/* suppress beta version message */
+#define	WANTRTT			0x800	/* output RTT info if available */
 
 #ifdef NO_IPV6				/* Build without IPv6 support */
 #undef AF_INET6
@@ -584,7 +591,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -854,6 +861,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-f-percentloss	don't give %%loss info on brief output (UDP)\n\
 	-fparse		generate key=value parsable output\n\
 	-f-beta		suppress beta version message\n\
+	-frtt		add transfer RTT info if available\n\
 ";	
 
 char stats[128];
@@ -885,6 +893,7 @@ int retry_server = 0;		/* set to retry control connect() to server */
 int num_connect_tries = 0;	/* tracks attempted connects to server */
 int single_threaded = 0;	/* set to make server single threaded */
 double srvr_MB;
+double srvr_RTT;
 double srvr_realt;
 double srvr_KBps;
 double srvr_Mbps;
@@ -1607,6 +1616,8 @@ main( int argc, char **argv )
 				format |= PARSE;
 			else if (strcmp(&argv[0][2], "-beta") == 0)
 				format |= NOBETAMSG;
+			else if (strcmp(&argv[0][2], "rtt") == 0)
+				format |= WANTRTT;
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid format option \"%s\"\n", &argv[0][2]);
@@ -2181,7 +2192,7 @@ main( int argc, char **argv )
 	    beta && !(format & NOBETAMSG)) {
 		fprintf(stdout, "nuttcp-%d.%d.%d: ",
 				vers_major, vers_minor, vers_delta);
-		fprintf(stdout, "Using beta version: %s interface/output "
+		fprintf(stdout, "Using beta vers: %s interface/output "
 				"subject to change\n", BETA_FEATURES);
 		fprintf(stdout, "              (to suppress this message "
 				"use \"-f-beta\")\n\n");
@@ -4764,6 +4775,15 @@ doit:
 					       &nretrans);
 				else
 					sscanf(cp2, RETRANS_FMT_IN, &nretrans);
+				if ((cp2 = strstr(cp1, "RTT"))) {
+					if (format & PARSE)
+						sscanf(cp2, P_RTT_FMT_IN,
+						       &srvr_RTT);
+					else
+						sscanf(cp2, RTT_FMT_IN,
+						       &srvr_RTT);
+					xfer_rtt = srvr_RTT*1000;
+				}
 			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
 				continue;
@@ -5018,6 +5038,13 @@ doit:
 						retransinfo == 1 ?
 							"" : "host-");
 				}
+				if ((format & WANTRTT) && xfer_rtt) {
+					if (format & PARSE)
+						strcpy(fmt, P_RTT_FMT_BRIEF);
+					else
+						strcpy(fmt, RTT_FMT_BRIEF);
+					fprintf(stdout, fmt, xfer_rtt/1000);
+				}
 				fprintf(stdout, "\n");
 			}
 			else {
@@ -5040,6 +5067,13 @@ doit:
 					fprintf(stdout, fmt, nretrans,
 						retransinfo == 1 ?
 							"" : "host-");
+				}
+				if ((format & WANTRTT) && xfer_rtt) {
+					if (format & PARSE)
+						strcpy(fmt, P_RTT_FMT_BRIEF);
+					else
+						strcpy(fmt, RTT_FMT_BRIEF);
+					fprintf(stdout, fmt, xfer_rtt/1000);
 				}
 				fprintf(stdout, "\n");
 			}
