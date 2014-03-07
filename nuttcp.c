@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.3
+ *	N U T T C P . C						v5.1.4
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,12 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.4, Bill Fink, 21-Apr-04
+ *	Change usage statement to use standard out instead of standard error
+ *	Fix bug with interval > timeout, give warning and ignore interval
+ *	Fix bug with counting error value in nbytes on interrupted transfers
+ *	Fix bug with TCP transmitted & received nbytes not matching
+ *	Merge "-t" and "-r" options in Usage: statement
  * V5.1.3, Bill Fink, 9-Apr-04
  *	Add "-Sf" force server mode (useful for starting server via rsh/ssh)
  *	Allow non-root user to find nuttcp binary in "."
@@ -272,8 +278,9 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
  */
 
 /*
+ * FIXME:
  * the nice gentlemen at Apple fixed their includes to typedef this now, but
- * there is no obvious way of differentiating the need for this.  FIX later...
+ * there is no obvious way of differentiating the need for this.
  */
 #if (defined(__APPLE__) && defined(__MACH__)) || (defined(sparc) && !defined(EAI_NONAME))
 typedef int socklen_t;
@@ -392,7 +399,7 @@ int mread( int fd, char *bufp, unsigned n);
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 3;
+int vers_delta = 4;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -533,58 +540,26 @@ char Usage[] = "\
 Usage: nuttcp or nuttcp -h	prints this usage info\n\
 Usage: nuttcp -V		prints version info\n\
 Usage: nuttcp -xt [-m] host	forward and reverse traceroute to/from server\n\
-Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
+Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
+      |(receiver):   nuttcp -r [-options] [host] [3rd-party] [ >out ]\n\
 	-4	Use IPv4\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
 #endif
-"	-l##	length of network write buf (default 8192/udp, 65536/tcp)\n\
-	-s	don't source a pattern to network, use stdin\n\
-	-n##	number of source bufs written to network (default 2048)\n\
-	-w##	transmitter window size in KB (or (m|M)B or (g|G)B)\n\
-	-ws##	server receive window size in KB (or (m|M)B or (g|G)B)\n\
+"	-l##	length of network write|read buf (default 8192/udp, 65536/tcp)\n\
+	-s	use stdin|stdout for data input|output instead of pattern data\n\
+	-n##	number of source bufs written to network (default unlimited)\n\
+	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
+	-ws##	server receive|transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
-	-p##	port number to send to (default 5001)\n\
+	-p##	port number to send to|listen at (default 5001)\n\
 	-P##	port number for control connection (default 5000)\n\
-	-u	use UDP instead of TCP\n\
-	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
-	-D	don't buffer TCP writes (sets TCP_NODELAY socket option)\n\
-	-N##	number of streams (starting at port number)\n\
-	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
-	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
-	-i##	server interval reporting in seconds (or (m|M)inutes)\n\
-	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
-	-F	flip option to reverse direction of data connection open\n"
-#ifdef HAVE_SETPRIO
-"	-xP##	set nuttcp process priority (must be root)\n"
-#endif
-"	-d	set TCP SO_DEBUG option on data socket\n\
-	-v[v]	verbose [or very verbose] output\n\
-	-b	brief output (default)\n"
-#ifdef IPV6_V6ONLY
-"	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
-"	--enable-v4-mapped enable v4 mapping in v6 server\n"
-#endif
-"Usage (receiver): nuttcp -r [-options] [host] [3rd-party] [ >out]\n\
-	-4	Use IPv4\n"
-#ifdef AF_INET6
-"	-6	Use IPv6\n"
-#endif
-"	-l##	length of network read buf (default 8192/udp, 65536/tcp)\n\
-	-s	don't sink (discard): prints all data from network to stdout\n\
-	-n##	number of bufs for server to write to network (default 2048)\n\
-	-w##	receiver window size in KB (or (m|M)B or (g|G)B)\n\
-	-ws##	server transmit window size in KB (or (m|M)B or (g|G)B)\n\
-	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
-	-p##	port number to listen at (default 5001)\n\
-	-P##	port number for control connection (default 5000)\n\
-	-B	Only output full blocks, as specified in -l## (for TAR)\n\
 	-u	use UDP instead of TCP\n\
 	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
 	-N##	number of streams (starting at port number), implies -B\n\
-	-R##	server transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
-	-T##	server transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
-	-i##	client interval reporting in seconds (or (m|M)inutes)\n\
+	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps)\n\
+	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
+	-i##	receiver interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
 	-F	flip option to reverse direction of data connection open\n"
 #ifdef HAVE_SETPRIO
@@ -592,7 +567,9 @@ Usage (transmitter): nuttcp -t [-options] host [3rd-party] [ <in ]\n\
 #endif
 "	-d	set TCP SO_DEBUG option on data socket\n\
 	-v[v]	verbose [or very verbose] output\n\
-	-b	brief output (default)\n"
+	-b	brief output (default)\n\
+	-D	xmit only: don't buffer TCP writes (sets TCP_NODELAY sockopt)\n\
+	-B	recv only: only output full blocks of size from -l## (for TAR)\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
@@ -1334,6 +1311,12 @@ optlen = sizeof(maxseg);
 		fprintf(stderr, "ctlport = %d overlaps port/nstream = %d/%d\n", ctlport, port, nstream);
 		fflush(stderr);
 		exit(1);
+	}
+
+	if (interval > timeout) {
+		fprintf(stderr, "ignoring interval = %f which is greater than timeout = %f\n", interval, timeout);
+		fflush(stderr);
+		interval = 0;
 	}
 
 	if (clientserver) {
@@ -2797,7 +2780,7 @@ doit:
 			err("fcntl 2");
 	}
 	if (sinkmode) {      
-		register int cnt;
+		register int cnt = 0;
 		if (trans)  {
 			if(udp) {
 				strcpy(buf, "BOD0");
@@ -2843,6 +2826,7 @@ doit:
 					pollfds[0].events = save_events;
 				}
 				nbytes += buflen;
+				cnt = 0;
 				if (udplossinfo)
 					bcopy(&nbytes, buf + 24, 8);
 				stream_idx = ++stream_idx % nstream;
@@ -2925,7 +2909,7 @@ doit:
 				}
 			}
 			nbytes -= buflen;
-			if (intr)
+			if (intr && (cnt > 0))
 				nbytes += cnt;
 			if(udp) {
 				if (multicast)
@@ -2962,6 +2946,7 @@ doit:
 				    if (!got_begin)
 					    continue;
 				    nbytes += cnt;
+				    cnt = 0;
 				    /* problematic if the interval timer
 				     * goes off right here */
 				    if (udplossinfo) {
@@ -2986,14 +2971,15 @@ doit:
 				    }
 				    stream_idx = ++stream_idx % nstream;
 			    }
-			    if (intr)
+			    if (intr && (cnt > 0))
 				    nbytes += cnt;
 			} else {
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    nbytes += cnt;
+				    cnt = 0;
 				    stream_idx = ++stream_idx % nstream;
 			    }
-			    if (intr)
+			    if (intr && (cnt > 0))
 				    nbytes += cnt;
 			}
 		}
@@ -3003,12 +2989,14 @@ doit:
 			while((cnt=read(0,buf,buflen)) > 0 &&
 			    Nwrite(fd[stream_idx + 1],buf,cnt) == cnt) {
 				nbytes += cnt;
+				cnt = 0;
 				stream_idx = ++stream_idx % nstream;
 			}
 		}  else  {
 			while((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
 			    write(realstdout,buf,cnt) == cnt) {
 				nbytes += cnt;
+				cnt = 0;
 				stream_idx = ++stream_idx % nstream;
 			}
 		}
@@ -3463,7 +3451,7 @@ cleanup:
 	exit(0);
 
 usage:
-	fprintf(stderr,Usage);
+	fprintf(stdout,Usage);
 	exit(1);
 }
 
