@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v7.1.6
+ *	N U T T C P . C						v7.2.1
  *
  * Copyright(c) 2000 - 2012 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2012 Rob Scott.  All rights reserved.
@@ -29,6 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 7.2.1, Bill Fink, 26-Dec-12
+ *	Add "-g" option to specify multicast IP address to use
+ *	Clean up really confused transmit code for IPv4/IPv6 SSM multicast
+ *	Bug fix from Aristeu Rozanski:
+ *	    Crash caused by closing TCP_ADV_WIN_SCALE file even if open failed
  * 7.1.6, Bill Fink, 25-Feb-12
  *	Add "-sd" direct I/O option for non-sinkmode (Linux only)
  *	Fix bug with server CPU affinity being parsed as %X instead of %d
@@ -760,6 +765,8 @@ static struct	sigaction savesigact;
 /* locally defined global scope IPv6 multicast, FF3E::8000:0-FF3E::FFFF:FFFF */
 #define HI_MC6			"FF3E::8000:0000"
 #define HI_MC6_LEN		13
+#define HI_MC6_ASM		"FF2E::0"
+#define HI_MC6_ASM_LEN		8
 #ifndef LISTEN_BACKLOG
 #define LISTEN_BACKLOG		64
 #endif
@@ -835,8 +842,8 @@ void print_tcpinfo();
 #endif
 
 int vers_major = 7;
-int vers_minor = 1;
-int vers_delta = 6;
+int vers_minor = 2;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -852,13 +859,14 @@ struct sockaddr_in save_sinhim, save_mc;
 struct sockaddr_in6 sinme6[MAXSTREAM + 1];
 struct sockaddr_in6 sinhim6[MAXSTREAM + 1];
 struct sockaddr_in6 save_sinhim6, save_mc6;
-struct in6_addr hi_mc6;
+struct in6_addr hi_mc6, hi_mc6_asm;
 #endif
 
 struct sockaddr_storage frominet;
 
 int domain = PF_UNSPEC;
 int af = AF_UNSPEC;
+int mc_af = AF_UNSPEC;
 int explicitaf = 0;		/* address family explicit specified (-4|-6) */
 int fd[MAXSTREAM + 1];		/* fd array of network sockets */
 int nfd;			/* fd for accept call */
@@ -958,7 +966,7 @@ int pass_ctlport = 0;		/* set to 1 to use same outgoing control port
 				   as incoming with 3rd party usage */
 char *nut_cmd;			/* command used to invoke nuttcp */
 char *cmdargs[50];		/* command arguments array */
-char tmpargs[50][40];
+char tmpargs[50][50];
 
 #ifndef AF_INET6
 #define ADDRSTRLEN 16
@@ -1022,6 +1030,8 @@ int ssm = -1;			/* set to 1 for Source Specific Multicast */
 				/* set to -1 to have SSM follow protocol */
 				/* (off for ipv4, on for ipv6) */
 int mc_param;
+char *mc_addr = NULL;		/* user specified multicast IP address */
+char mcgaddr[ADDRSTRLEN];	/* buffer to hold text of MC group address */
 struct ip_mreq mc_group;	/* holds multicast group address */
 #ifdef AF_INET6
 struct ipv6_mreq mc6_group;	/* holds multicast group address */
@@ -1115,6 +1125,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-P#/#	control port to/from 3rd-party host (default 5000)\n\
 	-u	use UDP instead of TCP\n\
 	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
+	-gxxx	user specified multicast IP address for -m option\n\
 	-M##	MSS for data connection (TCP)\n\
 	-N##	number of streams (starting at port number), implies -B\n\
 	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps or (p)ps)\n\
@@ -1718,7 +1729,8 @@ main( int argc, char **argv )
 	int sockopterr = 0;
 	int save_errno;
 	struct servent *sp = 0;
-	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL }, *host3res;
+	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL },
+			*host3res, *mcres = NULL;
 	union sockaddr_union client_ipaddr;
 	struct sockaddr_storage dummy;
 	struct timeval time_eod;	/* time EOD packet was received */
@@ -2310,6 +2322,10 @@ main( int argc, char **argv )
 			}
 			multicast = mc_param;
 			break;
+		case 'g':
+			reqval = 1;
+			mc_addr = getoptvalp(argv, 2, reqval, &skiparg);
+			break;
 		case 'M':
 			reqval = 1;
 			datamss = atoi(getoptvalp(argv, 2, reqval, &skiparg));
@@ -2499,8 +2515,23 @@ main( int argc, char **argv )
 		nstream = 1;
 	}
 
+	if (mc_addr && !multicast) {
+		fprintf(stderr, "can't use \"-g\" option for non-multicast\n");
+		fflush(stderr);
+		exit(1);
+	}
+	if (mc_addr && !*mc_addr) {
+		fprintf(stderr, "no multicast IP address specified for "
+				"\"-g\" option\n");
+		fflush(stderr);
+		exit(1);
+	}
+
 #ifdef AF_INET6
 	if (!inet_pton(AF_INET6, HI_MC6, &hi_mc6)) {
+		err("inet_pton");
+	}
+	if (!inet_pton(AF_INET6, HI_MC6_ASM, &hi_mc6_asm)) {
 		err("inet_pton");
 	}
 #endif
@@ -3010,6 +3041,103 @@ main( int argc, char **argv )
 #endif
 		}
 #endif
+	}
+
+	mc_af = af;
+	if (!host3 && clientserver && client && mc_addr) {
+		bzero(&hints, sizeof(hints));
+		if (explicitaf)
+			hints.ai_family = af;
+		if (udp)
+			hints.ai_socktype = SOCK_DGRAM;
+		else
+			hints.ai_socktype = SOCK_STREAM;
+		mcres = NULL;
+		error_num = getaddrinfo(mc_addr, NULL, &hints, &mcres);
+		if (error_num) {
+			fprintf(stderr, "getaddrinfo: "
+					"bad multicast IP address: %s: %s\n",
+				mc_addr, gai_strerror(error_num));
+			fflush(stderr);
+			exit(1);
+		}
+		nameinfo_flags = NI_NUMERICHOST;
+		error_num = getnameinfo(mcres->ai_addr, mcres->ai_addrlen,
+					mcgaddr, ADDRSTRLEN, NULL, 0,
+					nameinfo_flags);
+		if (error_num) {
+			fprintf(stderr, "getnameinfo: "
+					"bad multicast IP address: %s: %s\n",
+				mc_addr, gai_strerror(error_num));
+			fflush(stderr);
+			exit(1);
+		}
+		mc_addr = mcgaddr;
+		if (mcres->ai_family == AF_INET) {
+			struct sockaddr_in *group;
+			struct in_addr ipv4_mcaddr;
+
+			group = (struct sockaddr_in *)mcres->ai_addr;
+			bcopy((char *)&(group->sin_addr), (char *)&ipv4_mcaddr,
+			      sizeof(struct in_addr));
+			if (ssm) {
+				if (((htonl(ipv4_mcaddr.s_addr) & 0xFF000000) !=
+				     (HI_MC_SSM << 24))) {
+					fprintf(stderr, "bad SSM multicast "
+							"IP address: %s: "
+							"use 232.x.y.z\n",
+						mcgaddr);
+					fflush(stderr);
+					exit(1);
+				}
+			}
+			else {
+				if (((htonl(ipv4_mcaddr.s_addr) & 0xFF000000) !=
+				     (HI_MC << 24))) {
+					fprintf(stderr, "bad ASM multicast "
+							"IP address: %s: "
+							"use 231.x.y.z\n",
+						mcgaddr);
+					fflush(stderr);
+					exit(1);
+				}
+			}
+		}
+#ifdef AF_INET6
+		if (mcres->ai_family == AF_INET6) {
+			struct sockaddr_in6 *group;
+
+			group = (struct sockaddr_in6 *)mcres->ai_addr;
+			if (ssm) {
+				if ((bcmp((char *)&(group->sin6_addr),
+					  (char *)&hi_mc6,
+					  HI_MC6_LEN - 1) != 0) ||
+				    (group->sin6_addr.s6_addr[HI_MC6_LEN - 1]
+						< 0x80)) {
+					fprintf(stderr,
+						"bad SSM multicast IP address: "
+						"%s: use ff3e::[8-f]xxx:yyyy\n",
+						mcgaddr);
+					fflush(stderr);
+					exit(1);
+				}
+			}
+			else {
+				if ((bcmp((char *)&(group->sin6_addr),
+					  (char *)&hi_mc6_asm,
+					  HI_MC6_ASM_LEN) != 0)) {
+					fprintf(stderr,
+						"bad ASM multicast IP address: "
+						"%s: use ff2e::wwww:xxxx:"
+							      "yyyy:zzzz\n",
+						mcgaddr);
+					fflush(stderr);
+					exit(1);
+				}
+			}
+		}
+#endif
+		mc_af = mcres->ai_family;
 	}
 
 	if (irate < 0) {
@@ -3640,6 +3768,21 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 70201) {
+					fprintf(ctlconn, ", group = %.*s", ADDRSTRLEN, mc_addr ? mc_addr : "_NULL_");
+				}
+				else {
+					if (mc_addr) {
+						fprintf(stdout, "nuttcp%s%s: multicast group option not supported by server version %d.%d.%d, need >= 7.2.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						mc_addr = NULL;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -3827,7 +3970,7 @@ doit:
 					mc_param = 0;
 				}
 				if (irvers >= 60201) {
-					sscanf(strstr(buf, ", ssm =") + 7,
+					sscanf(strstr(buf, ", ssm =") + 8,
 						"%d", &ssm);
 				}
 				else {
@@ -3923,6 +4066,34 @@ doit:
 				}
 				else {
 					multilink = 0;
+				}
+				if (irvers >= 70201) {
+					sprintf(fmt, "%%%ds", ADDRSTRLEN);
+					sscanf(strstr(buf, ", group =") + 10,
+					       fmt, mcgaddr);
+					mcgaddr[ADDRSTRLEN - 1] = '\0';
+					if (strcmp(mcgaddr, "_NULL_") == 0)
+						mc_addr = NULL;
+					else
+						mc_addr = mcgaddr;
+					if (mc_addr) {
+						cp1 = mc_addr;
+						while (*cp1) {
+							if (!isxdigit((int)(*cp1))
+							     && (*cp1 != '.')
+							     && (*cp1 != ':')) {
+								fputs("KO\n", stdout);
+								mes("invalid multicast group");
+								fprintf(stdout, "multicast group = '%s'\n", mc_addr);
+								fputs("KO\n", stdout);
+								goto cleanup;
+							}
+							cp1++;
+						}
+					}
+				}
+				else {
+					mc_addr = NULL;
 				}
 				trans = !trans;
 				if (inetd && !sinkmode) {
@@ -4164,6 +4335,24 @@ doit:
 						do_owd);
 					fputs("KO\n", stdout);
 					goto cleanup;
+				}
+				if (mc_addr) {
+					error_num = inet_pton(AF_INET, mc_addr,
+							      &dummy);
+#ifdef AF_INET6
+					if (error_num != 1)
+						error_num = inet_pton(AF_INET6,
+								      mc_addr,
+								      &dummy);
+#endif
+					if (error_num != 1) {
+						fputs("KO\n", stdout);
+						mes("invalid multicast group");
+						fprintf(stdout, "multicast group = '%s'\n",
+							mc_addr);
+						fputs("KO\n", stdout);
+						goto cleanup;
+					}
 				}
 				/* used to send server "OK" here -
 				 * now delay sending of server OK until
@@ -5252,11 +5441,11 @@ acceptnewconn:
 			if ((adv_ws = fopen(TCP_ADV_WIN_SCALE, "r"))) {
 				if (fscanf(adv_ws, "%d", &winadjust) <= 0)
 					winadjust = 2;
+				fclose(adv_ws);
 			}
 			else {
 				winadjust = 2;
 			}
-			fclose(adv_ws);
 			if (winadjust < 0) {
 				sendwinavail = sendwinval >> -winadjust;
 				rcvwinavail  = rcvwinval  >> -winadjust;
@@ -5501,6 +5690,11 @@ acceptnewconn:
 						sprintf(tmpargs[j], "-m%d",
 							multicast);
 					cmdargs[i++] = tmpargs[j++];
+					if (mc_addr) {
+						sprintf(tmpargs[j], "-g%s",
+							mc_addr);
+						cmdargs[i++] = tmpargs[j++];
+					}
 				}
 				else
 					cmdargs[i++] = "-u";
@@ -5776,7 +5970,98 @@ acceptnewconn:
 		struct sockaddr_in6 me6;
 		socklen_t me6len = sizeof(me6);
 #endif
-		if (af == AF_INET) {
+		if (mc_addr && !client) {
+			bzero(&hints, sizeof(hints));
+			hints.ai_flags = AI_NUMERICHOST;
+			if (udp)
+				hints.ai_socktype = SOCK_DGRAM;
+			else
+				hints.ai_socktype = SOCK_STREAM;
+			mcres = NULL;
+			error_num = getaddrinfo(mc_addr, NULL, &hints, &mcres);
+			if (error_num) {
+				sprintf(tmpbuf, "getaddrinfo: "
+						"bad multicast IP address: "
+						"%s: %s",
+					mc_addr, gai_strerror(error_num));
+				errno = EINVAL;
+				err(tmpbuf);
+			}
+			if (mcres->ai_family == AF_INET) {
+				struct sockaddr_in *group;
+				struct in_addr ipv4_mcaddr;
+
+				group = (struct sockaddr_in *)mcres->ai_addr;
+				bcopy((char *)&(group->sin_addr),
+				      (char *)&ipv4_mcaddr,
+				      sizeof(struct in_addr));
+				if (ssm) {
+					if (((htonl(ipv4_mcaddr.s_addr)
+							& 0xFF000000) !=
+					     (HI_MC_SSM << 24))) {
+						sprintf(tmpbuf,
+							"bad SSM multicast "
+							"IP address: %s: "
+							"use 232.x.y.z",
+							mcgaddr);
+						errno = EINVAL;
+						err(tmpbuf);
+					}
+				}
+				else {
+					if (((htonl(ipv4_mcaddr.s_addr)
+							& 0xFF000000) !=
+					     (HI_MC << 24))) {
+						sprintf(tmpbuf,
+							"bad ASM multicast "
+							"IP address: %s: "
+							"use 231.x.y.z",
+							mcgaddr);
+						errno = EINVAL;
+						err(tmpbuf);
+					}
+				}
+			}
+#ifdef AF_INET6
+			if (mcres->ai_family == AF_INET6) {
+				struct sockaddr_in6 *group;
+
+				group = (struct sockaddr_in6 *)mcres->ai_addr;
+				if (ssm) {
+					if ((bcmp((char *)&(group->sin6_addr),
+						  (char *)&hi_mc6,
+						  HI_MC6_LEN - 1) != 0) ||
+					    (group->sin6_addr.s6_addr[HI_MC6_LEN - 1]
+							< 0x80)) {
+						sprintf(tmpbuf,
+							"bad SSM multicast "
+							"IP address: %s: use "
+							"ff3e::[8-f]xxx:yyyy",
+							mcgaddr);
+						errno = EINVAL;
+						err(tmpbuf);
+					}
+				}
+				else {
+					if ((bcmp((char *)&(group->sin6_addr),
+						  (char *)&hi_mc6_asm,
+						  HI_MC6_ASM_LEN) != 0)) {
+						sprintf(tmpbuf,
+							"bad ASM multicast "
+							"IP address: %s: use "
+							"ff2e::wwww:xxxx:"
+							      "yyyy:zzzz",
+							mcgaddr);
+						errno = EINVAL;
+						err(tmpbuf);
+					}
+				}
+			}
+#endif
+			mc_af = mcres->ai_family;
+		}
+
+		if (mc_af == AF_INET) {
 			if (getpeername(fd[0], (struct sockaddr *)&peer,
 					&peerlen) < 0) {
 				err("getpeername");
@@ -5787,7 +6072,7 @@ acceptnewconn:
 			}
 		}
 #ifdef AF_INET6
-		else if (af == AF_INET6) {
+		else if (mc_af == AF_INET6) {
 			if (getpeername(fd[0], (struct sockaddr *)&peer6,
 					&peer6len) < 0) {
 				err("getpeername");
@@ -5803,9 +6088,18 @@ acceptnewconn:
 		}
 
 		if (!trans) {
-		    if ((af == AF_INET) && !ssm) { /* IPv4 ASM */
+		    if ((mc_af == AF_INET) && !ssm) { /* IPv4 ASM */
 			/* The multicast receiver must join the mc group */
-			if (client && (irvers >= 50505)) {
+			if (mc_addr) {
+				struct sockaddr_in *user_group;
+
+				user_group =
+					(struct sockaddr_in *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin_addr.s_addr),
+				      (char *)&mc_group.imr_multiaddr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else if (client && (irvers >= 50505)) {
 				bcopy((char *)&me.sin_addr.s_addr,
 				      (char *)&mc_group.imr_multiaddr.s_addr,
 				      sizeof(struct in_addr));
@@ -5815,15 +6109,19 @@ acceptnewconn:
 				      (char *)&mc_group.imr_multiaddr.s_addr,
 				      sizeof(struct in_addr));
 			}
-			mc_group.imr_multiaddr.s_addr &= htonl(0xFFFFFF);
-			mc_group.imr_multiaddr.s_addr |= htonl(HI_MC << 24);
+			if (!mc_addr) {
+				mc_group.imr_multiaddr.s_addr &=
+					htonl(0xFFFFFF);
+				mc_group.imr_multiaddr.s_addr |=
+					htonl(HI_MC << 24);
+			}
 			if (setsockopt(fd[1], IPPROTO_IP, IP_ADD_MEMBERSHIP,
 				       (void *)&mc_group, sizeof(mc_group)) < 0)
 				err("setsockopt: IP_ADD_MEMBERSHIP");
 			if (brief <= 0) {
-				inet_ntop(af, &peer.sin_addr.s_addr,
+				inet_ntop(mc_af, &peer.sin_addr.s_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &mc_group.imr_multiaddr,
+				inet_ntop(mc_af, &mc_group.imr_multiaddr,
 					  multaddr, sizeof(multaddr));
 
 				if (format & PARSE)
@@ -5843,9 +6141,18 @@ acceptnewconn:
 			}
 		    }
 #ifdef AF_INET6
-		    else if ((af == AF_INET6) && !ssm) { /* IPv6 ASM */
+		    else if ((mc_af == AF_INET6) && !ssm) { /* IPv6 ASM */
 			/* The multicast receiver must join the mc group */
-			if (client) {
+			if (mc_addr) {
+				struct sockaddr_in6 *user_group;
+
+				user_group =
+					(struct sockaddr_in6 *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin6_addr),
+				      (char *)&mc6_group.ipv6mr_multiaddr,
+				      sizeof(struct in6_addr));
+			}
+			else if (client) {
 				bcopy((char *)&me6.sin6_addr,
 				      (char *)&mc6_group.ipv6mr_multiaddr,
 				      sizeof(struct in6_addr));
@@ -5855,17 +6162,19 @@ acceptnewconn:
 				      (char *)&mc6_group.ipv6mr_multiaddr,
 				      sizeof(struct in6_addr));
 			}
-			bcopy((char *)&hi_mc6,
-			      (char *)&mc6_group.ipv6mr_multiaddr,
-			      HI_MC6_LEN);
+			if (!mc_addr) {
+				bcopy((char *)&hi_mc6_asm,
+				      (char *)&mc6_group.ipv6mr_multiaddr,
+				      HI_MC6_ASM_LEN);
+			}
 			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_JOIN_GROUP,
 				       (void *)&mc6_group,
 				       sizeof(mc6_group)) < 0)
 				err("setsockopt: IPV6_JOIN_GROUP");
 			if (brief <= 0) {
-				inet_ntop(af, &peer6.sin6_addr,
+				inet_ntop(mc_af, &peer6.sin6_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &mc6_group.ipv6mr_multiaddr,
+				inet_ntop(mc_af, &mc6_group.ipv6mr_multiaddr,
 					  multaddr, sizeof(multaddr));
 
 				if (format & PARSE)
@@ -5886,25 +6195,39 @@ acceptnewconn:
 		    }
 #endif /* AF_INET6 */
 #ifdef MCAST_JOIN_SOURCE_GROUP
-		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
+		    else if ((mc_af == AF_INET) && ssm) { /* IPv4 SSM */
 			/* multicast receiver joins the mc source group */
 			union sockaddr_union group_ipaddr;
 			struct sockaddr_in *group;
 			struct sockaddr_in *source;
+
 			group = &group_ipaddr.sin;
 			source =
 			    (struct sockaddr_in *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
-			if (client)
+			if (mc_addr) {
+				struct sockaddr_in *user_group;
+
+				user_group =
+					(struct sockaddr_in *)mcres->ai_addr;
+				bcopy((char *)user_group, (char *)group,
+				      sizeof(struct sockaddr_in));
+			}
+			else if (client) {
 				bcopy((char *)&me, (char *)group,
 				      sizeof(struct sockaddr_in));
-			else
+			}
+			else {
 				bcopy((char *)&peer, (char *)group,
 				      sizeof(struct sockaddr_in));
+			}
 			bcopy((char *)&peer, (char *)source,
 			      sizeof(struct sockaddr_in));
-			group->sin_addr.s_addr &= htonl(0xFFFFFF);
-			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
+			if (!mc_addr) {
+				group->sin_addr.s_addr &= htonl(0xFFFFFF);
+				group->sin_addr.s_addr |=
+					htonl(HI_MC_SSM << 24);
+			}
 			group_source_req.gsr_group = group_ipaddr.ss;
 			if (setsockopt(fd[1], IPPROTO_IP,
 				       MCAST_JOIN_SOURCE_GROUP,
@@ -5912,9 +6235,9 @@ acceptnewconn:
 				       sizeof(group_source_req)) < 0)
 				err("setsockopt: MCAST_JOIN_SOURCE_GROUP");
 			if (brief <= 0) {
-				inet_ntop(af, &source->sin_addr.s_addr,
+				inet_ntop(mc_af, &source->sin_addr.s_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &group->sin_addr.s_addr,
+				inet_ntop(mc_af, &group->sin_addr.s_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
@@ -5933,34 +6256,48 @@ acceptnewconn:
 			}
 		    }
 #ifdef AF_INET6
-		    else if ((af == AF_INET6) && ssm) { /* IPv6 SSM */
+		    else if ((mc_af == AF_INET6) && ssm) { /* IPv6 SSM */
 			/* multicast receiver joins the mc source group */
 			struct sockaddr_in6 *group;
 			struct sockaddr_in6 *source;
+
 			group =
 			    (struct sockaddr_in6 *)&group_source_req.gsr_group;
 			source =
 			    (struct sockaddr_in6 *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
-			if (client)
+			if (mc_addr) {
+				struct sockaddr_in6 *user_group;
+
+				user_group =
+					(struct sockaddr_in6 *)mcres->ai_addr;
+				bcopy((char *)user_group, (char *)group,
+				      sizeof(struct sockaddr_in6));
+			}
+			else if (client) {
 				bcopy((char *)&me6, (char *)group,
 				      sizeof(struct sockaddr_in6));
-			else
+			}
+			else {
 				bcopy((char *)&peer6, (char *)group,
 				      sizeof(struct sockaddr_in6));
+			}
 			bcopy((char *)&peer6, (char *)source,
 			      sizeof(struct sockaddr_in6));
-			bcopy((char *)&hi_mc6, (char *)&group->sin6_addr,
-			      HI_MC6_LEN);
+			if (!mc_addr) {
+				bcopy((char *)&hi_mc6,
+				      (char *)&group->sin6_addr,
+				      HI_MC6_LEN);
+			}
 			if (setsockopt(fd[1], IPPROTO_IPV6,
 				       MCAST_JOIN_SOURCE_GROUP,
 				       &group_source_req,
 				       sizeof(group_source_req)) < 0)
 				err("setsockopt: MCAST_JOIN_SOURCE_GROUP");
 			if (brief <= 0) {
-				inet_ntop(af, &source->sin6_addr.s6_addr,
+				inet_ntop(mc_af, &source->sin6_addr.s6_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &group->sin6_addr.s6_addr,
+				inet_ntop(mc_af, &group->sin6_addr.s6_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
@@ -5985,20 +6322,29 @@ acceptnewconn:
 		    }
 		}
 		else { /* trans */
-		    if (af == AF_INET) {
+		    if (mc_af == AF_INET) {
 			bcopy((char *)&sinhim[1].sin_addr.s_addr,
 			      (char *)&save_sinhim.sin_addr.s_addr,
 			      sizeof(struct in_addr));
 		    }
 #ifdef AF_INET6
-		    else if (af == AF_INET6) {
+		    else if (mc_af == AF_INET6) {
 			bcopy((char *)&sinhim6[1], (char *)&save_sinhim6,
 			      sizeof(struct sockaddr_in6));
 		    }
 #endif
-		    if ((af == AF_INET) && !ssm) { /* IPv4 ASM */
+		    if ((mc_af == AF_INET) && !ssm) { /* IPv4 ASM */
 			/* The multicast transmitter just sends to mc group */
-			if (client || (irvers < 50505)) {
+			if (mc_addr) {
+				struct sockaddr_in *user_group;
+
+				user_group =
+					(struct sockaddr_in *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin_addr.s_addr),
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else if (client || (irvers < 50505)) {
 				bcopy((char *)&me.sin_addr.s_addr,
 				      (char *)&sinhim[1].sin_addr.s_addr,
 				      sizeof(struct in_addr));
@@ -6008,16 +6354,18 @@ acceptnewconn:
 				      (char *)&sinhim[1].sin_addr.s_addr,
 				      sizeof(struct in_addr));
 			}
-			sinhim[1].sin_addr.s_addr &= htonl(0xFFFFFF);
-			sinhim[1].sin_addr.s_addr |= htonl(HI_MC << 24);
+			if (!mc_addr) {
+				sinhim[1].sin_addr.s_addr &= htonl(0xFFFFFF);
+				sinhim[1].sin_addr.s_addr |= htonl(HI_MC << 24);
+			}
 			if (setsockopt(fd[1], IPPROTO_IP, IP_MULTICAST_TTL,
 				       (void *)&multicast,
 				       sizeof(multicast)) < 0)
 				err("setsockopt: IP_MULTICAST_TTL");
 			if (brief <= 0) {
-				inet_ntop(af, &me.sin_addr.s_addr,
+				inet_ntop(mc_af, &me.sin_addr.s_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &sinhim[1].sin_addr.s_addr,
+				inet_ntop(mc_af, &sinhim[1].sin_addr.s_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE) {
 					fprintf(stdout,
@@ -6038,9 +6386,18 @@ acceptnewconn:
 			}
 		    }
 #ifdef AF_INET6
-		    else if ((af == AF_INET6) && !ssm) { /* IPv6 ASM */
+		    else if ((mc_af == AF_INET6) && !ssm) { /* IPv6 ASM */
 			/* The multicast transmitter just sends to mc group */
-			if (client) {
+			if (mc_addr) {
+				struct sockaddr_in6 *user_group;
+
+				user_group =
+					(struct sockaddr_in6 *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin6_addr),
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			else if (client) {
 				bcopy((char *)&me6.sin6_addr,
 				      (char *)&sinhim6[1].sin6_addr,
 				      sizeof(struct in6_addr));
@@ -6050,16 +6407,19 @@ acceptnewconn:
 				      (char *)&sinhim6[1].sin6_addr,
 				      sizeof(struct in6_addr));
 			}
-			bcopy((char *)&hi_mc6, (char *)&sinhim6[1].sin6_addr,
-			      HI_MC6_LEN);
+			if (!mc_addr) {
+				bcopy((char *)&hi_mc6_asm,
+				      (char *)&sinhim6[1].sin6_addr,
+				      HI_MC6_ASM_LEN);
+			}
 			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
 				       (void *)&multicast,
 				       sizeof(multicast)) < 0)
 				err("setsockopt: IPV6_MULTICAST_HOPS");
 			if (brief <= 0) {
-				inet_ntop(af, &me6.sin6_addr.s6_addr,
+				inet_ntop(mc_af, &me6.sin6_addr.s6_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &sinhim6[1].sin6_addr.s6_addr,
+				inet_ntop(mc_af, &sinhim6[1].sin6_addr.s6_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE) {
 					fprintf(stdout,
@@ -6081,37 +6441,40 @@ acceptnewconn:
 		    }
 #endif /* AF_INET6 */
 #ifdef MCAST_JOIN_SOURCE_GROUP
-		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
+		    else if ((mc_af == AF_INET) && ssm) { /* IPv4 SSM */
 			/* The multicast transmitter just sends to mc group */
-			union sockaddr_union group_ipaddr;
-			struct sockaddr_in *group;
-			struct sockaddr_in *source;
-			group = &group_ipaddr.sin;
-			source =
-			    (struct sockaddr_in *)&group_source_req.gsr_source;
-			group_source_req.gsr_interface = 0;  /* any interface */
-			if (client)
-				bcopy((char *)&me, (char *)group,
-				      sizeof(struct sockaddr_in));
-			else
-				bcopy((char *)&peer, (char *)group,
-				      sizeof(struct sockaddr_in));
-			bcopy((char *)&me, (char *)source,
-			      sizeof(struct sockaddr_in));
-			group->sin_addr.s_addr &= htonl(0xFFFFFF);
-			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
-			group_source_req.gsr_group = group_ipaddr.ss;
-			bcopy((char *)&group->sin_addr.s_addr,
-			      (char *)&sinhim[1].sin_addr.s_addr,
-			      sizeof(struct in_addr));
+			if (mc_addr) {
+				struct sockaddr_in *user_group;
+
+				user_group =
+					(struct sockaddr_in *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin_addr.s_addr),
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else if (client) {
+				bcopy((char *)&me.sin_addr.s_addr,
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			else {
+				bcopy((char *)&peer.sin_addr.s_addr,
+				      (char *)&sinhim[1].sin_addr.s_addr,
+				      sizeof(struct in_addr));
+			}
+			if (!mc_addr) {
+				sinhim[1].sin_addr.s_addr &= htonl(0xFFFFFF);
+				sinhim[1].sin_addr.s_addr |=
+					htonl(HI_MC_SSM << 24);
+			}
 			if (setsockopt(fd[1], IPPROTO_IP, IP_MULTICAST_TTL,
 				       (void *)&multicast,
 				       sizeof(multicast)) < 0)
 				err("setsockopt: IP_MULTICAST_TTL");
 			if (brief <= 0) {
-				inet_ntop(af, &source->sin_addr.s_addr,
+				inet_ntop(mc_af, &me.sin_addr.s_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &group->sin_addr.s_addr,
+				inet_ntop(mc_af, &sinhim[1].sin_addr.s_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
@@ -6130,36 +6493,40 @@ acceptnewconn:
 			}
 		    }
 #ifdef AF_INET6
-		    else if ((af == AF_INET6) && ssm) { /* IPv6 SSM */
+		    else if ((mc_af == AF_INET6) && ssm) { /* IPv6 SSM */
 			/* The multicast transmitter just sends to mc group */
-			struct sockaddr_in6 *group;
-			struct sockaddr_in6 *source;
-			group =
-			    (struct sockaddr_in6 *)&group_source_req.gsr_group;
-			source =
-			    (struct sockaddr_in6 *)&group_source_req.gsr_source;
-			group_source_req.gsr_interface = 0;  /* any interface */
-			if (client)
-				bcopy((char *)&me6, (char *)group,
-				      sizeof(struct sockaddr_in6));
-			else
-				bcopy((char *)&peer6, (char *)group,
-				      sizeof(struct sockaddr_in6));
-			bcopy((char *)&me6, (char *)source,
-			      sizeof(struct sockaddr_in6));
-			bcopy((char *)&hi_mc6, (char *)&group->sin6_addr,
-			      HI_MC6_LEN);
-			bcopy((char *)&group->sin6_addr.s6_addr,
-			      (char *)&sinhim6[1].sin6_addr.s6_addr,
-			      sizeof(struct in6_addr));
+			if (mc_addr) {
+				struct sockaddr_in6 *user_group;
+
+				user_group =
+					(struct sockaddr_in6 *)mcres->ai_addr;
+				bcopy((char *)&(user_group->sin6_addr),
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			else if (client) {
+				bcopy((char *)&me6.sin6_addr,
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			else {
+				bcopy((char *)&peer6.sin6_addr,
+				      (char *)&sinhim6[1].sin6_addr,
+				      sizeof(struct in6_addr));
+			}
+			if (!mc_addr) {
+				bcopy((char *)&hi_mc6,
+				      (char *)&sinhim6[1].sin6_addr,
+				      HI_MC6_LEN);
+			}
 			if (setsockopt(fd[1], IPPROTO_IPV6, IPV6_MULTICAST_HOPS,
 				       (void *)&multicast,
 				       sizeof(multicast)) < 0)
 				err("setsockopt: IPV6_MULTICAST_HOPS");
 			if (brief <= 0) {
-				inet_ntop(af, &source->sin6_addr.s6_addr,
+				inet_ntop(mc_af, &me6.sin6_addr.s6_addr,
 					  multsrc, sizeof(multsrc));
-				inet_ntop(af, &group->sin6_addr.s6_addr,
+				inet_ntop(mc_af, &sinhim6[1].sin6_addr.s6_addr,
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
@@ -6182,6 +6549,11 @@ acceptnewconn:
 		    else {
 			err("unsupported AF");
 		    }
+		}
+
+		if (mcres) {
+			freeaddrinfo(mcres);
+			mcres = NULL;
 		}
 	}
 
@@ -8156,6 +8528,7 @@ cleanup:
 		format = 0;
 		traceroute = 0;
 		multicast = 0;
+		mc_addr = NULL;
 		ssm = -1;
 		skip_data = 0;
 		host3 = NULL;
