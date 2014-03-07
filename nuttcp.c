@@ -29,7 +29,7 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
- * 5.5.5, Bill Fink, 30-Jan-07
+ * 5.5.5, Bill Fink, 1-Feb-07
  *	Change default MC addr to be based on client addr instead of xmit addr
  * 5.5.4, Bill Fink, 3-Nov-06
  *	Fix bug with negative loss causing huge drop counts on interval reports
@@ -2805,13 +2805,6 @@ doit:
 				 * to the multicast group
 				 */
 				if (af == AF_INET) {
-				    struct sockaddr_in me;
-				    socklen_t melen = sizeof(me);
-				    if (getsockname(fd[0],
-				    		    (struct sockaddr *) &me, 
-						    &melen) < 0) {
-					err("getsockname");
-				    }
 				    bcopy((char *)&sinhim[1].sin_addr.s_addr,
 					(char *)&save_sinhim.sin_addr.s_addr,
 					sizeof(struct in_addr));
@@ -2819,7 +2812,7 @@ doit:
 					struct sockaddr_in peer;
 					socklen_t peerlen = sizeof(peer);
 					if (getpeername(fd[0],
-						      (struct sockaddr *) &peer, 
+						      (struct sockaddr *)&peer, 
 						      &peerlen) < 0) {
 						err("getpeername");
 					}
@@ -2828,9 +2821,16 @@ doit:
 					    sizeof(struct in_addr));
 				    }
 				    else {
+					struct sockaddr_in me;
+					socklen_t melen = sizeof(me);
+					if (getsockname(fd[0],
+				    			(struct sockaddr *)&me, 
+							&melen) < 0) {
+						err("getsockname");
+					}
 					bcopy((char *)&me.sin_addr.s_addr,
-					(char *)&sinhim[1].sin_addr.s_addr,
-					sizeof(struct in_addr));
+					    (char *)&sinhim[1].sin_addr.s_addr,
+					    sizeof(struct in_addr));
 				    }
 				    sinhim[1].sin_addr.s_addr &=
 					htonl(0xFFFFFF);
@@ -3815,14 +3815,14 @@ doit:
 			char tmphost[ADDRSTRLEN] = "\0";
 			char tmphost2[ADDRSTRLEN] = "\0";
 			socklen_t peerlen = sizeof(peer);
-			if (getpeername(fd[0], (struct sockaddr *) &peer, 
+			if (getpeername(fd[0], (struct sockaddr *)&peer, 
 					&peerlen) < 0) {
 				err("getpeername");
 			}
 			if (client && (irvers >= 50505)) {
 				struct sockaddr_in me;
 				socklen_t melen = sizeof(me);
-				if (getsockname(fd[0], (struct sockaddr *) &me, 
+				if (getsockname(fd[0], (struct sockaddr *)&me, 
 						&melen) < 0) {
 					err("getsockname");
 				}
