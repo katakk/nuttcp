@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.5
+ *	N U T T C P . C						v6.2.6
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.6, Bill Fink, 17-Apr-09
+ *	Allow setting server CPU affinity from client via "-xcs" option
+ *	Allow setting client & server CPU affinity via third party
+ *	Fix bug with option processing when reqval is set
  * 6.2.5, Bill Fink, 16-Apr-09
  *	Allow passing of third party control port via "-Pctlport/ctlport3"
  *	Up default idle data minimum to 15 sec to better handle net transients
@@ -680,7 +684,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 5;
+int vers_delta = 6;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -860,8 +864,17 @@ struct group_source_req group_source_req;  /* holds multicast SSM group and */
 int priority = 0;		/* nuttcp process priority */
 #endif
 
-#ifdef HAVE_SETAFFINITY
+/* affinity and srvr_affinity need to be defined even if don't
+ * HAVE_SETAFFINITY, to make parameter passing between client and
+ * server work out OK, since far end may HAVE_SETAFFINITY
+ *
+ * they are set to -1 so they have no effect even if don't
+ * HAVE_SETAFFINITY
+ */
 int affinity = -1;		/* nuttcp process CPU affinity */
+int srvr_affinity = -1;		/* nuttcp server process CPU affinity */
+
+#ifdef HAVE_SETAFFINITY
 int ncores = 1;			/* number of CPU cores */
 cpu_set_t cpu_set;		/* processor CPU set */
 #endif
@@ -936,7 +949,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
 #ifdef HAVE_SETAFFINITY
-"	-xc##	set nuttcp process CPU affinity\n"
+"	-xc##	set nuttcp client process CPU affinity\n"
+"	-xcs##	set nuttcp server process CPU affinity\n"
 #endif
 "	-d	set TCP SO_DEBUG option on data socket\n\
 	-v[v]	verbose [or very verbose] output\n\
@@ -963,7 +977,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
 #ifdef HAVE_SETAFFINITY
-"	-xc##	set nuttcp process CPU affinity\n"
+"	-xc##	set nuttcp server process CPU affinity\n"
 #endif
 "	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
 "		     server timeout in seconds for idle data connection\n"
@@ -1877,15 +1891,44 @@ main( int argc, char **argv )
 #endif
 #ifdef HAVE_SETAFFINITY
 			else if (argv[0][2] == 'c') {
-				affinity = atoi(getoptvalp(argv, 3, reqval,
-						&skiparg));
-				if ((affinity < 0) ||
-				    (affinity >= CPU_SETSIZE)) {
-					fprintf(stderr,
-						"invalid affinity = %d\n",
-						affinity);
-					fflush(stderr);
-					exit(1);
+				reqval = 1;
+				if (argv[0][3] == 's') {
+					cp1 = getoptvalp(argv, 4, reqval,
+							 &skiparg);
+					srvr_affinity = atoi(cp1);
+					if (srvr_affinity < 0) {
+						fprintf(stderr,
+							"invalid srvr_affinity "
+							"= %d\n",
+							srvr_affinity);
+						fflush(stderr);
+						exit(1);
+					}
+				}
+				else {
+					cp1 = getoptvalp(argv, 3, reqval,
+							 &skiparg);
+					affinity = atoi(cp1);
+					if ((affinity < 0) ||
+					    (affinity >= CPU_SETSIZE)) {
+						fprintf(stderr,
+							"invalid affinity "
+							"= %d\n", affinity);
+						fflush(stderr);
+						exit(1);
+					}
+					if ((cp2 = strchr(cp1, '/'))) {
+						srvr_affinity = atoi(cp2 + 1);
+						if (srvr_affinity < 0) {
+							fprintf(stderr,
+								"invalid "
+								"srvr_affinity "
+								"= %d\n",
+								srvr_affinity);
+							fflush(stderr);
+							exit(1);
+						}
+					}
 				}
 			}
 #endif
@@ -2363,7 +2406,7 @@ main( int argc, char **argv )
 #endif
 
 #ifdef HAVE_SETAFFINITY
-	if (affinity >= 0) {
+	if ((affinity >= 0) && !host3) {
 		if ((ncores = sysconf(_SC_NPROCESSORS_CONF)) <= 0)
 			err("sysconf: couldn't get _SC_NPROCESSORS_CONF");
 		CPU_ZERO(&cpu_set);
@@ -2851,6 +2894,33 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 60206) {
+					if (host3) {
+						fprintf(ctlconn,
+							" , affinity = %d",
+							affinity);
+						fprintf(ctlconn,
+							" , srvr_affinity = %d",
+							srvr_affinity);
+					}
+					else {
+						fprintf(ctlconn,
+							" , affinity = %d",
+							srvr_affinity);
+					}
+				}
+				else {
+					if (srvr_affinity >= 0) {
+						fprintf(stdout, "nuttcp%s%s: affinity option not supported by server version %d.%d.%d, need >= 6.2.6\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						srvr_affinity = -1;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -3068,6 +3138,25 @@ doit:
 					rate_pps = 0;
 					nodelay = 0;
 				}
+				if (irvers >= 60206) {
+					if (host3) {
+						sscanf(strstr(buf,
+							   ", affinity =") + 13,
+						       "%X", &affinity);
+						sscanf(strstr(buf,
+							   ", srvr_affinity =")
+								+ 18,
+						       "%X", &srvr_affinity);
+					}
+					else {
+						sscanf(strstr(buf,
+							   ", affinity =") + 13,
+						       "%X", &srvr_affinity);
+					}
+				}
+				else {
+					srvr_affinity = -1;
+				}
 				trans = !trans;
 				if (inetd && !sinkmode) {
 					fputs("KO\n", stdout);
@@ -3223,6 +3312,33 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
+				if ((srvr_affinity >= 0) && !host3) {
+#ifdef HAVE_SETAFFINITY
+					CPU_ZERO(&cpu_set);
+					CPU_SET(srvr_affinity, &cpu_set);
+					if (sched_setaffinity(0,
+							      sizeof(cpu_set_t),
+							      &cpu_set) != 0) {
+						fputs("KO\n", stdout);
+						mes("couldn't change server "
+						    "CPU affinity");
+						fprintf(stdout,
+							"srvr_affinity = %d\n",
+							srvr_affinity);
+						fputs("KO\n", stdout);
+						goto cleanup;
+					}
+#else
+					fputs("KO\n", stdout);
+					mes("server doesn't support setting "
+					    "CPU affinity");
+					fprintf(stdout,
+						"srvr_affinity = %d\n",
+						srvr_affinity);
+					fputs("KO\n", stdout);
+					goto cleanup;
+#endif
+				}
 				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
 						vers_minor, vers_delta);
 				fflush(stdout);
@@ -3367,7 +3483,7 @@ doit:
 			}
 #endif
 #ifdef HAVE_SETAFFINITY
-			if ((affinity >= 0) && (brief <= 0)) {
+			if ((affinity >= 0) && (brief <= 0) && !host3) {
 				int cpu_affinity;
 
 				errno = 0;
@@ -4193,6 +4309,14 @@ acceptnewconn:
 					sprintf(tmpargs[j], "-P%hu", ctlport);
 					cmdargs[i++] = tmpargs[j++];
 				}
+			}
+			if (affinity >= 0) {
+				sprintf(tmpargs[j], "-xc%dt", affinity);
+				cmdargs[i++] = tmpargs[j++];
+			}
+			if (srvr_affinity >= 0) {
+				sprintf(tmpargs[j], "-xcs%dt", srvr_affinity);
+				cmdargs[i++] = tmpargs[j++];
 			}
 			if (irvers < 50302) {
 				if ((udp && !multicast
@@ -6529,9 +6653,10 @@ getoptvalp( char **argv, int index, int reqval, int *skiparg )
 	if (*nextarg == NULL)
 		return(&argv[0][index]);
 
-	/* if the next arg is another option, return a pointer to the
-	   current arg value (which will be an empty string) */
-	if (**nextarg == '-')
+	/* if the next arg is another option, and a value isn't
+	 * required, return a pointer to the current arg value
+	 * (which will be an empty string) */
+	if ((**nextarg == '-') && !reqval)
 		return(&argv[0][index]);
 
 	/* if there is an arg after the next arg and it is another
