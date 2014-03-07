@@ -1,8 +1,8 @@
 /*
- *	N U T T C P . C						v6.0.6
+ *	N U T T C P . C						v6.0.7
  *
- * Copyright(c) 2000 - 2006 Bill Fink.  All rights reserved.
- * Copyright(c) 2003 - 2006 Rob Scott.  All rights reserved.
+ * Copyright(c) 2000 - 2008 Bill Fink.  All rights reserved.
+ * Copyright(c) 2003 - 2008 Rob Scott.  All rights reserved.
  *
  * nuttcp is free, opensource software.  You can redistribute it and/or
  * modify it under the terms of Version 2 of the GNU General Public
@@ -29,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.0.7, Bill Fink, 19-Aug-08
+ *	Add delay (default 0.5 sec) to "-a" option & change max retries to 10
+ *	Updated Copyright notice
  * 6.0.6, Bill Fink, 11-Aug-08
  *	Delay server forking until after listen() for better error status
  *	Above suggested by Hans Blom (jblom@science.uva.nl)
@@ -550,7 +553,10 @@ static struct	sigaction savesigact;
 #define HI_MC			231ul
 #define ACCEPT_TIMEOUT		5
 #ifndef MAX_CONNECT_TRIES
-#define MAX_CONNECT_TRIES	5	/* maximum server connect attempts */
+#define MAX_CONNECT_TRIES	10	/* maximum server connect attempts */
+#endif
+#ifndef SERVER_RETRY_USEC
+#define SERVER_RETRY_USEC	500000	/* server retry time in usec */
 #endif
 #define IDLE_DATA_MIN		5.0	/* minimum value for chk_idle_data */
 #define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
@@ -606,7 +612,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 0;
-int vers_delta = 6;
+int vers_delta = 7;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -3319,6 +3325,7 @@ doit:
 					/* retry control connection to
 					 * server for certain possibly
 					 * transient errors */
+					usleep(SERVER_RETRY_USEC);
 					goto doit;
 				}
 				if (!trans && (stream_idx == 0))
