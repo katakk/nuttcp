@@ -1,8 +1,8 @@
 /*
- *	N U T T C P . C						v7.1.1
+ *	N U T T C P . C						v7.1.2
  *
- * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
- * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
+ * Copyright(c) 2000 - 2010 Bill Fink.  All rights reserved.
+ * Copyright(c) 2003 - 2010 Rob Scott.  All rights reserved.
  *
  * nuttcp is free, opensource software.  You can redistribute it and/or
  * modify it under the terms of Version 2 of the GNU General Public
@@ -29,6 +29,17 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 7.1.2, Bill Fink, 23-Jan-10
+ *	Updated Copyright notice
+ *	Terminate non-sinkmode after specified file size with "-n" option
+ *	Allow multilink aggregation with "-N##m" option to work for receive
+ *	Add "-sz" zero copy option for non-sinkmode when input is a regular file
+ *	Fix compiler warnings about strict-aliasing rules for variable group
+ *	Remove "-Sf" forced server mode from Usage: statement
+ *	Fix zeroing of clientaddr6 during server cleanup
+ *	Fix freeaddrinfo() processing during cleanup
+ *	Change manually started oneshot server to have parent process just exit
+ *	Some minor whitespace cleanup
  * 7.1.1, Bill Fink, 24-Dec-09
  *	Provide summary TCP retrans info for multi-stream TCP
  *	Fix bug with retrans interval info when -fparse
@@ -453,6 +464,8 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #endif
 */
 
+#define _FILE_OFFSET_BITS	64
+
 #include <stdio.h>
 #include <signal.h>
 #include <ctype.h>
@@ -475,6 +488,11 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <limits.h>
 #include <string.h>
 #include <fcntl.h>
+
+#if defined(linux)
+#include <sys/stat.h>
+#include <sys/sendfile.h>
+#endif
 
 /* Let's try changing the previous unwieldy check */
 /* #if defined(linux) || defined(__FreeBSD__) || defined (sgi) || (defined(__MACH__) && defined(_SOCKLEN_T)) || defined(sparc) || defined(__CYGWIN__) */
@@ -551,6 +569,12 @@ typedef int socklen_t;
 
 #define BETA_STR	"-beta8"
 #define BETA_FEATURES	"jitter/owd"
+
+union sockaddr_union {
+	struct sockaddr_storage	ss;
+	struct sockaddr_in	sin;
+	struct sockaddr_in6	sin6;
+};
 
 static struct timeval time0;	/* Time at which timing started */
 static struct timeval timepk;	/* Time at which last packet sent */
@@ -781,7 +805,7 @@ void print_tcpinfo();
 
 int vers_major = 7;
 int vers_minor = 1;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -919,8 +943,12 @@ int v4mapped = 0;		/* set to 1 to enable v4 mapping in v6 server */
 char hostbuf[ADDRSTRLEN];	/* buffer to hold text of address */
 char host3addr[ADDRSTRLEN];	/* buffer to hold text of 3rd party address */
 char host3buf[HOST3BUFLEN + 1];	/* buffer to hold 3rd party name or address */
+char clientbuf[NI_MAXHOST];	/* buffer to hold client's resolved hostname */
 int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
+#if defined(linux)
+int zerocopy = 0;		/* set to enable zero copy via sendfile() */
+#endif
 int nofork = 0;			/* set to 1 to not fork server */
 int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 				 * resource usage. */
@@ -1038,9 +1066,14 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	-6	Use IPv6\n"
 #endif
 "	-c##	cos dscp value on data streams (t|T suffix for full TOS field)\n\
-	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n\
-	-s	use stdin|stdout for data input|output instead of pattern data\n\
-	-n##	number of source bufs written to network (default unlimited)\n\
+	-l##	length of network write|read buf (default 1K|8K/udp, 64K/tcp)\n"
+#if defined(linux)
+"	-s[z]	use stdin|stdout for data input|output instead of pattern data\n"
+"		('z' suboption enables zero copy tx if input is regular file)\n"
+#else
+"	-s	use stdin|stdout for data input|output instead of pattern data\n"
+#endif
+"	-n##	number of source bufs written to network (default unlimited)\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
 	-ws##	server receive|transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
@@ -1082,15 +1115,21 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
 #endif
 "\n\
-Usage (server): nuttcp -S[f][P] [-options]\n\
-		note server mode excludes use of -s\n\
+Usage (server): nuttcp -S[P] [-options]\n\
+		note server mode excludes use of -s except for -1 one-shot mode\n\
 		'P' suboption makes 3rd party {in,out}bound control ports same\n\
 	-4	Use IPv4 (default)\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
 #endif
-"	-1	oneshot server mode (implied with inetd/xinetd), implies -S\n\
-	-P##	port number for server connection (default 5000)\n\
+"	-1	oneshot server mode (implied with inetd/xinetd), implies -S\n"
+#if defined(linux)
+"	-s[z]	use stdin|stdout for data input|output instead of pattern data\n"
+"		('z' suboption enables zero copy tx if input is regular file)\n"
+#else
+"	-s	use stdin|stdout for data input|output instead of pattern data\n"
+#endif
+"	-P##	port number for server connection (default 5000)\n\
 		note don't use with inetd/xinetd (use services file instead)\n"
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
@@ -1112,7 +1151,7 @@ Multilink aggregation options (TCP only):\n\
          nuttcp [-options] -N##  [ctl_addr]/host1/host2/.../host## (xmit only)\n\
          nuttcp [-options] -N##  [ctl_addr/]host+addr_stride (IPv4 only)\n\
          nuttcp [-options] -N##  [ctl_addr/]host+n.n.n.n (IPv4 only)\n\
-         nuttcp [-options] -N##m [ctl_addr/]host (xmit only)\n\
+         nuttcp [-options] -N##m [ctl_addr/]host\n\
                                  where host resolves to multiple addresses\n\
 \n\
                         separate [ctl_addr/] option available only for xmit\n\
@@ -1646,6 +1685,7 @@ main( int argc, char **argv )
 	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL }, *host3res;
+	union sockaddr_union client_ipaddr;
 	struct sockaddr_storage dummy;
 	struct timeval time_eod;	/* time EOD packet was received */
 	struct timeval time_eod0;	/* time EOD0 packet was received */
@@ -1680,7 +1720,7 @@ main( int argc, char **argv )
 
 	nut_cmd = argv[0];
 	argv++; argc--;
-	while( argc>0 && argv[0][0] == '-' )  {
+	while ( argc>0 && argv[0][0] == '-' )  {
 		skiparg = 0;
 		switch (argv[0][1]) {
 
@@ -1841,6 +1881,10 @@ main( int argc, char **argv )
 			break;
 		case 's':
 			sinkmode = 0;	/* sink/source data */
+#if defined(linux)
+			if (argv[0][2] == 'z')
+				zerocopy = 1;
+#endif
 			break;
 		case 'p':
 			reqval = 1;
@@ -2832,6 +2876,8 @@ main( int argc, char **argv )
 #endif
 			{
 				clientaddr = peer.sin_addr;
+				client_ipaddr.ss.ss_family = AF_INET;
+				client_ipaddr.sin.sin_addr = clientaddr;
 				inetd = 1;
 				oneshot = 1;
 				start_idx = 1;
@@ -2847,6 +2893,8 @@ main( int argc, char **argv )
 			    (peer.sin6_family == AF_INET6)) {
 				clientaddr6 = peer.sin6_addr;
 				clientscope6 = peer.sin6_scope_id;
+				client_ipaddr.ss.ss_family = AF_INET6;
+				client_ipaddr.sin6.sin6_addr = clientaddr6;
 				inetd = 1;
 				oneshot = 1;
 				start_idx = 1;
@@ -4131,6 +4179,45 @@ doit:
 		    host = hostbuf;
 		}
 
+		if (multilink && !client &&
+		    ((trans && !reverse) || (!trans && reverse)) &&
+		    !udp && (stream_idx == 1)) {
+			nameinfo_flags = NI_NAMEREQD;
+			if (getnameinfo((struct sockaddr *)&client_ipaddr,
+						sizeof(struct in6_addr),
+						clientbuf, NI_MAXHOST,
+						NULL, 0,
+						nameinfo_flags) == 0) {
+				bzero(&hints, sizeof(hints));
+				res[0] = NULL;
+				res[1] = NULL;
+				hints.ai_family = af;
+				if (udp)
+					hints.ai_socktype = SOCK_DGRAM;
+				else
+					hints.ai_socktype = SOCK_STREAM;
+				if (getaddrinfo(clientbuf, NULL, &hints,
+						&res[1]) == 0) {
+					for ( i = 2; i <= nstream; i++ ) {
+						if (res[i - 1]->ai_next)
+							res[i] =
+							    res[i - 1]->ai_next;
+						else
+							res[i] = res[1];
+					}
+				}
+				else {
+					if (res[1]) {
+						freeaddrinfo(res[1]);
+						res[1] = NULL;
+					}
+					multilink = 0;
+				}
+			}
+			else
+				multilink = 0;
+		}
+
 		if ((stream_idx > 0) && skip_data) {
 			if (clientserver && !client && (stream_idx == 1)) {
 				/* send server "OK" message */
@@ -4187,12 +4274,21 @@ doit:
 						+ ipad_stride.ip32;
 				}
 				else {
-					sinhim[stream_idx].sin_addr =
-						clientaddr;
+					if (multilink && (stream_idx > 0))
+						sinhim[stream_idx].sin_addr =
+							((struct sockaddr_in *)res[stream_idx]->ai_addr)->sin_addr;
+					else
+						sinhim[stream_idx].sin_addr =
+							clientaddr;
 				}
 #ifdef AF_INET6
 				sinhim6[stream_idx].sin6_family = af;
-				sinhim6[stream_idx].sin6_addr = clientaddr6;
+				if (multilink && (stream_idx > 0))
+					sinhim6[stream_idx].sin6_addr =
+						((struct sockaddr_in6 *)res[stream_idx]->ai_addr)->sin6_addr;
+				else
+					sinhim6[stream_idx].sin6_addr =
+						clientaddr6;
 				sinhim6[stream_idx].sin6_scope_id = clientscope6;
 #endif
 			}
@@ -4881,7 +4977,7 @@ acceptnewconn:
 					close(nfd);
 					stream_idx = 0;
 					if (oneshot)
-						goto cleanup;
+						exit(0);
 					goto acceptnewconn;
 				}
 				/* child just makes a grandchild and then
@@ -4948,7 +5044,11 @@ acceptnewconn:
 				}
 				fprintf(stdout, "\n");
 			    }
-			    if (stream_idx == 0) clientaddr = peer.sin_addr;
+			    if (stream_idx == 0) {
+				clientaddr = peer.sin_addr;
+				client_ipaddr.ss.ss_family = AF_INET;
+				client_ipaddr.sin.sin_addr = clientaddr;
+			    }
 			}
 #ifdef AF_INET6
 			else if (af == AF_INET6) {
@@ -4987,6 +5087,8 @@ acceptnewconn:
 			    if (stream_idx == 0) {
 				clientaddr6 = peer.sin6_addr;
 				clientscope6 = peer.sin6_scope_id;
+				client_ipaddr.ss.ss_family = AF_INET6;
+				client_ipaddr.sin6.sin6_addr = clientaddr6;
 			    }
 			}
 #endif
@@ -5683,12 +5785,12 @@ acceptnewconn:
 #ifdef MCAST_JOIN_SOURCE_GROUP
 		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
 			/* multicast receiver joins the mc source group */
+			union sockaddr_union group_ipaddr;
 			struct sockaddr_in *group;
 			struct sockaddr_in *source;
-			group =
-			    (struct sockaddr_in*)&group_source_req.gsr_group;
+			group = &group_ipaddr.sin;
 			source =
-			    (struct sockaddr_in*)&group_source_req.gsr_source;
+			    (struct sockaddr_in *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
 			if (client)
 				bcopy((char *)&me, (char *)group,
@@ -5700,6 +5802,7 @@ acceptnewconn:
 			      sizeof(struct sockaddr_in));
 			group->sin_addr.s_addr &= htonl(0xFFFFFF);
 			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
+			group_source_req.gsr_group = group_ipaddr.ss;
 			if (setsockopt(fd[1], IPPROTO_IP,
 				       MCAST_JOIN_SOURCE_GROUP,
 				       &group_source_req,
@@ -5732,9 +5835,9 @@ acceptnewconn:
 			struct sockaddr_in6 *group;
 			struct sockaddr_in6 *source;
 			group =
-			    (struct sockaddr_in6*)&group_source_req.gsr_group;
+			    (struct sockaddr_in6 *)&group_source_req.gsr_group;
 			source =
-			    (struct sockaddr_in6*)&group_source_req.gsr_source;
+			    (struct sockaddr_in6 *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
 			if (client)
 				bcopy((char *)&me6, (char *)group,
@@ -5877,12 +5980,12 @@ acceptnewconn:
 #ifdef MCAST_JOIN_SOURCE_GROUP
 		    else if ((af == AF_INET) && ssm) { /* IPv4 SSM */
 			/* The multicast transmitter just sends to mc group */
+			union sockaddr_union group_ipaddr;
 			struct sockaddr_in *group;
 			struct sockaddr_in *source;
-			group =
-			    (struct sockaddr_in*)&group_source_req.gsr_group;
+			group = &group_ipaddr.sin;
 			source =
-			    (struct sockaddr_in*)&group_source_req.gsr_source;
+			    (struct sockaddr_in *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
 			if (client)
 				bcopy((char *)&me, (char *)group,
@@ -5894,6 +5997,7 @@ acceptnewconn:
 			      sizeof(struct sockaddr_in));
 			group->sin_addr.s_addr &= htonl(0xFFFFFF);
 			group->sin_addr.s_addr |= htonl(HI_MC_SSM << 24);
+			group_source_req.gsr_group = group_ipaddr.ss;
 			bcopy((char *)&group->sin_addr.s_addr,
 			      (char *)&sinhim[1].sin_addr.s_addr,
 			      sizeof(struct in_addr));
@@ -5928,9 +6032,9 @@ acceptnewconn:
 			struct sockaddr_in6 *group;
 			struct sockaddr_in6 *source;
 			group =
-			    (struct sockaddr_in6*)&group_source_req.gsr_group;
+			    (struct sockaddr_in6 *)&group_source_req.gsr_group;
 			source =
-			    (struct sockaddr_in6*)&group_source_req.gsr_source;
+			    (struct sockaddr_in6 *)&group_source_req.gsr_source;
 			group_source_req.gsr_interface = 0;  /* any interface */
 			if (client)
 				bcopy((char *)&me6, (char *)group,
@@ -6683,15 +6787,42 @@ acceptnewconn:
 	} else {
 		register int cnt;
 		if (trans)  {
-			while((cnt=read(savestdin,buf,buflen)) > 0 &&
-			    Nwrite(fd[stream_idx + 1],buf,cnt) == cnt) {
-				nbytes += cnt;
-				cnt = 0;
-				stream_idx++;
-				stream_idx = stream_idx % nstream;
+#if defined(linux)
+			struct stat instat;
+
+			if (fstat(savestdin, &instat) == 0) {
+				if (!S_ISREG(instat.st_mode))
+					zerocopy = 0;
+			}
+			else
+				zerocopy = 0;
+
+			if (zerocopy) {
+				while (nbuf-- &&
+				       ((cnt=sendfile(fd[stream_idx + 1],
+						      savestdin,
+						      (off_t *)&nbytes,
+						      buflen)) > 0)) {
+					cnt = 0;
+					stream_idx++;
+					stream_idx = stream_idx % nstream;
+				}
+			}
+			else
+#endif
+			{
+				while (nbuf-- &&
+				       ((cnt=read(savestdin,buf,buflen)) > 0) &&
+				       (Nwrite(fd[stream_idx + 1],buf,cnt)
+						== cnt)) {
+					nbytes += cnt;
+					cnt = 0;
+					stream_idx++;
+					stream_idx = stream_idx % nstream;
+				}
 			}
 		}  else  {
-			while((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
+			while ((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0 &&
 			    write(savestdout,buf,cnt) == cnt) {
 				nbytes += cnt;
 				cnt = 0;
@@ -7799,6 +7930,13 @@ cleanup:
 		for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 			fd[stream_idx] = -1;
 		}
+		if (multilink &&
+		    ((trans && !reverse) || (!trans && reverse)) && !udp) {
+			for ( stream_idx = 2; stream_idx <= nstream;
+			      stream_idx++ ) {
+				res[stream_idx] = NULL;
+			}
+		}
 		itimer.it_value.tv_sec = 0;
 		itimer.it_value.tv_usec = 0;
 		itimer.it_interval.tv_sec = 0;
@@ -7808,7 +7946,7 @@ cleanup:
 		bzero((char *)&frominet, sizeof(frominet));
 		bzero((char *)&clientaddr, sizeof(clientaddr));
 #ifdef AF_INET6
-		bzero((char *)&clientaddr6, sizeof(clientaddr));
+		bzero((char *)&clientaddr6, sizeof(clientaddr6));
 		clientscope6 = 0;
 #endif
 		cput = 0.000001;
@@ -7877,8 +8015,7 @@ cleanup:
 		two_bod = 0;
 		handle_urg = 0;
 		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
-			if (res[stream_idx] &&
-			    !(multilink && (stream_idx > 1))) {
+			if (res[stream_idx]) {
 				freeaddrinfo(res[stream_idx]);
 				res[stream_idx] = NULL;
 			}
@@ -7889,10 +8026,16 @@ cleanup:
 		multilink = 0;
 		if (!oneshot)
 			goto doit;
+		exit(0);
 	}
 
+	if (multilink) {
+		for ( stream_idx = 2; stream_idx <= nstream; stream_idx++ ) {
+			res[stream_idx] = NULL;
+		}
+	}
 	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ ) {
-		if (res[stream_idx] && !(multilink && (stream_idx > 1))) {
+		if (res[stream_idx]) {
 			freeaddrinfo(res[stream_idx]);
 			res[stream_idx] = NULL;
 		}
@@ -7958,8 +8101,8 @@ pattern( register char *cp, register int cnt )
 {
 	register char c;
 	c = 0;
-	while( cnt-- > 0 )  {
-		while( !isprint((c&0x7F)) )  c++;
+	while ( cnt-- > 0 )  {
+		while ( !isprint((c&0x7F)) )  c++;
 		*cp++ = (c++&0x7F);
 	}
 }
@@ -8024,7 +8167,7 @@ prusage( register struct rusage *r0, register struct rusage *r1, struct timeval 
 	    (r1->ru_stime.tv_usec-r0->ru_stime.tv_usec)/10000;
 	ms =  (e->tv_sec-b->tv_sec)*100 + (e->tv_usec-b->tv_usec)/10000;
 
-#define END(x)	{while(*x) x++;}
+#define END(x)	{ while (*x) x++; }
 
 	if (format & PARSE)
 		cp = "user=%U system=%S elapsed=%E cpu=%P memory=%Xi+%Dd-%Mmaxrss io=%F+%Rpf swaps=%Ccsw";
@@ -8340,7 +8483,7 @@ mread( int fd, register char *bufp, unsigned n )
 			return((int)count);
 		count += (unsigned)nread;
 		bufp += nread;
-	 } while(count < n);
+	 } while (count < n);
 
 	return((int)count);
 }
