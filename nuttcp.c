@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.3.1
+ *	N U T T C P . C						v5.3.2
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.3.2, Bill Fink, 09-Jun-06
+ *	Fix bug with default UDP buflen for 3rd party
+ *	Fix compiler warnings with -Wall on FreeBSD
+ *	Give warning that windows doesn't support TCP_MAXSEG
  * V5.3.1, Rob Scott, 06-Jun-06
  *	Add "-c" COS option for setting DSCP/TOS setting
  *	Fix builds on latest MacOS X
@@ -297,7 +301,11 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #include <string.h>
 #include <fcntl.h>
 
-#if defined(linux) || defined (sgi) || (defined(__MACH__) && defined(_SOCKLEN_T)) || defined(sparc) || defined(__CYGWIN__)
+/* Let's try changing the previous unwieldy check */
+/* #if defined(linux) || defined(__FreeBSD__) || defined (sgi) || (defined(__MACH__) && defined(_SOCKLEN_T)) || defined(sparc) || defined(__CYGWIN__) */
+/* to the following (hopefully equivalent) simpler form like we use
+ * for HAVE_POLL */
+#if !defined(_WIN32) && (!defined(__MACH__) || defined(_SOCKLEN_T))
 #include <unistd.h>
 #include <sys/wait.h>
 #include <strings.h>
@@ -331,23 +339,19 @@ static char RCSid[] = "@(#)$Revision: 1.2 $ (BRL)";
 #endif
 
 /*
+ * _SOCKLEN_T is now defined by apple when they typedef socklen_t
+ *
  * EAI_NONAME has nothing to do with socklen, but on sparc without it tells
  * us it's an old enough solaris to need the typedef
- */
-
-/*
- * _SOCKLEN_T is now defined by apple when they typedef socklen_t
  */
 #if (defined(__APPLE__) && defined(__MACH__)) && !defined(_SOCKLEN_T) || (defined(sparc) && !defined(EAI_NONAME))
 typedef int socklen_t;
 #endif
 
-#if defined(sparc)
-#if !defined(EAI_NONAME) /* old sparc */
+#if defined(sparc) && !defined(EAI_NONAME) /* old sparc */
 #define sockaddr_storage sockaddr
 #define ss_family sa_family
 #endif /* old sparc */
-#endif /* sparc */
 
 #if defined(_AIX)
 #define ss_family __ss_family
@@ -468,7 +472,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 3;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -1749,34 +1753,6 @@ doit:
 	for ( stream_idx = start_idx; stream_idx <= nstream; stream_idx++ ) {
 		if (clientserver && (stream_idx == 1)) {
 			if (client) {
-				if (udp) {
-					optlen = sizeof(ctlconnmss);
-					if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
-						err("get ctlconn maximum segment size didn't work\n");
-					if (format & DEBUGMTU)
-						fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
-					if (buflenopt) {
-						if (buflen > ctlconnmss) {
-							if (format & PARSE)
-								fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
-							else
-								fprintf(stderr, "nuttcp%s%s: Warning: IP frags or no data reception since buflen=%d > ctlconnmss=%d\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
-							fflush(stderr);
-						}
-					}
-					else {
-						while (buflen > ctlconnmss) {
-							buflen >>= 1;
-							if (nbuf_bytes)
-								nbuf <<= 1;
-							if ((rate != MAXRATE) &&
-							    rate_pps)
-								rate >>= 1;
-						}
-					}
-					if (format & DEBUGMTU)
-						fprintf(stderr, "buflen = %d\n", buflen);
-				}
 				if (!(ctlconn = fdopen(fd[0], "w")))
 					err("fdopen: ctlconn for writing");
 				close(0);
@@ -1812,6 +1788,8 @@ doit:
 							+ rvers_minor*100
 							+ rvers_delta;
 				}
+				if (host3 && !buflenopt && (irvers >= 50302))
+					buflen = 0;
 				fprintf(ctlconn, "buflen = %d, nbuf = %llu, win = %d, nstream = %d, rate = %lu, port = %hu, trans = %d, braindead = %d", buflen, nbuf, srvrwin, nstream, rate, port, trans, braindead);
 				if (irvers >= 30200)
 					fprintf(ctlconn, ", timeout = %f", timeout);
@@ -2142,22 +2120,23 @@ doit:
 					tos = 0;
 				}
 				trans = !trans;
-				if (nbuflen != buflen) {
-					buflen = nbuflen;
-					if (buflen < 1) {
+				if (!traceroute && !host3 &&
+				    (nbuflen != buflen)) {
+					if (nbuflen < 1) {
 						fputs("KO\n", stdout);
 						mes("invalid buflen");
-						fprintf(stdout, "buflen = %d\n", buflen);
+						fprintf(stdout, "buflen = %d\n", nbuflen);
 						fputs("KO\n", stdout);
 						goto cleanup;
 					}
 					free(buf);
-					mallocsize = buflen;
+					mallocsize = nbuflen;
 					if (mallocsize < MINMALLOC) mallocsize = MINMALLOC;
 					if( (buf = (char *)malloc(mallocsize)) == (char *)NULL)
 						err("malloc");
-					pattern( buf, buflen );
+					pattern( buf, nbuflen );
 				}
+				buflen = nbuflen;
 				if (nbuf < 1) {
 					fputs("KO\n", stdout);
 					mes("invalid nbuf");
@@ -2269,6 +2248,35 @@ doit:
 
 		if ((stream_idx > 0) && skip_data)
 			break;
+
+		if (clientserver && client && udp && (stream_idx == 1)) {
+			optlen = sizeof(ctlconnmss);
+			if (getsockopt(fd[0], IPPROTO_TCP, TCP_MAXSEG,  (void *)&ctlconnmss, &optlen) < 0)
+				err("get ctlconn maximum segment size didn't work\n");
+			if (format & DEBUGMTU)
+				fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
+			if (buflenopt) {
+				if (buflen > ctlconnmss) {
+					if (format & PARSE)
+						fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+					else
+						fprintf(stderr, "nuttcp%s%s: Warning: IP frags or no data reception since buflen=%d > ctlconnmss=%d\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
+					fflush(stderr);
+				}
+			}
+			else {
+				while (buflen > ctlconnmss) {
+					buflen >>= 1;
+					if (nbuf_bytes)
+						nbuf <<= 1;
+					if ((rate != MAXRATE) &&
+					    rate_pps)
+						rate >>= 1;
+				}
+			}
+			if (format & DEBUGMTU)
+				fprintf(stderr, "buflen = %d\n", buflen);
+		}
 
 		bzero((char *)&sinme[stream_idx], sizeof(sinme[stream_idx]));
 		bzero((char *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
@@ -2590,6 +2598,15 @@ doit:
 			}
 			usleep(20000);
 			if (trans && (stream_idx > 0) && datamss) {
+#if defined(__CYGWIN__) || defined(_WIN32)
+				if (format & PARSE)
+					fprintf(stderr, "nuttcp%s%s: Warning=\"setting_maximum_segment_size_not_supported_on_windows\"\n",
+						trans?"-t":"-r", ident);
+				else
+					fprintf(stderr, "nuttcp%s%s: Warning: setting maximum segment size not supported on windows\n",
+						trans?"-t":"-r", ident);
+				fflush(stderr);
+#endif
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
@@ -2737,6 +2754,15 @@ doit:
 			 * (unless reversed by the flip option)
 			 */
 			if (trans && (stream_idx > 0) && datamss) {
+#if defined(__CYGWIN__) || defined(_WIN32)
+				if (format & PARSE)
+					fprintf(stderr, "nuttcp%s%s: Warning=\"setting_maximum_segment_size_not_supported_on_windows\"\n",
+						trans?"-t":"-r", ident);
+				else
+					fprintf(stderr, "nuttcp%s%s: Warning: setting maximum segment size not supported on windows\n",
+						trans?"-t":"-r", ident);
+				fflush(stderr);
+#endif
 				optlen = sizeof(datamss);
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
@@ -3031,11 +3057,17 @@ doit:
 				sprintf(tmpargs[j], "-P%hu", ctlport);
 				cmdargs[i++] = tmpargs[j++];
 			}
-			if ((udp && !multicast
-				 && (buflen != DEFAULTUDPBUFLEN)) ||
-			    (udp && multicast
-				 && (buflen != DEFAULT_MC_UDPBUFLEN)) ||
-			    (!udp && (buflen != 65536))) {
+			if (irvers < 50302) {
+				if ((udp && !multicast
+					 && (buflen != DEFAULTUDPBUFLEN)) ||
+				    (udp && multicast
+					 && (buflen != DEFAULT_MC_UDPBUFLEN)) ||
+				    (!udp && (buflen != 65536))) {
+					sprintf(tmpargs[j], "-l%d", buflen);
+					cmdargs[i++] = tmpargs[j++];
+				}
+			}
+			else if (buflen) {
 				sprintf(tmpargs[j], "-l%d", buflen);
 				cmdargs[i++] = tmpargs[j++];
 			}
