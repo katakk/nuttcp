@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.10
+ *	N U T T C P . C						v7.0.1
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,7 +29,11 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
- * 6.2.10, Bill Fink, 3-Aug-09
+ * 7.0.1, Bill Fink, 18-Sep-09
+ *	Enable jitter measurements with "-j" option
+ *	Enable one-way delay measurements with "-o" option
+ *	Fix bug with RTT and -fparse
+ * 6.2.10, Bill Fink, 1-Aug-09
  *	Change ctl/data port checks to < 1024 instead of < 5000
  *	Fix "--idle-data-timeout" Usage: statement for new default minimum
  *	Improve transmit performance with "-i" by setting poll() timeout to 0
@@ -415,8 +419,6 @@
  *	Forking for multiple streams
  *	Bidirectional option
  *	Graphical interface
- *	OWD info
- *	Jitter info
  *	MTU info
  *	Warning for window size limiting throughput
  *	Auto window size optimization
@@ -538,13 +540,17 @@ typedef int socklen_t;
 #include "addrinfo.h"			/* from missing */
 #endif
 
-#define BETA_STR	"-beta"
-#define BETA_FEATURES	"retrans"
+#define BETA_STR	"-beta8"
+#define BETA_FEATURES	"jitter/owd"
 
-static struct	timeval time0;	/* Time at which timing started */
-static struct	timeval timepk;	/* Time at which last packet sent */
-static struct	timeval timep;	/* Previous time - for interval reporting */
-static struct	rusage ru0;	/* Resource utilization at the start */
+static struct timeval time0;	/* Time at which timing started */
+static struct timeval timepk;	/* Time at which last packet sent */
+static struct timeval timepkr;	/* Time at which last packet received */
+static struct timeval timepkri;	/* timepkr for interval reports */
+static struct timeval timep;	/* Previous time - for interval reporting */
+static struct timeval timetx;	/* Transmitter timestamp */
+static struct timeval timerx;	/* Receive timestamp */
+static struct rusage ru0;	/* Resource utilization at the start */
 
 static struct	sigaction sigact;	/* signal handler for alarm */
 static struct	sigaction savesigact;
@@ -571,6 +577,32 @@ static struct	sigaction savesigact;
 #define DROP_FMT	" %lld / %lld drop/pkt"
 #define DROP_FMT_BRIEF	" %lld / %lld drop/pkt"
 #define DROP_FMT_INTERVAL " %5lld / %5lld ~drop/pkt"
+#define JITTER_MIN		1
+#define JITTER_AVG		2
+#define JITTER_MAX		4
+#define JITTER_IGNORE_OOO	8
+#define JITTER_FMT	"min-jitter = %.4f ms, avg-jitter = %.4f ms, " \
+			"max-jitter = %.4f ms"
+#define JITTER_MIN_FMT_BRIEF " %.4f msMinJitter"
+#define JITTER_AVG_FMT_BRIEF " %.4f msAvgJitter"
+#define JITTER_MAX_FMT_BRIEF " %.4f msMaxJitter"
+#define JITTER_MIN_FMT_INTERVAL " %.4f msMinJitter"
+#define JITTER_AVG_FMT_INTERVAL " %.4f msAvgJitter"
+#define JITTER_MAX_FMT_INTERVAL " %.4f msMaxJitter"
+#define JITTER_FMT_IN	"jitter = %lf ms, avg-jitter = %lf ms, " \
+			"max-jitter = %lf ms"
+#define OWD_MIN			1
+#define OWD_AVG			2
+#define OWD_MAX			4
+#define OWD_FMT		"min-OWD = %.4f ms, avg-OWD = %.4f ms, " \
+			"max-OWD = %.4f ms"
+#define OWD_MIN_FMT_BRIEF " %.4f msMinOWD"
+#define OWD_AVG_FMT_BRIEF " %.4f msAvgOWD"
+#define OWD_MAX_FMT_BRIEF " %.4f msMaxOWD"
+#define OWD_MIN_FMT_INTERVAL " %.4f msMinOWD"
+#define OWD_AVG_FMT_INTERVAL " %.4f msAvgOWD"
+#define OWD_MAX_FMT_INTERVAL " %.4f msMaxOWD"
+#define OWD_FMT_IN	"OWD = %lf ms, avg-OWD = %lf ms, max-OWD = %lf ms"
 #define RETRANS_FMT	"%sretrans = %d"
 #define RETRANS_FMT_BRIEF " %d %sretrans"
 #define RETRANS_FMT_INTERVAL " %5d %sretrans"
@@ -619,6 +651,23 @@ static struct	sigaction savesigact;
 #define P_DROP_FMT		" drop=%lld pkt=%lld"
 #define P_DROP_FMT_BRIEF	" drop=%lld pkt=%lld"
 #define P_DROP_FMT_INTERVAL	" drop=%lld pkt=%lld"
+#define P_JITTER_FMT		"msminjitter=%.4f msavgjitter=%.4f " \
+				"msmaxjitter=%.4f"
+#define P_JITTER_MIN_FMT_BRIEF	" msminjitter=%.4f"
+#define P_JITTER_AVG_FMT_BRIEF	" msavgjitter=%.4f"
+#define P_JITTER_MAX_FMT_BRIEF	" msmaxjitter=%.4f"
+#define P_JITTER_MIN_FMT_INTERVAL " msminjitter=%.4f"
+#define P_JITTER_AVG_FMT_INTERVAL " msavgjitter=%.4f"
+#define P_JITTER_MAX_FMT_INTERVAL " msmaxjitter=%.4f"
+#define P_JITTER_FMT_IN		"jitter=%lf msavgjitter=%lf msmaxjitter=%lf"
+#define P_OWD_FMT		"msminOWD=%.4f msavgOWD=%.4f msmaxOWD=%.4f"
+#define P_OWD_MIN_FMT_BRIEF	" msminOWD=%.4f"
+#define P_OWD_AVG_FMT_BRIEF	" msavgOWD=%.4f"
+#define P_OWD_MAX_FMT_BRIEF	" msmaxOWD=%.4f"
+#define P_OWD_MIN_FMT_INTERVAL	" msminOWD=%.4f"
+#define P_OWD_AVG_FMT_INTERVAL	" msavgOWD=%.4f"
+#define P_OWD_MAX_FMT_INTERVAL	" msmaxOWD=%.4f"
+#define P_OWD_FMT_IN		"OWD=%lf msavgOWD=%lf msmaxOWD=%lf"
 #define P_RETRANS_FMT		"%sretrans=%d"
 #define P_RETRANS_FMT_BRIEF	" %sretrans=%d"
 #define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
@@ -683,6 +732,7 @@ static struct	sigaction savesigact;
 					 * of TCP retransmission info */
 #define	NOBETAMSG		0x400	/* suppress beta version message */
 #define	WANTRTT			0x800	/* output RTT info (default) */
+#define DEBUGJITTER		0x1000	/* debugging info for jitter option */
 
 #ifdef NO_IPV6				/* Build without IPv6 support */
 #undef AF_INET6
@@ -715,9 +765,9 @@ int get_retrans( int sockfd );
 void print_tcpinfo();
 #endif
 
-int vers_major = 6;
-int vers_minor = 2;
-int vers_delta = 10;
+int vers_major = 7;
+int vers_minor = 0;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -805,6 +855,8 @@ struct tcp_info tcpinf;
 int udp = 0;			/* 0 = tcp, !0 = udp */
 int udplossinfo = 0;		/* set to 1 to give UDP loss info for
 				 * interval reporting */
+int do_jitter = 0;		/* set to 1 to enable jitter measurements */
+int do_owd = 0;			/* set to 1 to enable one-way delay reports */
 
 int retransinfo = 0;		/* set to 1 to give TCP retransmission info
 				 * for interval reporting */
@@ -858,8 +910,9 @@ int nodelay = 0;		/* set TCP_NODELAY socket option */
 unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
 int maxburst = 1;		/* number of packets allowed to exceed rate */
 int nburst = 1;			/* number of packets currently exceeding rate */
-int irate = 0;			/* instantaneous rate limit if set */
+int irate = -1;			/* instantaneous rate limit if set */
 double pkt_time;		/* packet transmission time in seconds */
+double pkt_time_ms;		/* packet transmission time in milliseconds */
 uint64_t irate_pk_usec;		/* packet transmission time in microseconds */
 double irate_pk_nsec;		/* nanosecond portion of pkt xmit time */
 double irate_cum_nsec = 0.0;	/* cumulative nanaseconds over several pkts */
@@ -982,6 +1035,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps or (p)ps)\n\
 	-Ri#[/#] instantaneous rate limit with optional packet burst\n\
 	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
+	-j	enable jitter measurements (assumes -u and -Ri options)\n\
+	-o	enable one-way delay reports (needs synchronized clocks)\n\
 	-i##	receiver interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
 	-F	flip option to reverse direction of data connection open\n\
@@ -1050,6 +1105,8 @@ int64_t ntbytes = 0;		/* bytes sent by transmitter */
 int64_t ptbytes = 0;		/* previous bytes sent by transmitter */
 uint64_t ntbytesc = 0;		/* bytes sent by transmitter that have
 				 * been counted */
+uint64_t ntbytescp = 0;		/* previous ntbytesc count */
+uint64_t ntbytescpi = 0;	/* ntbytescp for interval reports */
 uint64_t chk_nbytes = 0;	/* byte counter used to test if no more data
 				 * being received by server (presumably because
 				 * client transmitter went away */
@@ -1078,6 +1135,26 @@ int srvr_cpu_util;
 
 double cput = 0.000001, realt = 0.000001;	/* user, real time (seconds) */
 double realtd = 0.000001;	/* real time delta - for interval reporting */
+double pkt_delta;		/* time delta between packets in ms */
+double jitter;			/* current jitter measurement in ms */
+unsigned long long njitter;	/* number of jitter measurements */
+double jitter_min;		/* jitter minimum */
+double jitter_max;		/* jitter maximum */
+double jitter_avg;		/* jitter average */
+double jitteri;			/* current jitter interval measurement in ms */
+unsigned long long njitteri;	/* number of jitter interval measurements */
+double jitter_mini;		/* jitter minimum for interval report */
+double jitter_maxi;		/* jitter maximum for interval report */
+double jitter_avgi;		/* jitter average for interval report */
+double owd;			/* current one-way delay measurement in ms */
+unsigned long long nowd;	/* number of one-way delay measurements */
+double owd_min;			/* one-way delay minimum */
+double owd_max;			/* one-way delay maximum */
+double owd_avg;			/* one-way delay average */
+unsigned long long nowdi;	/* number of OWD interval measurements */
+double owd_mini;		/* OWD minimum for interval report */
+double owd_maxi;		/* OWD maximum for interval report */
+double owd_avgi;		/* OWD average for interval report */
 
 void
 close_data_channels()
@@ -1176,8 +1253,6 @@ sigalarm( int signum )
 {
 	struct	timeval timec;	/* Current time */
 	struct	timeval timed;	/* Delta time */
-/*	beginnings of timestamps - not ready for prime time */
-/*	struct	timeval timet; */	/* Transmitter time */
 	int64_t nrbytes;
 	uint64_t deltarbytes, deltatbytes;
 	double fractloss;
@@ -1358,6 +1433,33 @@ sigalarm( int signum )
 					fprintf(stdout, fmt, fractloss * 100);
 				}
 			}
+			if ((do_jitter & JITTER_MIN) && njitteri) {
+				if (format & PARSE)
+					strcpy(fmt, P_JITTER_MIN_FMT_INTERVAL);
+				else
+					strcpy(fmt, JITTER_MIN_FMT_INTERVAL);
+				fprintf(stdout, fmt, jitter_mini);
+			}
+			if ((do_jitter & JITTER_AVG) && njitteri) {
+				if (format & PARSE)
+					strcpy(fmt, P_JITTER_AVG_FMT_INTERVAL);
+				else
+					strcpy(fmt, JITTER_AVG_FMT_INTERVAL);
+				fprintf(stdout, fmt, jitter_avgi/njitteri);
+			}
+			if ((do_jitter & JITTER_MAX) && njitteri) {
+				if (format & PARSE)
+					strcpy(fmt, P_JITTER_MAX_FMT_INTERVAL);
+				else
+					strcpy(fmt, JITTER_MAX_FMT_INTERVAL);
+				fprintf(stdout, fmt, jitter_maxi);
+			}
+			if (do_jitter && njitteri) {
+				njitteri = 0;
+				jitter_mini = 1000000.0;
+				jitter_maxi = -1000000.0;
+				jitter_avgi = 0.0;
+			}
 			if (read_retrans && sinkmode) {
 				if (format & PARSE)
 					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
@@ -1369,6 +1471,33 @@ sigalarm( int signum )
 						(nretrans - pretrans),
 						((retransinfo == 1) ||
 						 !nrbytes) ?  "" : "host-");
+			}
+			if ((do_owd & OWD_MIN) && nowdi) {
+				if (format & PARSE)
+					strcpy(fmt, P_OWD_MIN_FMT_INTERVAL);
+				else
+					strcpy(fmt, OWD_MIN_FMT_INTERVAL);
+				fprintf(stdout, fmt, owd_mini);
+			}
+			if ((do_owd & OWD_AVG) && nowdi) {
+				if (format & PARSE)
+					strcpy(fmt, P_OWD_AVG_FMT_INTERVAL);
+				else
+					strcpy(fmt, OWD_AVG_FMT_INTERVAL);
+				fprintf(stdout, fmt, owd_avgi/nowdi);
+			}
+			if ((do_owd & OWD_MAX) && nowdi) {
+				if (format & PARSE)
+					strcpy(fmt, P_OWD_MAX_FMT_INTERVAL);
+				else
+					strcpy(fmt, OWD_MAX_FMT_INTERVAL);
+				fprintf(stdout, fmt, owd_maxi);
+			}
+			if (do_owd && nowdi) {
+				nowdi = 0;
+				owd_mini = 1000000.0;
+				owd_maxi = -1000000.0;
+				owd_avgi = 0.0;
 			}
 			if (format & RUNNINGTOTAL) {
 				if (format & PARSE)
@@ -1451,18 +1580,6 @@ sigalarm( int signum )
 			}
 			fprintf(stdout, "\n");
 			fflush(stdout);
-/*			beginnings of timestamps - not ready for prime time */
-/*			bcopy(buf + 8, &timet.tv_sec, 4);		*/
-/*			bcopy(buf + 12, &timet.tv_usec, 4);		*/
-/*			tvsub( &timed, &timec, &timet );		*/
-/*			realt = timed.tv_sec + ((double)timed.tv_usec)	*/
-/*							    / 1000000;	*/
-/*			if( realt <= 0.0 )  realt = 0.000001;		*/
-/*			fprintf(stdout, "%.3f ms-OWD timet = %08X/%08X timec = %08X/%08X\n", */
-/*				realt*1000, timet.tv_sec, timet.tv_usec, */
-/*				timec.tv_sec, timec.tv_usec);		*/
-/*			fprintf(stdout, "%.3f ms-OWD\n", realt*1000);	*/
-/*			fflush(stdout);					*/
 			timep.tv_sec = timec.tv_sec;
 			timep.tv_usec = timec.tv_usec;
 			pbytes = nrbytes;
@@ -1483,19 +1600,20 @@ main( int argc, char **argv )
 	double fractloss;
 	int cpu_util;
 	int first_read;
+	int first_jitter, first_jitteri;
 	int ocorrection = 0;
 	double  correction = 0.0;
 	int pollst = 0;
-	int i, j;
-	char *cp1, *cp2;
-	char ch;
+	int i = 0, j = 0;
+	char *cp1 = NULL, *cp2 = NULL;
+	char ch = '\0';
 	int error_num = 0;
 	int sockopterr = 0;
 	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL };
 	struct timeval time_eod;	/* time EOD packet was received */
-	struct timeval timepkrcv;	/* time last data packet received */
+	struct timeval time_eod0;	/* time EOD0 packet was received */
 	struct timeval timed;		/* time delta */
 	struct timeval timeconn1;	/* time before connect() for RTT */
 	struct timeval timeconn2;	/* time after connect() for RTT */
@@ -1723,6 +1841,34 @@ main( int argc, char **argv )
 				rate = MAXRATE;
 			}
 			break;
+		case 'j':
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			if (strchr(cp1, 'm'))
+				do_jitter |= JITTER_MIN;
+			if (strchr(cp1, 'a'))
+				do_jitter |= JITTER_AVG;
+			if (strchr(cp1, 'x'))
+				do_jitter |= JITTER_MAX;
+			if (do_jitter == 0)
+				do_jitter = JITTER_MAX;
+			if (strchr(cp1, 'o'))
+				do_jitter |= JITTER_IGNORE_OOO;
+			udp = 1;
+			if (!buflenopt) buflen = DEFAULTUDPBUFLEN;
+			break;
+		case 'o':
+			reqval = 0;
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			if (strchr(cp1, 'm'))
+				do_owd |= OWD_MIN;
+			if (strchr(cp1, 'a'))
+				do_owd |= OWD_AVG;
+			if (strchr(cp1, 'x'))
+				do_owd |= OWD_MAX;
+			if (do_owd == 0)
+				do_owd = OWD_AVG;
+			break;
 		case 'v':
 			brief = 0;
 			if (argv[0][2] == 'v')
@@ -1756,8 +1902,14 @@ main( int argc, char **argv )
 				sscanf(cp1, "%lf", &rate_opt);
 				irate = 1;
 			}
+			else if (argv[0][2] == 'a') {
+				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+				sscanf(cp1, "%lf", &rate_opt);
+				irate = 0;
+			}
 			else if (argv[0][2] == 'u') {
 				rate_opt = 0.0;
+				irate = 0;
 				cp1 = &argv[0][3];
 			}
 			else {
@@ -1901,6 +2053,8 @@ main( int argc, char **argv )
 				format |= DEBUGPOLL;
 			else if (strcmp(&argv[0][2], "debugmtu") == 0)
 				format |= DEBUGMTU;
+			else if (strcmp(&argv[0][2], "debugjitter") == 0)
+				format |= DEBUGJITTER;
 			else if (strcmp(&argv[0][2], "parse") == 0)
 				format |= PARSE;
 			else if (strcmp(&argv[0][2], "-beta") == 0)
@@ -2496,6 +2650,24 @@ main( int argc, char **argv )
 #endif
 	}
 
+	if (irate < 0) {
+		if (do_jitter)
+			irate = 1;
+		else
+			irate = 0;
+	}
+	if (do_jitter && (rate == MAXRATE)) {
+		fprintf(stderr, "jitter option not supported for "
+				"unlimited rate\n");
+		fflush(stderr);
+		exit(1);
+	}
+	if (do_jitter && !irate) {
+		fprintf(stderr, "jitter option requires"
+				" \"-Ri\" instantaneous rate limit option\n");
+		fflush(stderr);
+		exit(1);
+	}
 	if (interval && !clientserver) {
 		fprintf(stderr, "interval option only supported for client/server mode\n");
 		fflush(stderr);
@@ -2556,6 +2728,13 @@ main( int argc, char **argv )
 			fprintf(stderr, "Unable to print interval loss information if UDP buflen < 32\n");
 	}
 
+	if (udp && (do_jitter & JITTER_IGNORE_OOO)) {
+		if (buflen >= 32)
+			udplossinfo = 1;
+		else
+			fprintf(stderr, "Unable to check out of order when calculating jitter if UDP buflen < 32\n");
+	}
+
 	if (!udp && trans) {
 		if (buflen >= 32) {
 			retransinfo = 1;
@@ -2563,6 +2742,10 @@ main( int argc, char **argv )
 		}
 		else
 			fprintf(stderr, "Unable to print retransmission information if TCP buflen < 32\n");
+	}
+
+	if (udp && do_owd && (buflen < 16)) {
+		fprintf(stderr, "Unable to calculate one-way delay if UDP buflen < 16\n");
 	}
 
 	ivers = vers_major*10000 + vers_minor*100 + vers_delta;
@@ -2581,7 +2764,7 @@ main( int argc, char **argv )
 	signal(SIGINT, sigint);
 
 	if (clientserver && client && !thirdparty &&
-	    beta && !(format & NOBETAMSG)) {
+	    beta && !(format & NOBETAMSG) && (do_jitter || do_owd)) {
 		fprintf(stderr, "nuttcp-%d.%d.%d: ",
 				vers_major, vers_minor, vers_delta);
 		fprintf(stderr, "Using beta vers: %s interface/output "
@@ -2999,6 +3182,47 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 70001) {
+					fprintf(ctlconn, " , do_jitter = %d", do_jitter);
+				}
+				else {
+					if (do_jitter && trans) {
+						fprintf(stdout, "nuttcp%s%s: jitter not supported by server version %d.%d.%d, need >= 7.0.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						do_jitter = 0;
+						abortconn = 1;
+					}
+					if ((do_jitter & JITTER_IGNORE_OOO) &&
+					    !trans && !(udp && interval)) {
+						udplossinfo = 0;
+						fprintf(stdout, "nuttcp%s%s: Unable to check out of order when calculating jitter\n",
+							trans?"-t":"-r", ident);
+						fprintf(stdout, "          due to using older server version %d.%d.%d, need >= 7.0.1\n",
+							rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+					}
+				}
+				if (irvers >= 70001) {
+					fprintf(ctlconn, " , do_owd = %d", do_owd);
+				}
+				else {
+					if (do_owd) {
+						fprintf(stdout, "nuttcp%s%s: owd not supported by server version %d.%d.%d, need >= 7.0.1\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						do_owd = 0;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -3242,6 +3466,20 @@ doit:
 				else {
 					maxburst = 1;
 				}
+				if (irvers >= 70001) {
+					sscanf(strstr(buf, ", do_jitter =") + 14,
+					       "%d", &do_jitter);
+				}
+				else {
+					do_jitter = 0;
+				}
+				if (irvers >= 70001) {
+					sscanf(strstr(buf, ", do_owd =") + 11,
+					       "%d", &do_owd);
+				}
+				else {
+					do_owd = 0;
+				}
 				trans = !trans;
 				if (inetd && !sinkmode) {
 					fputs("KO\n", stdout);
@@ -3432,12 +3670,53 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
+				if (do_jitter < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid do_jitter");
+					fprintf(stdout, "do_jitter = %d\n",
+						do_jitter);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (do_jitter && !udp) {
+					fputs("KO\n", stdout);
+					fprintf(stdout,
+						"jitter option"
+						" not supported for TCP\n");
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (do_jitter && (!rate || (rate == MAXRATE))) {
+					fputs("KO\n", stdout);
+					fprintf(stdout,
+						"jitter option not supported"
+						" for unlimited rate\n");
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (do_jitter && !irate) {
+					fputs("KO\n", stdout);
+					fprintf(stdout,
+						"jitter option requires"
+						" instantaneous rate limit\n");
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				if (do_owd < 0) {
+					fputs("KO\n", stdout);
+					mes("invalid do_owd");
+					fprintf(stdout, "do_owd = %d\n",
+						do_owd);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
 				/* used to send server "OK" here -
 				 * now delay sending of server OK until
 				 * after successful server bind() -
 				 * catches data port collision */
-				if (udp && interval && (buflen >= 32) &&
-					(irvers >= 30403))
+				if (udp && (interval ||
+					    (do_jitter & JITTER_IGNORE_OOO)) &&
+				    (buflen >= 32) && (irvers >= 30403))
 					udplossinfo = 1;
 				if (irvers >= 50401) {
 					two_bod = 1;
@@ -4694,6 +4973,12 @@ acceptnewconn:
 				else
 					cmdargs[i++] = "-u";
 			}
+			if (do_jitter) {
+				cmdargs[i++] = "-j";
+			}
+			if (do_owd) {
+				cmdargs[i++] = "-o";
+			}
 			if (interval) {
 				sprintf(tmpargs[j], "-i%f", interval);
 				cmdargs[i++] = tmpargs[j++];
@@ -5426,6 +5711,7 @@ acceptnewconn:
 		pkt_time = (double)buflen/rate/125;
 		irate_pk_usec = pkt_time*1000000;
 		irate_pk_nsec = (pkt_time*1000000 - irate_pk_usec)*1000;
+		pkt_time_ms = pkt_time*1000;
 	}
 	prep_timer();
 	errno = 0;
@@ -5478,9 +5764,7 @@ acceptnewconn:
 					setitimer(ITIMER_REAL, &itimer, 0);
 				prep_timer();
 			}
-/*			beginnings of timestamps - not ready for prime time */
-/*			bzero(buf + 8, 4);				*/
-/*			bzero(buf + 12, 4);				*/
+			bzero(buf + 8, 8);	/* zero out timestamp */
 			nbytes += buflen;
 			if (do_poll && (format & DEBUGPOLL)) {
 				fprintf(stdout, "do_poll is set\n");
@@ -5700,6 +5984,15 @@ acceptnewconn:
 						else {
 						    *cp1 = '\0';
 						}
+						if (do_retrans) {
+						    cp1 = strstr(intervalbuf,
+								 "Mbps") + 4;
+						    ch = '\0';
+						    if (cp1)
+							ch = *cp1;
+						    if (ch)
+							*cp1 = '\0';
+						}
 						fputs(intervalbuf, stdout);
 						if (do_retrans && sinkmode) {
 						    nretrans =
@@ -5721,6 +6014,10 @@ acceptnewconn:
 							   (retransinfo == 1) ?
 								"" : "host-");
 						    pretrans = nretrans;
+						}
+						if (do_retrans && cp1 && ch) {
+						    *cp1 = ch;
+						    fputs(cp1, stdout);
 						}
 						fprintf(stdout, "\n");
 						fflush(stdout);
@@ -5746,6 +6043,16 @@ acceptnewconn:
 			}
 		} else {
 			first_read = 1;
+			first_jitter = 1;
+			first_jitteri = 1;
+			nowd = 0;
+			nowdi = 0;
+			owd_min = 1000000.0;
+			owd_mini = 1000000.0;
+			owd_max = -1000000.0;
+			owd_maxi = -1000000.0;
+			owd_avg = 0.0;
+			owd_avgi = 0.0;
 			need_swap = 0;
 			bzero(buf + 24, 8);
 			if (udp) {
@@ -5754,7 +6061,7 @@ acceptnewconn:
 			    while (((cnt=Nread(fd[stream_idx + 1],buf,buflen)) > 0) && !intr)  {
 				    if( cnt <= 4 ) {
 					    if (strncmp(buf, "EOD0", 4) == 0) {
-						    gettimeofday(&timepkrcv,
+						    gettimeofday(&time_eod0,
 							(struct timezone *)0);
 						    got_eod0 = 1;
 						    done = 1;
@@ -5788,7 +6095,9 @@ acceptnewconn:
 					    got_begin = 1;
 				    }
 				    else if (got_eod0) {
-					    gettimeofday(&timepkrcv,
+					    /* got data after EOD0, so
+					     * extend EOD0 time */
+					    gettimeofday(&time_eod0,
 							 (struct timezone *)0);
 				    }
 				    if (!got_begin)
@@ -5822,13 +6131,151 @@ acceptnewconn:
 							    *cp1++ = *cp2--;
 					    }
 				    }
+				    if (do_jitter) {
+					    if (first_jitter) {
+						    gettimeofday(
+							&timepkr,
+							(struct timezone *)0);
+						    timepkri = timepkr;
+						    first_jitter = 0;
+						    first_jitteri = 0;
+						    ntbytescp = ntbytesc;
+						    ntbytescpi = ntbytesc;
+						    jitter = 0.0;
+						    jitteri = 0.0;
+						    njitter = 0;
+						    njitteri = 0;
+						    jitter_min = 1000000.0;
+						    jitter_mini = 1000000.0;
+						    jitter_max = -1000000.0;
+						    jitter_maxi = -1000000.0;
+						    jitter_avg = 0.0;
+						    jitter_avgi = 0.0;
+#ifdef DEBUG
+						    if (clientserver &&
+							client &&
+							(format & DEBUGJITTER))
+							fprintf(stdout,
+							    "pkt_time_ms"
+							    " = %6.3f ms\n",
+							    pkt_time_ms);
+#endif
+						    stream_idx++;
+						    stream_idx =
+							stream_idx % nstream;
+						    continue;
+					    }
+					    /* formula for jitter is from
+					     * RFC1889 - note synchronized
+					     * clocks are not required since
+					     * source packet delta time is
+					     * known (pkt_time_ms)
+					     *
+					     * D(i,j)=(Rj-Ri)-(Sj-Si)
+					     *       =(Rj-Sj)-(Ri-Si)
+					     * J=J+(|D(i-1,i)|-J)/16
+					     *
+					     * for nuttcp we just use the raw
+					     * absolute value of the delta
+					     *
+					     * J=|D(i-1,i)|
+					     */
+
+					    if (!do_owd) {
+						gettimeofday(&timerx,
+							(struct timezone *)0);
+					    }
+					    if (do_jitter & JITTER_IGNORE_OOO) {
+						/* first check that packet
+						 * is next in sequence */
+						if (udplossinfo &&
+						    (ntbytescp + buflen)
+							!= ntbytesc) {
+						    ntbytescp = ntbytesc;
+						    ntbytescpi = ntbytesc;
+						    timepkr = timerx;
+						    timepkri = timerx;
+						    stream_idx++;
+						    stream_idx =
+							stream_idx % nstream;
+						    continue;
+						}
+					    }
+
+					    tvsub( &timed, &timerx, &timepkr );
+					    pkt_delta =
+						timed.tv_sec*1000
+						    + ((double)timed.tv_usec)
+								/ 1000;
+					    pkt_delta -= pkt_time_ms;
+					    if (pkt_delta >= 0)
+						jitter = pkt_delta;
+					    else
+						jitter = -pkt_delta;
+					    njitter++;
+					    if (jitter < jitter_min)
+					    	jitter_min = jitter;
+					    if (jitter > jitter_max)
+					    	jitter_max = jitter;
+					    jitter_avg += jitter;
+#ifdef DEBUG
+					    if (clientserver && client &&
+						(format & DEBUGJITTER))
+						fprintf(stdout,
+						    "pkt_delta = %6.3f ms, "
+						    "jitter = %9.6f ms\n",
+						    pkt_delta, jitter);
+#endif
+					    timepkr = timerx;
+					    ntbytescp = ntbytesc;
+					    if (!interval) {
+						    stream_idx++;
+						    stream_idx =
+							stream_idx % nstream;
+						    continue;
+					    }
+					    if (first_jitteri) {
+						    gettimeofday(
+							&timepkri,
+							(struct timezone *)0);
+						    first_jitteri = 0;
+						    ntbytescpi = ntbytesc;
+						    jitteri = 0.0;
+						    njitteri = 0;
+						    jitter_mini = 1000000.0;
+						    jitter_maxi = -1000000.0;
+						    jitter_avgi = 0.0;
+						    stream_idx++;
+						    stream_idx =
+							stream_idx % nstream;
+						    continue;
+					    }
+					    tvsub( &timed, &timerx, &timepkri );
+					    pkt_delta =
+						timed.tv_sec*1000
+						    + ((double)timed.tv_usec)
+								/ 1000;
+					    pkt_delta -= pkt_time_ms;
+					    if (pkt_delta >= 0)
+						jitteri = pkt_delta;
+					    else
+						jitteri = -pkt_delta;
+					    njitteri++;
+					    if (jitteri < jitter_mini)
+					    	jitter_mini = jitteri;
+					    if (jitteri > jitter_maxi)
+					    	jitter_maxi = jitteri;
+					    jitter_avgi += jitteri;
+					    timepkri = timerx;
+					    ntbytescpi = ntbytesc;
+				    }
 				    stream_idx++;
 				    stream_idx = stream_idx % nstream;
 			    }
 			    if (intr && (cnt > 0))
 				    nbytes += cnt;
 			    if (got_eod0) {
-				    tvsub( &timed, &time_eod, &timepkrcv );
+				    tvsub( &timed, &time_eod, &time_eod0 );
 				    correction = timed.tv_sec +
 						    ((double)timed.tv_usec)
 								/ 1000000;
@@ -5951,6 +6398,16 @@ acceptnewconn:
 			sretrans);
 	}
 
+#ifdef DEBUG
+	if (clientserver && client && !trans && do_jitter && njitter &&
+	    (format & DEBUGJITTER)) {
+		fprintf(stdout, "njitter = %lld\n", njitter);
+		fprintf(stdout, "jitter_min = %9.6f ms\n", jitter_min);
+		fprintf(stdout, "jitter_max = %9.6f ms\n", jitter_max);
+		fprintf(stdout, "jitter_avg = %9.6f ms\n", jitter_avg/njitter);
+	}
+#endif
+
 	for ( stream_idx = 1; stream_idx <= nstream; stream_idx++ ) {
 		if (!udp && trans) {
 #if defined(linux) && defined(TCPI_OPT_TIMESTAMPS) && !defined(BROKEN_UNACKED)
@@ -6046,6 +6503,15 @@ acceptnewconn:
 								ident + 1);
 						intervalbuf[strlen(intervalbuf)
 								- 1] = '\0';
+						if (do_retrans) {
+						    cp1 = strstr(intervalbuf,
+								 "Mbps") + 4;
+						    ch = '\0';
+						    if (cp1)
+							ch = *cp1;
+						    if (ch)
+							*cp1 = '\0';
+						}
 						fputs(intervalbuf, stdout);
 						if (do_retrans && sinkmode) {
 						    nretrans =
@@ -6067,6 +6533,10 @@ acceptnewconn:
 							   (retransinfo == 1) ?
 								"" : "host-");
 						    pretrans = nretrans;
+						}
+						if (do_retrans && cp1 && ch) {
+						    *cp1 = ch;
+						    fputs(cp1, stdout);
 						}
 						fprintf(stdout, "\n");
 						fflush(stdout);
@@ -6193,6 +6663,14 @@ acceptnewconn:
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
 			intervalbuf[strlen(intervalbuf) - 1] = '\0';
+			if (do_retrans) {
+				cp1 = strstr(intervalbuf, "Mbps") + 4;
+				ch = '\0';
+				if (cp1)
+					ch = *cp1;
+				if (ch)
+					*cp1 = '\0';
+			}
 			fputs(intervalbuf, stdout);
 			if (do_retrans && sinkmode) {
 				nretrans = get_retrans(fd[1]);
@@ -6208,6 +6686,10 @@ acceptnewconn:
 						(retransinfo == 1) ?
 							"" : "host-");
 				pretrans = nretrans;
+			}
+			if (do_retrans && cp1 && ch) {
+				*cp1 = ch;
+				fputs(cp1, stdout);
 			}
 			fprintf(stdout, "\n");
 			fflush(stdout);
@@ -6319,11 +6801,32 @@ acceptnewconn:
 						sscanf(cp2, RTT_FMT_INB, &rtt);
 				}
 			}
-			else if ((cp2 = strstr(cp1, "RTT"))) {
+			else if ((cp2 = strstr(cp1, "RTT")) ||
+				 (cp2 = strstr(cp1, "rtt"))) {
 				if (format & PARSE)
 					sscanf(cp2, P_RTT_FMT_IN, &rtt);
 				else
 					sscanf(cp2, RTT_FMT_IN, &rtt);
+			}
+			else if ((cp2 = strstr(cp1, "jitter"))) {
+				if (format & PARSE)
+					sscanf(cp2, P_JITTER_FMT_IN,
+					       &jitter_min, &jitter_avg,
+					       &jitter_max);
+				else
+					sscanf(cp2, JITTER_FMT_IN,
+					       &jitter_min, &jitter_avg,
+					       &jitter_max);
+				njitter = 1;
+			}
+			else if ((cp2 = strstr(cp1, "OWD"))) {
+				if (format & PARSE)
+					sscanf(cp2, P_OWD_FMT_IN,
+					       &owd_min, &owd_avg, &owd_max);
+				else
+					sscanf(cp2, OWD_FMT_IN,
+					       &owd_min, &owd_avg, &owd_max);
+				nowd = 1;
 			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
 				continue;
@@ -6377,6 +6880,26 @@ acceptnewconn:
 			else
 				strcpy(fmt, LOSS_FMT);
 			fprintf(stdout, fmt, fractloss * 100);
+			fprintf(stdout, "\n");
+		}
+		if (clientserver && udp && !trans && do_jitter && njitter) {
+			strcpy(fmt, "nuttcp%s%s: ");
+			if (format & PARSE)
+				strcat(fmt, P_JITTER_FMT);
+			else
+				strcat(fmt, JITTER_FMT);
+			fprintf(stdout, fmt, trans?"-t":"-r", ident,
+				jitter_min, jitter_avg/njitter, jitter_max);
+			fprintf(stdout, "\n");
+		}
+		if (clientserver && !trans && do_owd && nowd) {
+			strcpy(fmt, "nuttcp%s%s: ");
+			if (format & PARSE)
+				strcat(fmt, P_OWD_FMT);
+			else
+				strcat(fmt, OWD_FMT);
+			fprintf(stdout, fmt, trans?"-t":"-r", ident,
+				owd_min, owd_avg/nowd, owd_max);
 			fprintf(stdout, "\n");
 		}
 		if (verbose) {
@@ -6478,6 +7001,58 @@ acceptnewconn:
 						strcpy(fmt, PERF_FMT_BRIEF3);
 					fprintf(stdout, fmt, MB);
 				}
+				if ((do_jitter & JITTER_MIN) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, jitter_min);
+				}
+				if ((do_jitter & JITTER_AVG) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt,
+						jitter_avg/njitter);
+				}
+				if ((do_jitter & JITTER_MAX) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, jitter_max);
+				}
+				if ((do_owd & OWD_MIN) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_min);
+				}
+				if ((do_owd & OWD_AVG) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_avg/nowd);
+				}
+				if ((do_owd & OWD_MAX) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_max);
+				}
 			}
 			else {
 				if (*ident)
@@ -6519,6 +7094,58 @@ acceptnewconn:
 					else
 						strcpy(fmt, PERF_FMT_BRIEF3);
 					fprintf(stdout, fmt, srvr_MB);
+				}
+				if ((do_jitter & JITTER_MIN) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, jitter_min);
+				}
+				if ((do_jitter & JITTER_AVG) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt,
+						jitter_avg/njitter);
+				}
+				if ((do_jitter & JITTER_MAX) && njitter) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_JITTER_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt,
+						       JITTER_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, jitter_max);
+				}
+				if ((do_owd & OWD_MIN) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_min);
+				}
+				if ((do_owd & OWD_AVG) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_avg/nowd);
+				}
+				if ((do_owd & OWD_MAX) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_max);
 				}
 			}
 			fprintf(stdout, "\n");
@@ -6565,6 +7192,30 @@ acceptnewconn:
 						strcpy(fmt, RTT_FMT_BRIEF);
 					fprintf(stdout, fmt, rtt);
 				}
+				if ((do_owd & OWD_MIN) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_min);
+				}
+				if ((do_owd & OWD_AVG) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_avg/nowd);
+				}
+				if ((do_owd & OWD_MAX) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_max);
+				}
 				fprintf(stdout, "\n");
 			}
 			else {
@@ -6598,6 +7249,30 @@ acceptnewconn:
 					else
 						strcpy(fmt, RTT_FMT_BRIEF);
 					fprintf(stdout, fmt, rtt);
+				}
+				if ((do_owd & OWD_MIN) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MIN_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MIN_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_min);
+				}
+				if ((do_owd & OWD_AVG) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_AVG_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_AVG_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_avg/nowd);
+				}
+				if ((do_owd & OWD_MAX) && nowd) {
+					if (format & PARSE)
+						strcpy(fmt,
+						       P_OWD_MAX_FMT_BRIEF);
+					else
+						strcpy(fmt, OWD_MAX_FMT_BRIEF);
+					fprintf(stdout, fmt, owd_max);
 				}
 				fprintf(stdout, "\n");
 			}
@@ -6718,6 +7393,8 @@ cleanup:
 		braindead = 0;
 		udp = 0;
 		udplossinfo = 0;
+		do_jitter = 0;
+		do_owd = 0;
 		retransinfo = 0;
 		force_retrans = 0;
 		rtt = 0.0;
@@ -7029,6 +7706,7 @@ Nread( int fd, char *buf, int count )
 {
 	struct sockaddr_storage from;
 	socklen_t len = sizeof(from);
+	struct timeval timed;	/* time delta */
 	register int cnt;
 	if( udp )  {
 		cnt = recvfrom( fd, buf, count, 0, (struct sockaddr *)&from, &len );
@@ -7040,6 +7718,30 @@ Nread( int fd, char *buf, int count )
 			cnt = read( fd, buf, count );
 			numCalls++;
 		}
+	}
+	if (do_owd && (cnt > 4)) {
+		uint32_t secs, usecs;
+
+		/* get transmitter timestamp */
+		bcopy(buf + 8, &secs, 4);
+		bcopy(buf + 12, &usecs, 4);
+		timetx.tv_sec = ntohl(secs);
+		timetx.tv_usec = ntohl(usecs);
+		gettimeofday(&timerx, (struct timezone *)0);
+		tvsub( &timed, &timerx, &timetx );
+		owd = timed.tv_sec*1000 + ((double)timed.tv_usec)/1000;
+		nowd++;
+		if (owd < owd_min)
+			owd_min = owd;
+		if (owd > owd_max)
+			owd_max = owd;
+		owd_avg += owd;
+		nowdi++;
+		if (owd < owd_mini)
+			owd_mini = owd;
+		if (owd > owd_maxi)
+			owd_maxi = owd;
+		owd_avgi += owd;
 	}
 	return(cnt);
 }
@@ -7104,10 +7806,16 @@ Nwrite( int fd, char *buf, int count )
 			if( realt <= 0.0 )  realt = 0.000001;
 		}
 	}
-/*	beginnings of timestamps - not ready for prime time		*/
-/*	gettimeofday(&timedol, (struct timezone *)0);			*/
-/*	bcopy(&timedol.tv_sec, buf + 8, 4);				*/
-/*	bcopy(&timedol.tv_usec, buf + 12, 4);				*/
+	if (do_owd && (count > 4)) {
+		uint32_t secs, usecs;
+
+		/* record transmitter timestamp in packet */
+		gettimeofday(&timedol, (struct timezone *)0);
+		secs = htonl(timedol.tv_sec);
+		usecs = htonl(timedol.tv_usec);
+		bcopy(&secs, buf + 8, 4);
+		bcopy(&usecs, buf + 12, 4);
+	}
 	if( udp )  {
 again:
 		if (af == AF_INET) {
