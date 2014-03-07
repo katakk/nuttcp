@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.5.2
+ *	N U T T C P . C						v5.5.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 5.5.3, Bill Fink, 23-Oct-06
+ *	Fix bug with "-Ri" instantaneous rate limiting not working properly
  * 5.5.2, Bill Fink, 25-Jul-06
  *	Make manually started server multi-threaded
  *	Add "--single-threaded" server option to restore old behavior
@@ -530,7 +532,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 5;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -611,6 +613,7 @@ int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 int nodelay = 0;		/* set TCP_NODELAY socket option */
 unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
 int irate = 0;			/* instantaneous rate limit if set */
+double pkt_time;		/* packet transmission time in seconds */
 uint64_t irate_pk_usec;		/* packet transmission time in microseconds */
 double irate_pk_nsec;		/* nanosecond portion of pkt xmit time */
 double irate_cum_nsec = 0.0;	/* cumulative nanaseconds over several pkts */
@@ -3881,8 +3884,7 @@ doit:
 		do_poll = 1;
 
 	if (irate) {
-		double pkt_time = (double)buflen/rate/125;
-
+		pkt_time = (double)buflen/rate/125;
 		irate_pk_usec = pkt_time*1000000;
 		irate_pk_nsec = (pkt_time*1000000 - irate_pk_usec)*1000;
 	}
@@ -5007,22 +5009,33 @@ Nwrite( int fd, char *buf, int count )
 	double deltat;
 
 	if (irate) {
-		do {
+		/* Get real time */
+		gettimeofday(&timedol, (struct timezone *)0);
+		tvsub( &td, &timedol, &timepk );
+		deltat = td.tv_sec + ((double)td.tv_usec) / 1000000;
+
+		if (deltat >= 2*pkt_time) {
+			timepk.tv_sec = timedol.tv_sec;
+			timepk.tv_usec = timedol.tv_usec;
+			irate_cum_nsec = 0;
+		}
+
+		while (((double)count/rate/125 > deltat) && !intr) {
 			/* Get real time */
 			gettimeofday(&timedol, (struct timezone *)0);
 			tvsub( &td, &timedol, &timepk );
 			deltat = td.tv_sec + ((double)td.tv_usec) / 1000000;
-		} while (((double)count/rate/125 > deltat) && !intr);
-
-		timepk.tv_usec += irate_pk_usec;
-		if (timepk.tv_usec >= 1000000) {
-			timepk.tv_sec++;
-			timepk.tv_usec -= 1000000;
 		}
+
 		irate_cum_nsec += irate_pk_nsec;
 		if (irate_cum_nsec >= 1000.0) {
 			irate_cum_nsec -= 1000.0;
 			timepk.tv_usec++;
+		}
+		timepk.tv_usec += irate_pk_usec;
+		while (timepk.tv_usec >= 1000000) {
+			timepk.tv_usec -= 1000000;
+			timepk.tv_sec++;
 		}
 		if (intr && (!udp || (count != 4))) return(0);
 	}
