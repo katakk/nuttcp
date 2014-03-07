@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.7
+ *	N U T T C P . C						v6.2.8
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -18,9 +18,9 @@
  * Developed by Bill Fink, billfink@mindspring.com
  *          and Rob Scott, rob@hpcmo.hpc.mil
  * Latest version available at:
- *	ftp://ftp.lcp.nrl.navy.mil/pub/nuttcp/
+ *	http://lcp.nrl.navy.mil/nuttcp/
  *
- * Test TCP connection.  Makes a connection on port 5001
+ * Test TCP connection.  Makes a connection on port 5000(ctl)/5101(data)
  * and transfers fabricated buffers or data copied from stdin.
  *
  * Run nuttcp with no arguments to get a usage statement
@@ -29,6 +29,19 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.8, Bill Fink, 8-Jun-09
+ *	Play nice with iperf (change default data port to 5101)
+ *	Delay sending of server "OK" until after successful server bind()
+ *	Client check for server errors before starting data transfer
+ *	Continue checking for server output while draining client transmission
+ *	Correct "server not ACKing data" error message (server -> receiver)
+ *	Add "--packet-burst" option for Rob
+ *	Fix "--idle-data-timeout" Usage: statement for client
+ *	Improve accuracy of retrans info timing synchronization (client xmitter)
+ *	Change reference to nuttcp repository from ftp:// to http://
+ *	Fix bug affecting nuttscp introduced in 6.2.4 (not honoring oneshot)
+ *	Whitespace cleanup: get rid of <tab><spaces><tab>, <tab>$, & <spaces>$
+ *	Whitespace cleanup: convert 8 spaces to <tab> where appropriate
  * 6.2.7, Bill Fink, 22-May-09
  *	Allow rate limit to be exceeded temporarily by n packets ("-Rixxx/n")
  *	Fix several reqval parameter settings
@@ -265,7 +278,7 @@
  *	Changed "-xt" option to do both forward and reverse traceroute
  *	Changed to use brief output by default ("-v" for old default behavior)
  * V4.0.1, Rob Scott, 10-Oct-03
- *	Added IPv6 code 
+ *	Added IPv6 code
  *	Changed inet get functions to protocol independent versions
  *	Added fakepoll for hosts without poll() (macosx)
  *	Added ifdefs to only include setprio if os supports it (non-win)
@@ -569,7 +582,7 @@ static struct	sigaction savesigact;
 /* Parsable output formats */
 
 #define P_PERF_FMT_OUT	  "megabytes=%.4f real_seconds=%.2f " \
-                          "rate_KBps=%.2f rate_Mbps=%.4f\n"
+			  "rate_KBps=%.2f rate_Mbps=%.4f\n"
 #define P_PERF_FMT_BRIEF  "megabytes=%.4f real_seconds=%.2f rate_Mbps=%.4f " \
 			  "tx_cpu=%d rx_cpu=%d"
 #define P_PERF_FMT_BRIEF3 " tx_megabytes=%.4f"
@@ -585,7 +598,7 @@ static struct	sigaction savesigact;
 
 #define P_LOSS_FMT		" data_loss=%.5f"
 #define P_LOSS_FMT_BRIEF	" data_loss=%.5f"
-#define P_LOSS_FMT_INTERVAL	" data_loss=%.5f" 
+#define P_LOSS_FMT_INTERVAL	" data_loss=%.5f"
 #define P_DROP_FMT		" drop=%lld pkt=%lld"
 #define P_DROP_FMT_BRIEF	" drop=%lld pkt=%lld"
 #define P_DROP_FMT_INTERVAL	" drop=%lld pkt=%lld"
@@ -687,7 +700,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 7;
+int vers_delta = 8;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -780,14 +793,19 @@ int retransinfo = 0;		/* set to 1 to give TCP retransmission info
 				 * for interval reporting */
 int force_retrans = 0;		/* set to force sending retrans info */
 int send_retrans = 1;		/* set to 0 if no need to send retrans info */
+int do_retrans = 0;		/* set to 1 for client transmitter */
 int read_retrans = 1;		/* set to 0 if no need to read retrans info */
+int got_0retrans = 0;		/* set to 1 by client transmitter after
+				   processing initial server output
+				   having "0 retrans" */
 
 int need_swap;			/* client and server are different endian */
 int options = 0;		/* socket options */
-int one = 1;                    /* for 4.3 BSD style setsockopt() */
+int one = 1;			/* for 4.3 BSD style setsockopt() */
 /* default port numbers if command arg or getserv doesn't get a port # */
-#define DEFAULT_PORT	5001
+#define DEFAULT_PORT	5101
 #define DEFAULT_CTLPORT	5000
+#define IPERF_PORT	5001
 unsigned short port = 0;	/* TCP port number */
 unsigned short ctlport = 0;	/* control port for server connection */
 unsigned short ctlport3 = 0;	/* control port for 3rd party server conn */
@@ -816,7 +834,7 @@ char hostbuf[ADDRSTRLEN];	/* buffer to hold text of address */
 char host3buf[HOSTNAMELEN + 1];	/* buffer to hold 3rd party name or address */
 int trans = 1;			/* 0=receive, !0=transmit mode */
 int sinkmode = 1;		/* 0=normal I/O, !0=sink/source mode */
-int nofork = 0;	 		/* set to 1 to not fork server */
+int nofork = 0;			/* set to 1 to not fork server */
 int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 				 * resource usage. */
 int nodelay = 0;		/* set TCP_NODELAY socket option */
@@ -938,7 +956,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
 	-ws##	server receive|transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
-	-p##	port number to send to|listen at (default 5001)\n\
+	-p##	port number to send to|listen at (default 5101)\n\
 	-P##	port number for control connection (default 5000)\n\
 	-u	use UDP instead of TCP\n\
 	-m##	use multicast with specified TTL instead of unicast (UDP)\n\
@@ -963,8 +981,9 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-b	brief output (default)\n\
 	-D	xmit only: don't buffer TCP writes (sets TCP_NODELAY sockopt)\n\
 	-B	recv only: only output full blocks of size from -l## (for TAR)\n"
+"	--packet-burst packet burst value for instantaneous rate limit option\n"
 "	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
-"		     server timeout in seconds for idle data connection\n"
+"		     client timeout in seconds for idle data connection\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
@@ -1003,7 +1022,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-fparse		generate key=value parsable output\n\
 	-f-beta		suppress beta version message\n\
 	-f-rtt		suppress RTT info \n\
-";	
+";
 
 char stats[128];
 char srvrbuf[4096];
@@ -1480,6 +1499,7 @@ main( int argc, char **argv )
 	double default_idle_data = DEFAULT_IDLE_DATA;
 	char multsrc[ADDRSTRLEN] = "\0";
 	char multaddr[ADDRSTRLEN] = "\0";
+	long flags;
 
 	sendwin = 0;
 	rcvwin = 0;
@@ -1803,7 +1823,7 @@ main( int argc, char **argv )
 				fflush(stderr);
 				exit(1);
 			}
-			else if (interval == 0.0) 
+			else if (interval == 0.0)
 				interval = 1.0;
 			if (*cp1)
 				ch = *(cp1 + strlen(cp1) - 1);
@@ -2103,6 +2123,18 @@ main( int argc, char **argv )
 			}
 			else if (strcmp(&argv[0][2], "single-threaded") == 0) {
 				single_threaded=1;
+			}
+			else if (strcmp(&argv[0][2], "packet-burst") == 0) {
+				maxburst = atoi(argv[1]);
+				if (maxburst <= 0) {
+					fprintf(stderr,
+						"invalid maxburst = %d\n",
+						maxburst);
+					fflush(stderr);
+					exit(1);
+				}
+				argv++;
+				argc--;
 			}
 #ifdef IPV6_V6ONLY
 			else if (strcmp(&argv[0][2], "disable-v4-mapped") == 0) {
@@ -2563,6 +2595,8 @@ doit:
 		if (clientserver && (stream_idx == 1)) {
 			retransinfo = 0;
 			send_retrans = 1;
+			do_retrans = 0;
+			got_0retrans = 0;
 			read_retrans = 1;
 			if (client) {
 				if (udp && !host3 && !traceroute) {
@@ -3388,9 +3422,10 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 				}
-				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
-						vers_minor, vers_delta);
-				fflush(stdout);
+				/* used to send server "OK" here -
+				 * now delay sending of server OK until
+				 * after successful server bind() -
+				 * catches data port collision */
 				if (udp && interval && (buflen >= 32) &&
 					(irvers >= 30403))
 					udplossinfo = 1;
@@ -3404,14 +3439,84 @@ doit:
 					else
 						read_retrans = 0;
 				}
-				if ((trans && !reverse) || (!trans && reverse))
-					usleep(50000);
 			}
-			if (!udp && trans && (nstream == 1)) {
-				nretrans = get_retrans(fd[0]);
-				if (retransinfo > 0)
-					b_flag = 1;
+		}
+
+		if (clientserver && client && (stream_idx == 1)) {
+			reading_srvr_info = 1;
+			pollfds[0].fd = fileno(ctlconn);
+			pollfds[0].events = POLLIN | POLLPRI;
+			pollfds[0].revents = 0;
+			flags = fcntl(0, F_GETFL, 0);
+			if (flags < 0)
+				err("fcntl 1");
+			flags |= O_NONBLOCK;
+			if (fcntl(0, F_SETFL, flags) < 0)
+				err("fcntl 2");
+			itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+			itimer.it_value.tv_usec = 0;
+			itimer.it_interval.tv_sec = 0;
+			itimer.it_interval.tv_usec = 0;
+			setitimer(ITIMER_REAL, &itimer, 0);
+		}
+		if (clientserver && client && (stream_idx == 1) &&
+		    ((pollst = poll(pollfds, 1, 0)) > 0) &&
+		    (pollfds[0].revents & (POLLIN | POLLPRI)) && !got_done) {
+			/* check for server output (mainly for server error) */
+			while (fgets(intervalbuf, sizeof(intervalbuf), stdin)) {
+				setitimer(ITIMER_REAL, &itimer, 0);
+				if (strncmp(intervalbuf, "DONE", 4) == 0) {
+					if (format & DEBUGPOLL) {
+						fprintf(stdout, "got DONE\n");
+						fflush(stdout);
+					}
+					got_done = 1;
+					intr = 1;
+					break;
+				}
+				else if (strncmp(intervalbuf,
+						 "nuttcp-", 7) == 0) {
+					if ((brief <= 0) ||
+					    strstr(intervalbuf, "Warning") ||
+					    strstr(intervalbuf, "Error") ||
+					    strstr(intervalbuf, "Debug")) {
+						if (*ident) {
+							fputs("nuttcp", stdout);
+							fputs(trans ?
+								"-r" : "-t",
+							      stdout);
+							fputs(ident, stdout);
+							fputs(intervalbuf + 8,
+							      stdout);
+						}
+						else
+							fputs(intervalbuf,
+							      stdout);
+						fflush(stdout);
+					}
+					if (strstr(intervalbuf, "Error"))
+						exit(1);
+				}
+				else {
+					if (*ident)
+						fprintf(stdout, "%s: ",
+							ident + 1);
+					fputs(intervalbuf, stdout);
+					fflush(stdout);
+				}
 			}
+		}
+		if (clientserver && client && (stream_idx == 1)) {
+			reading_srvr_info = 0;
+			flags = fcntl(0, F_GETFL, 0);
+			if (flags < 0)
+				err("fcntl 1");
+			flags &= ~O_NONBLOCK;
+			if (fcntl(0, F_SETFL, flags) < 0)
+				err("fcntl 2");
+			itimer.it_value.tv_sec = 0;
+			itimer.it_value.tv_usec = 0;
+			setitimer(ITIMER_REAL, &itimer, 0);
 		}
 
 		if (!client) {
@@ -3426,8 +3531,15 @@ doit:
 		    host = hostbuf;
 		}
 
-		if ((stream_idx > 0) && skip_data)
+		if ((stream_idx > 0) && skip_data) {
+			if (clientserver && !client && (stream_idx == 1)) {
+				/* send server "OK" message */
+				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
+						vers_minor, vers_delta);
+				fflush(stdout);
+			}
 			break;
+		}
 
 		bzero((char *)&sinme[stream_idx], sizeof(sinme[stream_idx]));
 		bzero((char *)&sinhim[stream_idx], sizeof(sinhim[stream_idx]));
@@ -3503,8 +3615,132 @@ doit:
 		sinme6[stream_idx].sin6_family = af;
 #endif
 
-		if ((fd[stream_idx] = socket(domain, (udp && (stream_idx != 0))?SOCK_DGRAM:SOCK_STREAM, 0)) < 0)
+		if ((fd[stream_idx] = socket(domain, (udp && (stream_idx != 0))?SOCK_DGRAM:SOCK_STREAM, 0)) < 0) {
+			if (clientserver && !client && (stream_idx == 1)) {
+				save_errno = errno;
+				fputs("KO\n", stdout);
+				mes("Error: socket() on data stream failed");
+				fputs("Error: ", stdout);
+				fputs(strerror(save_errno), stdout);
+				fputs("\n", stdout);
+				fputs("KO\n", stdout);
+				goto cleanup;
+			}
 			err("socket");
+		}
+
+		if (setsockopt(fd[stream_idx], SOL_SOCKET, SO_REUSEADDR, (void *)&one, sizeof(one)) < 0) {
+			if (clientserver && !client && (stream_idx == 1)) {
+				save_errno = errno;
+				fputs("KO\n", stdout);
+				mes("Error: setsockopt()"
+				    " to so_reuseaddr failed");
+				fputs("Error: ", stdout);
+				fputs(strerror(save_errno), stdout);
+				fputs("\n", stdout);
+				fputs("KO\n", stdout);
+				goto cleanup;
+			}
+			err("setsockopt: so_reuseaddr");
+		}
+
+#ifdef IPV6_V6ONLY
+		if ((af == AF_INET6) && !v4mapped) {
+			if (setsockopt(fd[stream_idx], IPPROTO_IPV6, IPV6_V6ONLY, (void *)&one, sizeof(int)) < 0) {
+				if (clientserver && !client &&
+				    (stream_idx == 1)) {
+					save_errno = errno;
+					fputs("KO\n", stdout);
+					mes("Error: setsockopt()"
+					    " to ipv6_only failed");
+					fputs("Error: ", stdout);
+					fputs(strerror(save_errno), stdout);
+					fputs("\n", stdout);
+					fputs("KO\n", stdout);
+					goto cleanup;
+				}
+				err("setsockopt: ipv6_only");
+			}
+		}
+#endif
+
+		if (af == AF_INET) {
+		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme[stream_idx], sizeof(sinme[stream_idx])) < 0) {
+			if (clientserver && !client && (stream_idx == 1)) {
+				save_errno = errno;
+				fputs("KO\n", stdout);
+				mes("Error: bind() on data stream failed");
+				fputs("Error: ", stdout);
+				fputs(strerror(save_errno), stdout);
+				fputs("\n", stdout);
+				if (((!trans && !reverse)
+					|| (trans && reverse)) &&
+				    (errno == EADDRINUSE) &&
+				    (port == IPERF_PORT))
+					fputs("Info: Possible collision"
+					      " with iperf server\n", stdout);
+				fputs("KO\n", stdout);
+				goto cleanup;
+			}
+			if (clientserver && client && (stream_idx == 1) &&
+			    ((!trans && !reverse) || (trans && reverse)) &&
+			    (errno == EADDRINUSE) && (port == IPERF_PORT)) {
+				errmes("bind");
+				fputs("Info: Possible collision"
+				      " with iperf server\n", stderr);
+				fflush(stderr);
+				exit(1);
+			}
+			err("bind");
+		    }
+		}
+#ifdef AF_INET6
+		else if (af == AF_INET6) {
+		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme6[stream_idx], sizeof(sinme6[stream_idx])) < 0) {
+			if (clientserver && !client && (stream_idx == 1)) {
+				save_errno = errno;
+				fputs("KO\n", stdout);
+				mes("Error: bind() on data stream failed");
+				fputs("Error: ", stdout);
+				fputs(strerror(save_errno), stdout);
+				fputs("\n", stdout);
+				fputs("KO\n", stdout);
+				goto cleanup;
+			}
+			err("bind");
+		    }
+		}
+#endif
+		else {
+		    if (clientserver && !client && (stream_idx == 1)) {
+			save_errno = errno;
+			fputs("KO\n", stdout);
+			mes("Error: unsupported AF on data stream");
+			fputs("Error: ", stdout);
+			fputs(strerror(save_errno), stdout);
+			fputs("\n", stdout);
+			fputs("KO\n", stdout);
+			goto cleanup;
+		    }
+		    err("unsupported AF");
+		}
+
+		if (clientserver && !client && (stream_idx == 1)) {
+			/* finally OK to send server "OK" message */
+			fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
+					vers_minor, vers_delta);
+			fflush(stdout);
+			if ((trans && !reverse) || (!trans && reverse))
+				usleep(50000);
+		}
+
+		if (clientserver && (stream_idx == 1)) {
+			if (!udp && trans && (nstream == 1)) {
+				nretrans = get_retrans(fd[0]);
+				if (retransinfo > 0)
+					b_flag = 1;
+			}
+		}
 
 		if (stream_idx == nstream) {
 			if (brief <= 0)
@@ -3578,7 +3814,7 @@ doit:
 					    multicast);
 				fprintf(stdout, "\n");
 				if (timeout)
-				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n", 
+				    fprintf(stdout,"nuttcp-t%s: time_limit=%.2f\n",
 				    ident, timeout);
 				if ((rate != MAXRATE) || tos)
 				    fprintf(stdout,"nuttcp-t%s:", ident);
@@ -3676,31 +3912,6 @@ doit:
 			}
 		}
 
-		if (setsockopt(fd[stream_idx], SOL_SOCKET, SO_REUSEADDR, (void *)&one, sizeof(one)) < 0)
-				err("setsockopt: so_reuseaddr");
-
-#ifdef IPV6_V6ONLY
-		if ((af == AF_INET6) && !v4mapped) {
-			if (setsockopt(fd[stream_idx], IPPROTO_IPV6, IPV6_V6ONLY, (void *)&one, sizeof(int)) < 0) {
-				err("setsockopt: ipv6_only");
-			}
-		}
-#endif
-
-		if (af == AF_INET) {
-		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme[stream_idx], sizeof(sinme[stream_idx])) < 0)
-			err("bind");
-		}
-#ifdef AF_INET6
-		else if (af == AF_INET6) {
-		    if (bind(fd[stream_idx], (struct sockaddr *)&sinme6[stream_idx], sizeof(sinme6[stream_idx])) < 0)
-			err("bind");
-		}
-#endif
-		else {
-		    err("unsupported AF");
-		}
-
 		if (stream_idx > 0)  {
 		    if (trans) {
 			/* Set the transmitter options */
@@ -3720,7 +3931,7 @@ doit:
 			if (nodelay && !udp) {
 				struct protoent *p;
 				p = getprotobyname("tcp");
-				if( p && setsockopt(fd[stream_idx], p->p_proto, TCP_NODELAY, 
+				if( p && setsockopt(fd[stream_idx], p->p_proto, TCP_NODELAY,
 				    (void *)&one, sizeof(one)) < 0)
 					err("setsockopt: nodelay");
 				if ((stream_idx == nstream) && (brief <= 0))
@@ -3745,8 +3956,8 @@ doit:
 		}
 		if (!udp || (stream_idx == 0))  {
 		    if (((trans && !reverse) && (stream_idx > 0)) ||
-		        ((!trans && reverse) && (stream_idx > 0)) ||
-		        (client && (stream_idx == 0))) {
+			((!trans && reverse) && (stream_idx > 0)) ||
+			(client && (stream_idx == 0))) {
 			/* The transmitter initiates the connection
 			 * (unless reversed by the flip option)
 			 */
@@ -3769,6 +3980,17 @@ doit:
 				if ((sockopterr = setsockopt(fd[stream_idx], IPPROTO_TCP, TCP_MAXSEG,  (void *)&datamss, optlen)) < 0)
 					if (errno != EINVAL)
 						err("unable to set maximum segment size");
+			}
+			if (clientserver && !client && (stream_idx == 1)) {
+				/* check if client went away */
+				pollfds[0].fd = fileno(ctlconn);
+				save_events = pollfds[0].events;
+				pollfds[0].events = POLLIN | POLLPRI;
+				pollfds[0].revents = 0;
+				if ((poll(pollfds, 1, 0) > 0) &&
+				    (pollfds[0].revents & (POLLIN | POLLPRI)))
+					goto cleanup;
+				pollfds[0].events = save_events;
 			}
 			num_connect_tries++;
 			if (stream_idx == 1)
@@ -3908,7 +4130,7 @@ doit:
 
 				if (format & PARSE) {
 					fprintf(stdout,
-						"nuttcp%s%s: connect=%s", 
+						"nuttcp%s%s: connect=%s",
 						trans?"-t":"-r", ident,
 						tmphost);
 					if (trans && datamss) {
@@ -3920,7 +4142,7 @@ doit:
 				}
 				else {
 					fprintf(stdout,
-						"nuttcp%s%s: connect to %s", 
+						"nuttcp%s%s: connect to %s",
 						trans?"-t":"-r", ident,
 						tmphost);
 					if (rtt || (trans && datamss))
@@ -4043,6 +4265,8 @@ acceptnewconn:
 					 * connection */
 					close(nfd);
 					stream_idx = 0;
+					if (oneshot)
+						goto cleanup;
 					goto acceptnewconn;
 				}
 				/* child just makes a grandchild and then
@@ -4078,7 +4302,7 @@ acceptnewconn:
 			    struct sockaddr_in peer;
 			    socklen_t peerlen = sizeof(peer);
 			    if (getpeername(fd[stream_idx],
-			    		    (struct sockaddr *)&peer, 
+					    (struct sockaddr *)&peer,
 					    &peerlen) < 0) {
 				err("getpeername");
 			    }
@@ -4089,7 +4313,7 @@ acceptnewconn:
 
 				if (format & PARSE) {
 					fprintf(stdout,
-						"nuttcp%s%s: accept=%s", 
+						"nuttcp%s%s: accept=%s",
 						trans?"-t":"-r", ident,
 						tmphost);
 					if (trans && datamss) {
@@ -4099,7 +4323,7 @@ acceptnewconn:
 				}
 				else {
 					fprintf(stdout,
-						"nuttcp%s%s: accept from %s", 
+						"nuttcp%s%s: accept from %s",
 						trans?"-t":"-r", ident,
 						tmphost);
 					if (trans && datamss) {
@@ -4116,7 +4340,7 @@ acceptnewconn:
 			    struct sockaddr_in6 peer;
 			    socklen_t peerlen = sizeof(peer);
 			    if (getpeername(fd[stream_idx],
-			    		    (struct sockaddr *)&peer, 
+					    (struct sockaddr *)&peer,
 					    &peerlen) < 0) {
 				err("getpeername");
 			    }
@@ -4126,7 +4350,7 @@ acceptnewconn:
 					  tmphost, sizeof(tmphost));
 				if (format & PARSE) {
 				    fprintf(stdout,
-					    "nuttcp%s%s: accept=%s", 
+					    "nuttcp%s%s: accept=%s",
 					    trans?"-t":"-r", ident,
 					    tmphost);
 				    if (trans && datamss) {
@@ -4135,7 +4359,7 @@ acceptnewconn:
 				}
 				else {
 				    fprintf(stdout,
-					    "nuttcp%s%s: accept from %s", 
+					    "nuttcp%s%s: accept from %s",
 					    trans?"-t":"-r", ident,
 					    tmphost);
 				    if (trans && datamss) {
@@ -4146,8 +4370,8 @@ acceptnewconn:
 				fprintf(stdout, "\n");
 			    }
 			    if (stream_idx == 0) {
-			    	clientaddr6 = peer.sin6_addr;
-			    	clientscope6 = peer.sin6_scope_id;
+				clientaddr6 = peer.sin6_addr;
+				clientscope6 = peer.sin6_scope_id;
 			    }
 			}
 #endif
@@ -4720,22 +4944,22 @@ acceptnewconn:
 		socklen_t me6len = sizeof(me6);
 #endif
 		if (af == AF_INET) {
-			if (getpeername(fd[0], (struct sockaddr *)&peer, 
+			if (getpeername(fd[0], (struct sockaddr *)&peer,
 					&peerlen) < 0) {
 				err("getpeername");
 			}
-			if (getsockname(fd[0], (struct sockaddr *)&me, 
+			if (getsockname(fd[0], (struct sockaddr *)&me,
 					&melen) < 0) {
 				err("getsockname");
 			}
 		}
 #ifdef AF_INET6
 		else if (af == AF_INET6) {
-			if (getpeername(fd[0], (struct sockaddr *)&peer6, 
+			if (getpeername(fd[0], (struct sockaddr *)&peer6,
 					&peer6len) < 0) {
 				err("getpeername");
 			}
-			if (getsockname(fd[0], (struct sockaddr *)&me6, 
+			if (getsockname(fd[0], (struct sockaddr *)&me6,
 					&me6len) < 0) {
 				err("getsockname");
 			}
@@ -4771,7 +4995,7 @@ acceptnewconn:
 
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -4813,7 +5037,7 @@ acceptnewconn:
 
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -4860,7 +5084,7 @@ acceptnewconn:
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -4906,7 +5130,7 @@ acceptnewconn:
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -4934,7 +5158,7 @@ acceptnewconn:
 		    }
 #ifdef AF_INET6
 		    else if (af == AF_INET6) {
-		    	bcopy((char *)&sinhim6[1], (char *)&save_sinhim6,
+			bcopy((char *)&sinhim6[1], (char *)&save_sinhim6,
 			      sizeof(struct sockaddr_in6));
 		    }
 #endif
@@ -4961,7 +5185,7 @@ acceptnewconn:
 					  multsrc, sizeof(multsrc));
 				inet_ntop(af, &sinhim[1].sin_addr.s_addr,
 					  multaddr, sizeof(multaddr));
-			 	if (format & PARSE) {
+				if (format & PARSE) {
 					fprintf(stdout,
 						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
 						trans?"-t":"-r", ident,
@@ -5003,7 +5227,7 @@ acceptnewconn:
 					  multsrc, sizeof(multsrc));
 				inet_ntop(af, &sinhim6[1].sin6_addr.s6_addr,
 					  multaddr, sizeof(multaddr));
-			 	if (format & PARSE) {
+				if (format & PARSE) {
 					fprintf(stdout,
 						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=0\n",
 						trans?"-t":"-r", ident,
@@ -5056,7 +5280,7 @@ acceptnewconn:
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -5104,7 +5328,7 @@ acceptnewconn:
 					  multaddr, sizeof(multaddr));
 				if (format & PARSE)
 					fprintf(stdout,
-						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n", 
+						"nuttcp%s%s: multicast_source=%s multicast_group=%s ssm=1\n",
 						trans?"-t":"-r", ident,
 						multsrc, multaddr);
 				else
@@ -5216,7 +5440,7 @@ acceptnewconn:
 		if (fcntl(0, F_SETFL, flags) < 0)
 			err("fcntl 2");
 	}
-	if (sinkmode) {      
+	if (sinkmode) {
 		register int cnt = 0;
 		if (trans)  {
 			if(udp) {
@@ -5260,20 +5484,44 @@ acceptnewconn:
 			      (force_retrans >= retransinfo)))) {
 				uint32_t tmp;
 
-				if (retransinfo == 1)
-					tmp = 0x5254524Eu;	/* "RTRN" */
-				else
-					tmp = 0x48525452u;	/* "HRTR" */
-				bcopy(&nretrans, buf + 24, 4);
-				bcopy(&tmp, buf + 28, 4);
+				if (client) {
+					if (send_retrans)
+						do_retrans = 1;
+					send_retrans = 0;
+					if (!udp)
+						bzero(buf + 24, 8);
+				}
+				else {
+					if (retransinfo == 1)
+						tmp = 0x5254524Eu;  /* "RTRN" */
+					else
+						tmp = 0x48525452u;  /* "HRTR" */
+					bcopy(&nretrans, buf + 24, 4);
+					bcopy(&tmp, buf + 28, 4);
+					do_retrans = 0;
+				}
 			}
 			else {
 				send_retrans = 0;
+				do_retrans = 0;
 				if (!udp)
 					bzero(buf + 24, 8);
 			}
 			if (nbuf == INT_MAX)
 				nbuf = ULLONG_MAX;
+			if (!client) {
+				/* check if client went away */
+				pollfds[0].fd = fileno(ctlconn);
+				save_events = pollfds[0].events;
+				pollfds[0].events = POLLIN | POLLPRI;
+				pollfds[0].revents = 0;
+				if ((poll(pollfds, 1, 0) > 0) &&
+				    (pollfds[0].revents & (POLLIN | POLLPRI))) {
+					nbuf = 0;
+					intr = 1;
+				}
+				pollfds[0].events = save_events;
+			}
 			while (nbuf-- && ((cnt = Nwrite(fd[stream_idx + 1],buf,buflen)) == buflen) && !intr) {
 				if (clientserver && ((nbuf & 0x3FF) == 0)) {
 				    if (!client) {
@@ -5301,7 +5549,7 @@ acceptnewconn:
 						tmpbuf[0] = '\0';
 						if ((recv(fd[0], tmpbuf, 1,
 							  MSG_OOB) == -1) &&
-						    (errno == EINVAL)) 
+						    (errno == EINVAL))
 							recv(fd[0], tmpbuf,
 							     1, 0);
 						if (tmpbuf[0] == 'A')
@@ -5399,7 +5647,72 @@ acceptnewconn:
 					else {
 						if (*ident)
 							fprintf(stdout, "%s: ", ident + 1);
+						cp1 = intervalbuf +
+							strlen(intervalbuf) - 1;
+						/* ugly kludge to get rid of
+						 * server "0 retrans" info at
+						 * start of transfer for small
+						 * interval reports -
+						 * hopefully it won't be
+						 * necessary to also check
+						 * at end of transfer when
+						 * processing server output */
+						if (!got_0retrans) {
+						    if (format & PARSE) {
+							if ((cp2 = strstr(
+								    intervalbuf,
+								    "host-"
+								    "retrans")))
+							    *(cp2 - 1) = '\0';
+							else if ((cp2 = strstr(
+								    intervalbuf,
+								    "retrans")))
+							    *(cp2 - 1) = '\0';
+							else {
+							    *cp1 = '\0';
+							    got_0retrans = 1;
+							}
+						    }
+						    else {
+							if (strstr(intervalbuf,
+								"host-retrans"))
+							    *(cp1 - 19) = '\0';
+							else if (strstr(
+								    intervalbuf,
+								    "retrans"))
+							    *(cp1 - 14) = '\0';
+							else {
+							    *cp1 = '\0';
+							    got_0retrans = 1;
+							}
+						    }
+						}
+						else {
+						    *cp1 = '\0';
+						}
 						fputs(intervalbuf, stdout);
+						if (do_retrans) {
+						    nretrans =
+						      get_retrans(fd[stream_idx
+									+ 1]);
+						    nretrans -= iretrans;
+						    if (format & PARSE)
+							fprintf(stdout,
+							 P_RETRANS_FMT_INTERVAL,
+							   (retransinfo == 1) ?
+								"" : "host-",
+							   (nretrans -
+								pretrans));
+						    else
+							fprintf(stdout,
+							 RETRANS_FMT_INTERVAL,
+							   (nretrans -
+								pretrans),
+							   (retransinfo == 1) ?
+								"" : "host-");
+						    pretrans = nretrans;
+						}
+						fprintf(stdout, "\n");
 						fflush(stdout);
 					}
 					}
@@ -5632,6 +5945,7 @@ acceptnewconn:
 		if (!udp && trans) {
 #if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
 			struct timeval timeunack, timec, timed;
+			long flags;
 
 			optlen = sizeof(tcpinf);
 			if (getsockopt(fd[stream_idx], SOL_TCP, TCP_INFO,
@@ -5641,8 +5955,110 @@ acceptnewconn:
 			}
 			gettimeofday(&timeunack, (struct timezone *)0);
 			realtd = 0.0;
+			if (clientserver && client) {
+				reading_srvr_info = 1;
+				pollfds[0].fd = fileno(ctlconn);
+				pollfds[0].events = POLLIN | POLLPRI;
+				pollfds[0].revents = 0;
+				flags = fcntl(0, F_GETFL, 0);
+				if (flags < 0)
+					err("fcntl 1");
+				flags |= O_NONBLOCK;
+				if (fcntl(0, F_SETFL, flags) < 0)
+					err("fcntl 2");
+				itimer.it_value.tv_sec = MAX_EOT_WAIT_SEC + 10;
+				itimer.it_value.tv_usec = 0;
+				itimer.it_interval.tv_sec = 0;
+				itimer.it_interval.tv_usec = 0;
+				setitimer(ITIMER_REAL, &itimer, 0);
+			}
 			while ((tcpinf.tcpinfo_unacked) &&
 			       (realtd < MAX_EOT_WAIT_SEC)) {
+				if (clientserver && client &&
+				    ((pollst = poll(pollfds, 1, 0)) > 0) &&
+				    (pollfds[0].revents & (POLLIN | POLLPRI)) &&
+				    !got_done) {
+					/* check for server output */
+					while (fgets(intervalbuf,
+					       sizeof(intervalbuf), stdin))
+					{
+					setitimer(ITIMER_REAL, &itimer, 0);
+					gettimeofday(&timeunack,
+						     (struct timezone *)0);
+					if (strncmp(intervalbuf, "DONE", 4)
+							== 0) {
+						if (format & DEBUGPOLL) {
+							fprintf(stdout,
+								"got DONE\n");
+							fflush(stdout);
+						}
+						got_done = 1;
+						intr = 1;
+						break;
+					}
+					else if (strncmp(intervalbuf,
+							 "nuttcp-", 7) == 0) {
+						if ((brief <= 0) ||
+						    strstr(intervalbuf,
+							    "Warning") ||
+						    strstr(intervalbuf,
+							    "Error") ||
+						    strstr(intervalbuf,
+							    "Debug")) {
+							if (*ident) {
+							    fputs("nuttcp",
+								  stdout);
+							    fputs(trans ?
+								    "-r" : "-t",
+								  stdout);
+							    fputs(ident,
+								  stdout);
+							    fputs(intervalbuf
+								    + 8,
+								  stdout);
+							}
+							else
+							    fputs(intervalbuf,
+								  stdout);
+							fflush(stdout);
+						}
+						if (strstr(intervalbuf,
+							   "Error"))
+							exit(1);
+					}
+					else {
+						if (*ident)
+							fprintf(stdout, "%s: ",
+								ident + 1);
+						intervalbuf[strlen(intervalbuf)
+								- 1] = '\0';
+						fputs(intervalbuf, stdout);
+						if (do_retrans) {
+						    nretrans =
+						      get_retrans(
+							    fd[stream_idx]);
+						    nretrans -= iretrans;
+						    if (format & PARSE)
+							fprintf(stdout,
+							 P_RETRANS_FMT_INTERVAL,
+							   (retransinfo == 1) ?
+								"" : "host-",
+							   (nretrans -
+								pretrans));
+						    else
+							fprintf(stdout,
+							 RETRANS_FMT_INTERVAL,
+							   (nretrans -
+								pretrans),
+							   (retransinfo == 1) ?
+								"" : "host-");
+						    pretrans = nretrans;
+						}
+						fprintf(stdout, "\n");
+						fflush(stdout);
+					}
+					}
+				}
 				if (format & DEBUGRETRANS)
 					print_tcpinfo();
 				if (format & DEBUGRETRANS)
@@ -5661,11 +6077,23 @@ acceptnewconn:
 				realtd = timed.tv_sec
 					    + ((double)timed.tv_usec) / 1000000;
 			}
+			if (clientserver && client) {
+				reading_srvr_info = 0;
+				flags = fcntl(0, F_GETFL, 0);
+				if (flags < 0)
+					err("fcntl 1");
+				flags &= ~O_NONBLOCK;
+				if (fcntl(0, F_SETFL, flags) < 0)
+					err("fcntl 2");
+				itimer.it_value.tv_sec = 0;
+				itimer.it_value.tv_usec = 0;
+				setitimer(ITIMER_REAL, &itimer, 0);
+			}
 
 			if (tcpinf.tcpinfo_unacked) {
 				/* assume receiver went away */
 				if (clientserver && client) {
-					mes("Error: server not ACKing data");
+					mes("Error: receiver not ACKing data");
 					exit(1);
 				}
 				goto cleanup;
@@ -5686,7 +6114,16 @@ acceptnewconn:
 			sretrans);
 	}
 
-	close_data_channels();
+	if (interval && clientserver && client && do_retrans && !got_done) {
+		/* don't fully close data channels yet since there
+		 * may be some straggler interval reports to which we
+		 * will need to append retrans info, so just shutdown()
+		 * for writing for now */
+		for (stream_idx = 1; stream_idx <= nstream; stream_idx++)
+			shutdown(fd[stream_idx], SHUT_WR);
+	}
+	else
+		close_data_channels();
 
 	if (interval && clientserver && !client && !trans) {
 		fprintf(stdout, "DONE\n");
@@ -5741,12 +6178,34 @@ acceptnewconn:
 				continue;
 			if (*ident)
 				fprintf(stdout, "%s: ", ident + 1);
+			intervalbuf[strlen(intervalbuf) - 1] = '\0';
 			fputs(intervalbuf, stdout);
+			if (do_retrans) {
+				nretrans = get_retrans(fd[1]);
+				nretrans -= iretrans;
+				if (format & PARSE)
+					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
+						(retransinfo == 1) ?
+							"" : "host-",
+						(nretrans - pretrans));
+				else
+					fprintf(stdout, RETRANS_FMT_INTERVAL,
+						(nretrans - pretrans),
+						(retransinfo == 1) ?
+							"" : "host-");
+				pretrans = nretrans;
+			}
+			fprintf(stdout, "\n");
 			fflush(stdout);
 		}
 		itimer.it_value.tv_sec = 0;
 		itimer.it_value.tv_usec = 0;
 		setitimer(ITIMER_REAL, &itimer, 0);
+	}
+
+	if (interval && clientserver && client && do_retrans) {
+		/* it's OK to fully close the data channels now */
+		close_data_channels();
 	}
 
 	if (clientserver && client) {
@@ -6240,7 +6699,7 @@ cleanup:
 		ident[0] = '\0';
 		intr = 0;
 		abortconn = 0;
-		port = 5001;
+		port = 5101;
 		trans = 0;
 		braindead = 0;
 		udp = 0;
@@ -6370,7 +6829,7 @@ prep_timer()
 
 /*
  *			R E A D _ T I M E R
- * 
+ *
  */
 double
 read_timer( char *str, int len )
