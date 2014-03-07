@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.3.2
+ *	N U T T C P . C						v5.3.3
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,15 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.3.3, Bill Fink & Mark S. Mathews, 18-Jun-06
+ *	Add new capability for separate control and data paths
+ *	(using syntax:  nuttcp ctl_name_or_IP/data_name_or_IP)
+ *	Extend new capability for multiple independent data paths
+ *	(using syntax:  nuttcp ctl/data1/data2/.../datan)
+ *	Above only supported for transmit or flipped/reversed receive
+ *	Fix -Wall compiler warnings on 64-bit systems
+ *	Make manually started server also pass stderr to client
+ *	(so client will get warning messages from server)
  * V5.3.2, Bill Fink, 09-Jun-06
  *	Fix bug with default UDP buflen for 3rd party
  *	Fix compiler warnings with -Wall on FreeBSD
@@ -472,7 +481,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 3;
-int vers_delta = 2;
+int vers_delta = 3;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -502,7 +511,7 @@ int buflen = 64 * 1024;		/* length of buffer */
 int nbuflen;
 int mallocsize;
 char *buf;			/* ptr to dynamic buffer */
-uint64_t nbuf = 0;		/* number of buffers to send in sinkmode */
+unsigned long long nbuf = 0;	/* number of buffers to send in sinkmode */
 int nbuf_bytes = 0;		/* set to 1 if nbuf is actually bytes */
 
 /*  nick code  */
@@ -622,8 +631,8 @@ char Usage[] = "\
 Usage: nuttcp or nuttcp -h	prints this usage info\n\
 Usage: nuttcp -V		prints version info\n\
 Usage: nuttcp -xt [-m] host	forward and reverse traceroute to/from server\n\
-Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
-      |(receiver):   nuttcp -r [-options] [host] [3rd-party] [ >out ]\n\
+Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
+      |(receiver):   nuttcp -r [-options] [host] [3rd-party] [>out]\n\
 	-4	Use IPv4\n"
 #ifdef AF_INET6
 "	-6	Use IPv6\n"
@@ -972,7 +981,7 @@ main( int argc, char **argv )
 	int sockopterr = 0;
 	int save_errno;
 	struct servent *sp = 0;
-	struct addrinfo hints, *res = NULL;
+	struct addrinfo hints, *res[MAXSTREAM + 1] = { NULL };
 	short save_events;
 	int skiparg;
 	int reqval;
@@ -1466,7 +1475,7 @@ main( int argc, char **argv )
 		cp1 = host3;
 		while (*cp1) {
 			if (!isalnum((int)(*cp1)) && (*cp1 != '-') && (*cp1 != '.')
-					   && (*cp1 != ':')) {
+					   && (*cp1 != ':') && (*cp1 != '/')) {
 				fprintf(stderr, "invalid 3rd party host '%s'\n", host3);
 				fflush(stderr);
 				exit(1);
@@ -1513,15 +1522,53 @@ main( int argc, char **argv )
 
 	if (argc >= 1) {
 		host = argv[0];
-
-		bzero(&hints, sizeof(hints));
-		res = NULL;
-		if (explicitaf) hints.ai_family = af;
-		if ((error_num = getaddrinfo(host, NULL, &hints, &res))) {
-			fprintf(stderr, "bad hostname or address: %s\n", gai_strerror(error_num));
+		stream_idx = 0;
+		res[0] = NULL;
+		cp1 = host;
+		if (host[strlen(host) - 1] == '/') {
+			fprintf(stderr, "bad hostname or address: trailing '/' not allowed: %s\n", host);
+			fflush(stderr);
 			exit(1);
 		}
-		af = res->ai_family;
+		if (strchr(host, '/') && !trans && !reverse) {
+			fprintf(stderr, "multiple control/data paths not supported for receive\n");
+			fflush(stderr);
+			exit(1);
+		}
+		if (strchr(host, '/') && trans && reverse) {
+			fprintf(stderr, "multiple control/data paths not supported for flipped transmit\n");
+			fflush(stderr);
+			exit(1);
+		}
+		if (host[0] == '/') {
+			host++;
+			cp1++;
+			stream_idx = 1;
+		}
+		else if ((cp2 = strchr(host, '/'))) {
+			host = cp2 + 1;
+		}
+
+		while (stream_idx <= nstream) {
+			bzero(&hints, sizeof(hints));
+			res[stream_idx] = NULL;
+			if (explicitaf) hints.ai_family = af;
+			if ((cp2 = strchr(cp1, '/'))) {
+				if (stream_idx == nstream) {
+					fprintf(stderr, "bad hostname or address: too many data paths for nstream=%d: %s\n", nstream, argv[0]);
+					fflush(stderr);
+					exit(1);
+				}
+				*cp2 = '\0';
+			}
+			if ((error_num = getaddrinfo(cp1, NULL, &hints, &res[stream_idx]))) {
+				if (cp2)
+					*cp2++ = '/';
+				fprintf(stderr, "bad hostname or address: %s: %s\n", gai_strerror(error_num), argv[0]);
+				fflush(stderr);
+				exit(1);
+			}
+			af = res[stream_idx]->ai_family;
 /*
  * At the moment PF_ matches AF_ but are maintained seperate and the socket
  * call is supposed to be PF_
@@ -1530,7 +1577,31 @@ main( int argc, char **argv )
  * ever get changed to not match some code will have to go here to find the
  * domain appropriate for the family
  */
-		domain = af;
+			domain = af;
+			stream_idx++;
+			if (cp2) {
+				*cp2++ = '/';
+				cp1 = cp2;
+			}
+			else
+				cp1 = host;
+		}
+		if (!res[0]) {
+			if ((cp1 = strchr(host, '/')))
+				*cp1 = '\0';
+			if ((error_num = getaddrinfo(host, NULL, &hints, &res[0]))) {
+				if (cp1)
+					*cp1++ = '/';
+				fprintf(stderr, "bad hostname or address: %s: %s\n", gai_strerror(error_num), argv[0]);
+				fflush(stderr);
+				exit(1);
+			}
+			af = res[0]->ai_family;
+			/* see previous comment about domain */
+			domain = af;
+			if (cp1)
+				*cp1 = '/';
+		}
 	}
 
 #ifdef AF_INET6
@@ -2006,6 +2077,8 @@ doit:
 					savestdout=dup(1);
 					close(1);
 					dup(fd[0]);
+					close(2);
+					dup(1);
 				}
 				fgets(buf, mallocsize, ctlconn);
 				if (sscanf(buf, HELO_FMT, &rvers_major,
@@ -2080,7 +2153,8 @@ doit:
 							if (!isalnum((int)(*cp1))
 							     && (*cp1 != '-')
 							     && (*cp1 != '.')
-							     && (*cp1 != ':')) {
+							     && (*cp1 != ':')
+							     && (*cp1 != '/')) {
 								fputs("KO\n", stdout);
 								mes("invalid 3rd party host");
 								fprintf(stdout, "3rd party host = '%s'\n", host3);
@@ -2293,17 +2367,17 @@ doit:
 			if (client) {
 				if (af == AF_INET) {
 				    sinhim[stream_idx].sin_family = af;
-				    bcopy((char *)&(((struct sockaddr_in *)res->ai_addr)->sin_addr),
+				    bcopy((char *)&(((struct sockaddr_in *)res[stream_idx]->ai_addr)->sin_addr),
 					  (char *)&sinhim[stream_idx].sin_addr.s_addr,
 					  sizeof(sinhim[stream_idx].sin_addr.s_addr));
 				}
 #ifdef AF_INET6
 				else if (af == AF_INET6) {
 				    sinhim6[stream_idx].sin6_family = af;
-				    bcopy((char *)&(((struct sockaddr_in6 *)res->ai_addr)->sin6_addr),
+				    bcopy((char *)&(((struct sockaddr_in6 *)res[stream_idx]->ai_addr)->sin6_addr),
 					  (char *)&sinhim6[stream_idx].sin6_addr.s6_addr,
 					  sizeof(sinhim6[stream_idx].sin6_addr.s6_addr));
-				    sinhim6[stream_idx].sin6_scope_id = ((struct sockaddr_in6 *)res->ai_addr)->sin6_scope_id;
+				    sinhim6[stream_idx].sin6_scope_id = ((struct sockaddr_in6 *)res[stream_idx]->ai_addr)->sin6_scope_id;
 				}
 #endif
 				else {
@@ -2435,7 +2509,7 @@ doit:
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (udp) {
-					uint64_t ppsrate =
+					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
 					fprintf(stdout," pps_rate=%llu",
@@ -2470,7 +2544,7 @@ doit:
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
 				    if (udp) {
-					uint64_t ppsrate =
+					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
 
 					fprintf(stdout,", %llu pps", ppsrate);
@@ -4084,6 +4158,9 @@ cleanup:
 			if (!inetd) {
 				dup(savestdout);
 				close(savestdout);
+				fflush(stderr);
+				close(2);
+				dup(1);
 			}
 		}
 		fclose(ctlconn);
@@ -4150,14 +4227,16 @@ cleanup:
 		brief = 0;
 		done = 0;
 		got_begin = 0;
-		res = NULL;
+		for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
+			res[stream_idx] = NULL;
 		if (!oneshot)
 			goto doit;
 	}
 	if (!sinkmode && !trans)
 		close(realstdout);
-	if (res)
-		freeaddrinfo(res);
+	for ( stream_idx = 0; stream_idx <= nstream; stream_idx++ )
+		if (res[stream_idx])
+			freeaddrinfo(res[stream_idx]);
 	exit(0);
 
 usage:
