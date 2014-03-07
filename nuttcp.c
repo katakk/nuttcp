@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.1
+ *	N U T T C P . C						v6.2.2
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.2, Bill Fink, 3-Apr-09
+ *	Fix bad third party bug causing >= 1 minute transfers to silently fail
+ *	Fix Usage: statement: "--idle-data-timeout" not just a server option
  * 6.2.1, Rob Scott, 22-Mar-09
  *	Added IPv6 and SSM MC support
  *	Ported from Rob's 5.5.5 based code by Bill Fink
@@ -575,6 +578,7 @@ static struct	sigaction savesigact;
 #define DEFAULTUDPBUFLEN	8192
 #define DEFAULT_MC_UDPBUFLEN	1024
 #define MAXUDPBUFLEN		65507
+#define LOW_RATE_HOST3		1000
 #define MINMALLOC		1024
 #define HI_MC			231ul
 #define HI_MC_SSM		232ul
@@ -649,7 +653,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 1;
+int vers_delta = 2;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -902,6 +906,8 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-b	brief output (default)\n\
 	-D	xmit only: don't buffer TCP writes (sets TCP_NODELAY sockopt)\n\
 	-B	recv only: only output full blocks of size from -l## (for TAR)\n"
+"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
+"		     server timeout in seconds for idle data connection\n"
 #ifdef IPV6_V6ONLY
 "	--disable-v4-mapped disable v4 mapping in v6 server (default)\n"
 "	--enable-v4-mapped enable v4 mapping in v6 server\n"
@@ -919,8 +925,6 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 #ifdef HAVE_SETPRIO
 "	-xP##	set nuttcp process priority (must be root)\n"
 #endif
-"	--idle-data-timeout <value|minimum/default/maximum>  (default: 5/30/60)\n"
-"		     server timeout in seconds for idle data connection\n"
 "	--no3rdparty don't allow 3rd party capability\n"
 "	--nofork     don't fork server\n"
 "	--single-threaded  make manually started server be single threaded\n"
@@ -3918,7 +3922,25 @@ doit:
 			if ((pid = fork()) == (pid_t)-1)
 				err("can't fork");
 			if (pid == 0) {
-				itimer.it_value.tv_sec = SRVR_INFO_TIMEOUT;
+				if (interval) {
+					itimer.it_value.tv_sec = interval;
+				}
+				else if (timeout) {
+					itimer.it_value.tv_sec = timeout;
+				}
+				else {
+					if (rate != MAXRATE)
+						itimer.it_value.tv_sec =
+							(double)(2*nbuf*buflen)
+								/rate/125;
+					else
+						itimer.it_value.tv_sec =
+							(double)(nbuf*buflen)
+							    /LOW_RATE_HOST3/125;
+					if (itimer.it_value.tv_sec < 7200)
+						itimer.it_value.tv_sec = 7200;
+				}
+				itimer.it_value.tv_sec += SRVR_INFO_TIMEOUT;
 				itimer.it_value.tv_usec = 0;
 				itimer.it_interval.tv_sec = 0;
 				itimer.it_interval.tv_usec = 0;
