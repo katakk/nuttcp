@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.0.7
+ *	N U T T C P . C						v6.1.1
  *
  * Copyright(c) 2000 - 2008 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2008 Rob Scott.  All rights reserved.
@@ -29,6 +29,17 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.1.1, Bill Fink, 26-Aug-08
+ *	Remove beta designation
+ *	Report RTT by default (use "-f-rtt" to suppress)
+ *	Moved RTT info to "connect to" line
+ *	Correct bogus IP frag warning for e.g. "-l1472" or "-l8972"
+ *	Don't report interval host-retrans if no data rcvd (e.g. initial PMTU)
+ *	Correct reporting of retrans info with "-fparse" option
+ *	Correct reporting of RTT with "-F" flip option
+ *	Report doubled send and receive window sizes (for Linux)
+ *	Add report of available send and receive window sizes (for Linux)
+ *	Touchup TODO list to remove some already completed items
  * 6.0.7, Bill Fink, 19-Aug-08
  *	Add delay (default 0.5 sec) to "-a" option & change max retries to 10
  *	Updated Copyright notice
@@ -336,11 +347,9 @@
  *	IPv6 multicast support
  *	Add "-ut" option to do both UDP and TCP simultaneously
  *	Default rate limit UDP if too much loss
- *	QOS support
  *	Ping option
  *	Other brief output formats
  *	Linux window size bug/feature note
- *	Retransmission/timeout info
  *	Network interface interrupts (for Linux only)
  *	netstat -i info
  *	Man page
@@ -494,9 +503,10 @@ static struct	sigaction savesigact;
 #define RETRANS_FMT_BRIEF " %d %sretrans"
 #define RETRANS_FMT_INTERVAL " %5d %sretrans"
 #define RETRANS_FMT_IN	"retrans = %d"
-#define RTT_FMT		"RTT = %.3f ms"
+#define RTT_FMT		" RTT=%.3f ms"
 #define RTT_FMT_BRIEF	" %.2f msRTT"
-#define RTT_FMT_IN	"RTT = %lf"
+#define RTT_FMT_IN	"RTT=%lf"
+#define RTT_FMT_INB	"RTT = %lf"
 #define SIZEOF_TCP_INFO_RETRANS		104
 
 /* define NEW_TCP_INFO if struct tcp_info in /usr/include/netinet/tcp.h
@@ -533,7 +543,7 @@ static struct	sigaction savesigact;
 #define P_RETRANS_FMT_BRIEF	" %sretrans=%d"
 #define P_RETRANS_FMT_INTERVAL	" %sretrans=%d"
 #define P_RETRANS_FMT_IN	"retrans=%d"
-#define P_RTT_FMT		"rtt_ms=%.3f"
+#define P_RTT_FMT		" rtt_ms=%.3f"
 #define P_RTT_FMT_BRIEF		" rtt_ms=%.2f"
 #define P_RTT_FMT_IN		"rtt_ms=%lf"
 
@@ -562,6 +572,11 @@ static struct	sigaction savesigact;
 #define DEFAULT_IDLE_DATA	30.0	/* default value for chk_idle_data */
 #define IDLE_DATA_MAX		60.0	/* maximum value for chk_idle_data */
 #define NON_JUMBO_ETHER_MSS	1448	/* 1500 - 20:IP - 20:TCP -12:TCPOPTS */
+#define TCP_UDP_HDRLEN_DELTA	12	/* difference in tcp & udp hdr sizes */
+
+#if defined(linux)
+#define TCP_ADV_WIN_SCALE	"/proc/sys/net/ipv4/tcp_adv_win_scale"
+#endif
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -577,7 +592,7 @@ static struct	sigaction savesigact;
 #define	DEBUGRETRANS		0x200	/* output info for debugging collection
 					 * of TCP retransmission info */
 #define	NOBETAMSG		0x400	/* suppress beta version message */
-#define	WANTRTT			0x800	/* output RTT info */
+#define	WANTRTT			0x800	/* output RTT info (default) */
 
 #ifdef NO_IPV6				/* Build without IPv6 support */
 #undef AF_INET6
@@ -611,14 +626,14 @@ void print_tcpinfo();
 #endif
 
 int vers_major = 6;
-int vers_minor = 0;
-int vers_delta = 7;
+int vers_minor = 1;
+int vers_delta = 1;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
 int rvers_delta = 0;
 int irvers;
-int beta = 1;
+int beta = 0;
 
 struct sockaddr_in sinme[MAXSTREAM + 1];
 struct sockaddr_in sinhim[MAXSTREAM + 1];
@@ -652,6 +667,10 @@ socklen_t optlen;
 int rcvwin=0, rcvwinval=0, origrcvwin=0;
 int srvrwin=0;
 /*  end nick code  */
+
+#if defined(linux)
+int sendwinavail=0, rcvwinavail=0, winadjust=0;
+#endif
 
 #if defined(linux) && defined(TCPI_OPT_TIMESTAMPS)
 #ifdef OLD_TCP_INFO
@@ -881,7 +900,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-f-percentloss	don't give %%loss info on brief output (UDP)\n\
 	-fparse		generate key=value parsable output\n\
 	-f-beta		suppress beta version message\n\
-	-frtt		add RTT info \n\
+	-f-rtt		suppress RTT info \n\
 ";	
 
 char stats[128];
@@ -1129,11 +1148,15 @@ sigalarm( int signum )
 			}
 			if (read_retrans) {
 				if (format & PARSE)
-					strcpy(fmt, P_RETRANS_FMT_INTERVAL);
+					fprintf(stdout, P_RETRANS_FMT_INTERVAL,
+						((retransinfo == 1) ||
+						 !nrbytes) ?  "" : "host-",
+						(nretrans - pretrans));
 				else
-					strcpy(fmt, RETRANS_FMT_INTERVAL);
-				fprintf(stdout, fmt, (nretrans - pretrans),
-					retransinfo == 1 ?  "" : "host-");
+					fprintf(stdout, RETRANS_FMT_INTERVAL,
+						(nretrans - pretrans),
+						((retransinfo == 1) ||
+						 !nrbytes) ?  "" : "host-");
 			}
 			if (format & RUNNINGTOTAL) {
 				if (format & PARSE)
@@ -1178,14 +1201,19 @@ sigalarm( int signum )
 				}
 				if (read_retrans) {
 					if (format & PARSE)
-						strcpy(fmt,
-						       P_RETRANS_FMT_INTERVAL);
+						fprintf(stdout,
+							P_RETRANS_FMT_INTERVAL,
+							((retransinfo == 1) ||
+							 !nrbytes) ?
+							    "" : "host-",
+							nretrans);
 					else
-						strcpy(fmt,
-						       RETRANS_FMT_INTERVAL);
-					fprintf(stdout, fmt, nretrans,
-						retransinfo == 1 ?
-							"" : "host-");
+						fprintf(stdout,
+							RETRANS_FMT_INTERVAL,
+							nretrans,
+							((retransinfo == 1) ||
+							 !nrbytes) ?
+							    "" : "host-");
 				}
 			}
 			if (udplossinfo && (format & XMITSTATS)) {
@@ -1271,6 +1299,7 @@ main( int argc, char **argv )
 	sendwin = 0;
 	rcvwin = 0;
 	srvrwin = -1;
+	format |= WANTRTT;
 
 	if (argc < 2) goto usage;
 
@@ -1636,8 +1665,11 @@ main( int argc, char **argv )
 				format |= PARSE;
 			else if (strcmp(&argv[0][2], "-beta") == 0)
 				format |= NOBETAMSG;
+			/* below is for compatibility with 6.0.x beta */
 			else if (strcmp(&argv[0][2], "rtt") == 0)
 				format |= WANTRTT;
+			else if (strcmp(&argv[0][2], "-rtt") == 0)
+				format &= ~WANTRTT;
 			else {
 				if (argv[0][2]) {
 					fprintf(stderr, "invalid format option \"%s\"\n", &argv[0][2]);
@@ -2258,7 +2290,9 @@ doit:
 					else if (format & DEBUGMTU)
 						fprintf(stderr, "ctlconnmss = %d\n", ctlconnmss);
 					if (buflenopt) {
-						if (buflen > ctlconnmss) {
+						if (buflen >
+						    ctlconnmss +
+						      TCP_UDP_HDRLEN_DELTA) {
 							if (format & PARSE)
 								fprintf(stderr, "nuttcp%s%s: Warning=\"IP_frags_or_no_data_reception_since_buflen=%d_>_ctlconnmss=%d\"\n", trans?"-t":"-r", ident, buflen, ctlconnmss);
 							else
@@ -3446,16 +3480,24 @@ doit:
 						fprintf(stdout, " mss=%d",
 							datamss);
 					}
+					if (rtt)
+						fprintf(stdout, P_RTT_FMT, rtt);
 				}
 				else {
 					fprintf(stdout,
 						"nuttcp%s%s: connect to %s", 
 						trans?"-t":"-r", ident,
 						tmphost);
+					if (rtt || (trans && datamss))
+						fprintf(stdout, " with");
 					if (trans && datamss) {
-						fprintf(stdout, " with mss=%d",
+						fprintf(stdout, " mss=%d",
 							datamss);
+						if (rtt)
+							fprintf(stdout, ",");
 					}
+					if (rtt)
+						fprintf(stdout, RTT_FMT, rtt);
 				}
 				fprintf(stdout, "\n");
 			}
@@ -3673,17 +3715,43 @@ doit:
 			fflush(stderr);
 		}
 
-		if ((stream_idx == nstream) && (brief <= 0)) {
-			if (format & PARSE)
-				fprintf(stdout,"nuttcp%s%s: send_window_size=%d receive_window_size=%d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
-			else
-				fprintf(stdout,"nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
-		}
-
 		if (firsttime) {
 			firsttime = 0;
 			origsendwin = sendwinval;
 			origrcvwin = rcvwinval;
+		}
+
+		if ((stream_idx == nstream) && (brief <= 0)) {
+#if defined(linux)
+			FILE *adv_ws;
+
+			sendwinval *= 2;
+			rcvwinval  *= 2;
+			if ((adv_ws = fopen(TCP_ADV_WIN_SCALE, "r"))) {
+				fscanf(adv_ws, "%d", &winadjust);
+			}
+			fclose(adv_ws);
+			if (winadjust < 0) {
+				sendwinavail = sendwinval >> -winadjust;
+				rcvwinavail  = rcvwinval  >> -winadjust;
+			}
+			else if (winadjust > 0) {
+				sendwinavail = sendwinval -
+						   (sendwinval >> winadjust);
+				rcvwinavail  = rcvwinval  -
+						   (rcvwinval  >> winadjust);
+			}
+#endif
+			if (format & PARSE)
+				fprintf(stdout,"nuttcp%s%s: send_window_size=%d receive_window_size=%d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+			else
+				fprintf(stdout,"nuttcp%s%s: send window size = %d, receive window size = %d\n", trans?"-t":"-r", ident, sendwinval, rcvwinval);
+#if defined(linux)
+			if (format & PARSE)
+				fprintf(stdout,"nuttcp%s%s: send_window_avail=%d receive_window_avail=%d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
+			else
+				fprintf(stdout,"nuttcp%s%s: available send window = %d, available receive window = %d\n", trans?"-t":"-r", ident, sendwinavail, rcvwinavail);
+#endif
 		}
 	}
 
@@ -3866,8 +3934,9 @@ doit:
 					cmdargs[i++] = "-f-retrans";
 				if (format & PARSE)
 					cmdargs[i++] = "-fparse";
-				if (format & WANTRTT)
-					cmdargs[i++] = "-frtt";
+			}
+			else {
+				cmdargs[i++] = "-f-rtt";
 			}
 			if (traceroute)
 				cmdargs[i++] = "-xt";
@@ -4836,12 +4905,19 @@ doit:
 					       &nretrans);
 				else
 					sscanf(cp2, RETRANS_FMT_IN, &nretrans);
+				/* below is for compatibility with 6.0.x beta */
 				if ((cp2 = strstr(cp1, "RTT"))) {
 					if (format & PARSE)
 						sscanf(cp2, P_RTT_FMT_IN, &rtt);
 					else
-						sscanf(cp2, RTT_FMT_IN, &rtt);
+						sscanf(cp2, RTT_FMT_INB, &rtt);
 				}
+			}
+			else if ((cp2 = strstr(cp1, "RTT"))) {
+				if (format & PARSE)
+					sscanf(cp2, P_RTT_FMT_IN, &rtt);
+				else
+					sscanf(cp2, RTT_FMT_IN, &rtt);
 			}
 			else if ((strstr(cp1, "KB/cpu")) && !verbose)
 				continue;
@@ -4905,43 +4981,16 @@ doit:
 				(double)nbytes/(1024*1024), cput,
 				(double)nbytes/cput/1024 );
 		}
-		if (!udp && trans) {
-			if (rtt || (retransinfo > 0)) {
-				fprintf(stdout, "nuttcp-t%s: ", ident);
-				if (beta) {
-					if (format & PARSE)
-						fprintf(stdout,
-							"beta_info=true ");
-					else
-						fprintf(stdout, "Beta info: ");
-				}
-			}
-			if (rtt) {
-				if (format & PARSE)
-					strcpy(fmt, P_RTT_FMT);
-				else
-					strcpy(fmt, RTT_FMT);
-				fprintf(stdout, fmt, rtt);
-			}
-			if (retransinfo > 0) {
-				if (rtt) {
-					if (format & PARSE)
-						strcpy(fmt, " ");
-					else
-						strcpy(fmt, ", ");
-				}
-				else
-					strcpy(fmt, "");
-				if (format & PARSE)
-					strcat(fmt, P_RETRANS_FMT);
-				else
-					strcat(fmt, RETRANS_FMT);
-				fprintf(stdout, fmt,
-					retransinfo == 1 ? "" : "host-",
-					nretrans);
-			}
-			if (rtt || (retransinfo > 0))
-				fprintf(stdout, "\n");
+		if (!udp && trans && (retransinfo > 0)) {
+			fprintf(stdout, "nuttcp%s%s: ",
+				trans ? "-t" : "-r", ident);
+			if (format & PARSE)
+				strcpy(fmt, P_RETRANS_FMT);
+			else
+				strcpy(fmt, RETRANS_FMT);
+			fprintf(stdout, fmt,
+				retransinfo == 1 ? "" : "host-", nretrans);
+			fprintf(stdout, "\n");
 		}
 
 		strcpy(fmt, "nuttcp%s%s: ");
@@ -5088,15 +5137,19 @@ doit:
 				if ((retransinfo > 0) &&
 				    (!(format & NORETRANS))) {
 					if (format & PARSE)
-						strcpy(fmt,
-						       P_RETRANS_FMT_BRIEF);
+						fprintf(stdout,
+							P_RETRANS_FMT_BRIEF,
+							retransinfo == 1 ?
+								"" : "host-",
+							nretrans);
 					else
-						strcpy(fmt, RETRANS_FMT_BRIEF);
-					fprintf(stdout, fmt, nretrans,
-						retransinfo == 1 ?
-							"" : "host-");
+						fprintf(stdout,
+							RETRANS_FMT_BRIEF,
+							nretrans,
+							retransinfo == 1 ?
+								"" : "host-");
 				}
-				if ((format & WANTRTT) && rtt) {
+				if (rtt && (format & WANTRTT)) {
 					if (format & PARSE)
 						strcpy(fmt, P_RTT_FMT_BRIEF);
 					else
@@ -5118,15 +5171,19 @@ doit:
 				if ((retransinfo > 0) &&
 				    (!(format & NORETRANS))) {
 					if (format & PARSE)
-						strcpy(fmt,
-						       P_RETRANS_FMT_BRIEF);
+						fprintf(stdout,
+							P_RETRANS_FMT_BRIEF,
+							retransinfo == 1 ?
+								"" : "host-",
+							nretrans);
 					else
-						strcpy(fmt, RETRANS_FMT_BRIEF);
-					fprintf(stdout, fmt, nretrans,
-						retransinfo == 1 ?
-							"" : "host-");
+						fprintf(stdout,
+							RETRANS_FMT_BRIEF,
+							nretrans,
+							retransinfo == 1 ?
+								"" : "host-");
 				}
-				if ((format & WANTRTT) && rtt) {
+				if (rtt && (format & WANTRTT)) {
 					if (format & PARSE)
 						strcpy(fmt, P_RTT_FMT_BRIEF);
 					else
