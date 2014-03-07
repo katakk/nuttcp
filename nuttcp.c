@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v6.2.6
+ *	N U T T C P . C						v6.2.7
  *
  * Copyright(c) 2000 - 2009 Bill Fink.  All rights reserved.
  * Copyright(c) 2003 - 2009 Rob Scott.  All rights reserved.
@@ -29,6 +29,9 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * 6.2.7, Bill Fink, 22-May-09
+ *	Allow rate limit to be exceeded temporarily by n packets ("-Rixxx/n")
+ *	Fix several reqval parameter settings
  * 6.2.6, Bill Fink, 17-Apr-09
  *	Allow setting server CPU affinity from client via "-xcs" option
  *	Allow setting client & server CPU affinity via third party
@@ -684,7 +687,7 @@ void print_tcpinfo();
 
 int vers_major = 6;
 int vers_minor = 2;
-int vers_delta = 6;
+int vers_delta = 7;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -818,6 +821,8 @@ int verbose = 0;		/* 0=print basic info, 1=print cpu rate, proc
 				 * resource usage. */
 int nodelay = 0;		/* set TCP_NODELAY socket option */
 unsigned long rate = MAXRATE;	/* transmit rate limit in Kbps */
+int maxburst = 1;		/* number of packets allowed to exceed rate */
+int nburst = 1;			/* number of packets currently exceeding rate */
 int irate = 0;			/* instantaneous rate limit if set */
 double pkt_time;		/* packet transmission time in seconds */
 uint64_t irate_pk_usec;		/* packet transmission time in microseconds */
@@ -940,6 +945,7 @@ Usage (transmitter): nuttcp [-t] [-options] [ctl_addr/]host [3rd-party] [<in]\n\
 	-M##	MSS for data connection (TCP)\n\
 	-N##	number of streams (starting at port number), implies -B\n\
 	-R##	transmit rate limit in Kbps (or (m|M)bps or (g|G)bps or (p)ps)\n\
+	-Ri#[/#] instantaneous rate limit with optional packet burst\n\
 	-T##	transmit timeout in seconds (or (m|M)inutes or (h|H)ours)\n\
 	-i##	receiver interval reporting in seconds (or (m|M)inutes)\n\
 	-Ixxx	identifier for nuttcp output (max of 40 characters)\n\
@@ -1564,7 +1570,7 @@ main( int argc, char **argv )
 			}
 			break;
 		case 'l':
-			reqval = 0;
+			reqval = 1;
 			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
 			buflen = atoi(cp1);
 			buflenopt = 1;
@@ -1583,7 +1589,7 @@ main( int argc, char **argv )
 				buflen *= 1048576;
 			break;
 		case 'w':
-			reqval = 0;
+			reqval = 1;
 			if (argv[0][2] == 's') {
 				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
 				srvrwin = atoi(cp1);
@@ -1647,7 +1653,7 @@ main( int argc, char **argv )
 			sinkmode = 0;	/* sink/source data */
 			break;
 		case 'p':
-			reqval = 0;
+			reqval = 1;
 			tmpport = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if ((tmpport < 5001) || (tmpport > 65535)) {
 				fprintf(stderr, "invalid port = %d\n", tmpport);
@@ -1657,7 +1663,7 @@ main( int argc, char **argv )
 			port = tmpport;
 			break;
 		case 'P':
-			reqval = 0;
+			reqval = 1;
 			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
 			tmpport = atoi(cp1);
 			if ((tmpport < 5000) || (tmpport > 65535)) {
@@ -1693,7 +1699,7 @@ main( int argc, char **argv )
 				verbose = 1;
 			break;
 		case 'N':
-			reqval = 0;
+			reqval = 1;
 			nstream = atoi(getoptvalp(argv, 2, reqval, &skiparg));
 			if (nstream < 1) {
 				fprintf(stderr, "invalid nstream = %d\n", nstream);
@@ -1713,7 +1719,7 @@ main( int argc, char **argv )
 			}
 			break;
 		case 'R':
-			reqval = 0;
+			reqval = 1;
 			haverateopt = 1;
 			if (argv[0][2] == 'i') {
 				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
@@ -1727,6 +1733,17 @@ main( int argc, char **argv )
 			else {
 				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
 				sscanf(cp1, "%lf", &rate_opt);
+			}
+			if ((cp2 = strchr(cp1, '/'))) {
+				*cp2++ = '\0';
+				maxburst = atoi(cp2);
+				if (maxburst <= 0) {
+					fprintf(stderr,
+						"invalid maxburst = %d\n",
+						maxburst);
+					fflush(stderr);
+					exit(1);
+				}
 			}
 			if (*cp1)
 				ch = *(cp1 + strlen(cp1) - 1);
@@ -1878,7 +1895,7 @@ main( int argc, char **argv )
 			}
 			break;
 		case 'x':
-			reqval = 0;
+			reqval = 1;
 			if (argv[0][2] == 't') {
 				traceroute = 1;
 				brief = 1;
@@ -2921,6 +2938,23 @@ doit:
 						abortconn = 1;
 					}
 				}
+				if (irvers >= 60207) {
+					fprintf(ctlconn, " , maxburst = %d",
+						maxburst);
+				}
+				else {
+					if ((maxburst > 1) &&
+					    (!trans || host3)) {
+						fprintf(stdout, "nuttcp%s%s: packet burst not supported by server version %d.%d.%d, need >= 6.2.7\n",
+							trans?"-t":"-r",
+							ident, rvers_major,
+							rvers_minor,
+							rvers_delta);
+						fflush(stdout);
+						maxburst = 1;
+						abortconn = 1;
+					}
+				}
 				fprintf(ctlconn, "\n");
 				fflush(ctlconn);
 				if (abortconn) {
@@ -3157,6 +3191,13 @@ doit:
 				else {
 					srvr_affinity = -1;
 				}
+				if (irvers >= 60207) {
+					sscanf(strstr(buf, ", maxburst =") + 13,
+					       "%d", &maxburst);
+				}
+				else {
+					maxburst = 1;
+				}
 				trans = !trans;
 				if (inetd && !sinkmode) {
 					fputs("KO\n", stdout);
@@ -3338,6 +3379,14 @@ doit:
 					fputs("KO\n", stdout);
 					goto cleanup;
 #endif
+				}
+				if (maxburst < 1) {
+					fputs("KO\n", stdout);
+					mes("invalid maxburst");
+					fprintf(stdout, "maxburst = %d\n",
+						maxburst);
+					fputs("KO\n", stdout);
+					goto cleanup;
 				}
 				fprintf(stdout, "OK v%d.%d.%d\n", vers_major,
 						vers_minor, vers_delta);
@@ -3537,6 +3586,9 @@ doit:
 				    fprintf(stdout," rate_limit=%.3f rate_unit=Mbps rate_mode=%s",
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
+				    if (maxburst > 1)
+					fprintf(stdout," packet_burst=%d",
+						maxburst);
 				    if (udp) {
 					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
@@ -3572,6 +3624,9 @@ doit:
 				    fprintf(stdout," rate limit = %.3f Mbps (%s)",
 					(double)rate/1000,
 					irate ? "instantaneous" : "aggregate");
+				    if (maxburst > 1)
+					fprintf(stdout,", packet burst = %d",
+						maxburst);
 				    if (udp) {
 					unsigned long long ppsrate =
 					    ((uint64_t)rate * 1000)/8/buflen;
@@ -4352,12 +4407,26 @@ acceptnewconn:
 				cmdargs[i++] = tmpargs[j++];
 			}
 			if (rate != MAXRATE) {
-				if (rate_pps)
-					sprintf(tmpargs[j], "-R%s%lup",
-						irate ? "i" : "", rate);
-				else
-					sprintf(tmpargs[j], "-R%s%lu",
-						irate ? "i" : "", rate);
+				if (maxburst > 1) {
+					if (rate_pps)
+						sprintf(tmpargs[j],
+							"-R%s%lup/%d",
+							irate ? "i" : "",
+							rate, maxburst);
+					else
+						sprintf(tmpargs[j],
+							"-R%s%lu/%d",
+							irate ? "i" : "",
+							rate, maxburst);
+				}
+				else {
+					if (rate_pps)
+						sprintf(tmpargs[j], "-R%s%lup",
+							irate ? "i" : "", rate);
+					else
+						sprintf(tmpargs[j], "-R%s%lu",
+							irate ? "i" : "", rate);
+				}
 				cmdargs[i++] = tmpargs[j++];
 			} else {
 				if (udp && !multicast)
@@ -6154,6 +6223,8 @@ cleanup:
 		rcvwin = origrcvwin;
 		b_flag = 1;
 		rate = MAXRATE;
+		maxburst = 1;
+		nburst = 1;
 		irate = 0;
 		irate_cum_nsec = 0.0;
 		timeout = 0.0;
@@ -6517,28 +6588,37 @@ Nwrite( int fd, char *buf, int count )
 		tvsub( &td, &timedol, &timepk );
 		deltat = td.tv_sec + ((double)td.tv_usec) / 1000000;
 
-		if (deltat >= 2*pkt_time) {
+		if (deltat >= (1 + maxburst)*pkt_time) {
 			timepk.tv_sec = timedol.tv_sec;
 			timepk.tv_usec = timedol.tv_usec;
 			irate_cum_nsec = 0;
+			deltat = 0.0;
+			nburst = 1;
 		}
 
-		while (((double)count/rate/125 > deltat) && !intr) {
-			/* Get real time */
-			gettimeofday(&timedol, (struct timezone *)0);
-			tvsub( &td, &timedol, &timepk );
-			deltat = td.tv_sec + ((double)td.tv_usec) / 1000000;
+		if (nburst++ >= maxburst) {
+			while ((maxburst*(double)count/rate/125 > deltat)
+			       && !intr) {
+				/* Get real time */
+				gettimeofday(&timedol, (struct timezone *)0);
+				tvsub( &td, &timedol, &timepk );
+				deltat = td.tv_sec + ((double)td.tv_usec)
+							/ 1000000;
+			}
 		}
 
-		irate_cum_nsec += irate_pk_nsec;
-		if (irate_cum_nsec >= 1000.0) {
-			irate_cum_nsec -= 1000.0;
-			timepk.tv_usec++;
-		}
-		timepk.tv_usec += irate_pk_usec;
-		while (timepk.tv_usec >= 1000000) {
-			timepk.tv_usec -= 1000000;
-			timepk.tv_sec++;
+		if (nburst > maxburst) {
+			irate_cum_nsec += maxburst*irate_pk_nsec;
+			while (irate_cum_nsec >= 1000.0) {
+				irate_cum_nsec -= 1000.0;
+				timepk.tv_usec++;
+			}
+			timepk.tv_usec += maxburst*irate_pk_usec;
+			while (timepk.tv_usec >= 1000000) {
+				timepk.tv_usec -= 1000000;
+				timepk.tv_sec++;
+			}
+			nburst = 1;
 		}
 		if (intr && (!udp || (count != 4))) return(0);
 	}
