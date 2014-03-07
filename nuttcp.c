@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.6
+ *	N U T T C P . C						v5.1.7
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,8 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.7, Bill Fink, 29-Apr-04
+ *	Drop "-nb" option in favor of "-n###[k|m|g|t|p]"
  * V5.1.6, Bill Fink, 25-Apr-04
  *	Fix bug with using interval option without timeout
  * V5.1.5, Bill Fink, 23-Apr-04
@@ -408,7 +410,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 6;
+int vers_delta = 7;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -559,7 +561,6 @@ Usage (transmitter): nuttcp [-t] [-options] host [3rd-party] [ <in ]\n\
 "	-l##	length of network write|read buf (default 8192/udp, 65536/tcp)\n\
 	-s	use stdin|stdout for data input|output instead of pattern data\n\
 	-n##	number of source bufs written to network (default unlimited)\n\
-	-nb##	number of source bytes written to network (default unlimited)\n\
 	-w##	transmitter|receiver window size in KB (or (m|M)B or (g|G)B)\n\
 	-ws##	server receive|transmit window size in KB (or (m|M)B or (g|G)B)\n\
 	-wb	braindead Solaris 2.8 (sets both xmit and rcv windows)\n\
@@ -880,11 +881,11 @@ optlen = sizeof(maxseg);
 		case 'n':
 			reqval = 0;
 			if (argv[0][2] == 'b') {
-				nbuf_bytes = 1;
-				cp1 = getoptvalp(argv, 3, reqval, &skiparg);
+				fprintf(stderr, "option \"-nb\" no longer supported, use \"-n###[k|m|g|t|p]\" instead\n");
+				fflush(stderr);
+				exit(1);
 			}
-			else
-				cp1 = getoptvalp(argv, 2, reqval, &skiparg);
+			cp1 = getoptvalp(argv, 2, reqval, &skiparg);
 			nbuf = strtoull(cp1, NULL, 0);
 			if (nbuf == 0) {
 				if (errno == EINVAL) {
@@ -894,10 +895,7 @@ optlen = sizeof(maxseg);
 					exit(1);
 				}
 				else {
-					if (nbuf_bytes)
-						nbuf = DEFAULT_NBYTES;
-					else
-						nbuf = DEFAULT_NBUF;
+					nbuf = DEFAULT_NBUF;
 					break;
 				}
 			}
@@ -905,16 +903,26 @@ optlen = sizeof(maxseg);
 				ch = *(cp1 + strlen(cp1) - 1);
 			else
 				ch = '\0';
-			if ((ch == 'k') || (ch == 'K'))
+			if ((ch == 'k') || (ch == 'K')) {
 				nbuf *= 1024;
-			else if ((ch == 'm') || (ch == 'M'))
+				nbuf_bytes = 1;
+			}
+			else if ((ch == 'm') || (ch == 'M')) {
 				nbuf *= 1048576;
-			else if ((ch == 'g') || (ch == 'G'))
+				nbuf_bytes = 1;
+			}
+			else if ((ch == 'g') || (ch == 'G')) {
 				nbuf *= 1073741824;
-			else if ((ch == 't') || (ch == 'T'))
+				nbuf_bytes = 1;
+			}
+			else if ((ch == 't') || (ch == 'T')) {
 				nbuf *= 1099511627776ull;
-			else if ((ch == 'p') || (ch == 'P'))
+				nbuf_bytes = 1;
+			}
+			else if ((ch == 'p') || (ch == 'P')) {
 				nbuf *= 1125899906842624ull;
+				nbuf_bytes = 1;
+			}
 			break;
 		case 'l':
 			reqval = 0;
