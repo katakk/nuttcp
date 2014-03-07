@@ -1,5 +1,5 @@
 /*
- *	N U T T C P . C						v5.1.8
+ *	N U T T C P . C						v5.1.9
  *
  * Copyright(c) 2000 - 2003 Bill Fink.  All rights reserved.
  *
@@ -22,6 +22,10 @@
  *      T.C. Slattery, USNA
  * Minor improvements, Mike Muuss and Terry Slattery, 16-Oct-85.
  *
+ * V5.1.9, Bill Fink, 23-May-04
+ *	Fix bug with client error on "-d" option putting server into bad state
+ *	Set server accept timeout (currently 5 seconds) to prevent stuck server
+ *	Add nuttcp version info to error message from err() exit
  * V5.1.8, Bill Fink, 22-May-04
  *	Allow 'd|D' suffix to "-T" option to specify days
  *	Fix compiler warning about unused variable cp in getoptvalp routine
@@ -324,6 +328,7 @@ static struct	timeval timep;	/* Previous time - for interval reporting */
 static struct	rusage ru0;	/* Resource utilization at the start */
 
 static struct	sigaction sigact;	/* signal handler for alarm */
+static struct	sigaction savesigact;
 
 #define PERF_FMT_OUT	  "%.4f MB in %.2f real seconds = %.2f KB/sec" \
 			  " = %.4f Mbps\n"
@@ -383,6 +388,7 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 #define MAXUDPBUFLEN		65507
 #define MINMALLOC		1024
 #define HI_MC			231ul
+#define ACCEPT_TIMEOUT		5
 
 #define XMITSTATS		0x1	/* also give transmitter stats (MB) */
 #define DEBUGINTERVAL		0x2	/* add info to assist with
@@ -396,9 +402,11 @@ static struct	sigaction sigact;	/* signal handler for alarm */
 
 void sigpipe( int signum );
 void sigint( int signum );
+void ignore_alarm( int signum );
 void sigalarm( int signum );
 void err( char *s );
 void mes( char *s );
+void errmes( char *s );
 void pattern( char *cp, int cnt );
 void prep_timer();
 double read_timer( char *str, int len );
@@ -414,7 +422,7 @@ char *getoptvalp( char **argv, int index, int reqval, int *skiparg );
 
 int vers_major = 5;
 int vers_minor = 1;
-int vers_delta = 8;
+int vers_delta = 9;
 int ivers;
 int rvers_major = 0;
 int rvers_minor = 0;
@@ -661,6 +669,12 @@ sigint( int signum )
 }
 
 void
+ignore_alarm( int signum )
+{
+	return;
+}
+
+void
 sigalarm( int signum )
 {
 	struct	timeval timec;	/* Current time */
@@ -834,6 +848,7 @@ main( int argc, char **argv )
 	char *cp1, *cp2;
 	char ch;
 	int error_num;
+	int save_errno;
 	struct servent *sp = 0;
 	struct addrinfo hints, *res = NULL;
 	short save_events;
@@ -2286,7 +2301,7 @@ doit:
 			 */
 			if (options && (stream_idx > 0))  {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
-					err("setsockopt");
+					errmes("unable to setsockopt options");
 			}
 			usleep(20000);
 			if (af == AF_INET) {
@@ -2386,11 +2401,35 @@ doit:
 			listen(fd[stream_idx],1);   /* allow a queue of 1 */
 			if (options && (stream_idx > 0))  {
 				if( setsockopt(fd[stream_idx], SOL_SOCKET, options, (void *)&one, sizeof(one)) < 0)
-					err("setsockopt");
+					errmes("unable to setsockopt options");
+			}
+			if (clientserver && !client && (stream_idx > 0)) {
+				sigact.sa_handler = ignore_alarm;
+				sigemptyset(&sigact.sa_mask);
+				sigact.sa_flags = 0;
+				sigaction(SIGALRM, &sigact, &savesigact);
+				alarm(ACCEPT_TIMEOUT);
 			}
 			fromlen = sizeof(frominet);
-			if((nfd=accept(fd[stream_idx], (struct sockaddr *)&frominet, &fromlen) ) < 0)
+			nfd=accept(fd[stream_idx], (struct sockaddr *)&frominet, &fromlen);
+			save_errno = errno;
+			if (clientserver && !client && (stream_idx > 0)) {
+				alarm(0);
+				sigact.sa_handler = savesigact.sa_handler;
+				sigact.sa_mask = savesigact.sa_mask;
+				sigact.sa_flags = savesigact.sa_flags;
+				sigaction(SIGALRM, &sigact, 0);
+			}
+			if (nfd < 0) {
+				if ((save_errno = EINTR) && clientserver
+							 && !client
+							 && (stream_idx > 0)) {
+					for ( i = 1; i <= stream_idx; i++ )
+						close(fd[i]);
+					goto cleanup;
+				}
 				err("accept");
+			}
 			af = frominet.ss_family;
 			close(fd[stream_idx]);
 			fd[stream_idx]=nfd;
@@ -3572,7 +3611,8 @@ usage:
 void
 err( char *s )
 {
-	fprintf(stderr,"nuttcp%s%s: ", trans?"-t":"-r", ident);
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
+			vers_major, vers_minor, vers_delta);
 	perror(s);
 	fprintf(stderr,"errno=%d\n",errno);
 	exit(1);
@@ -3583,6 +3623,14 @@ mes( char *s )
 {
 	fprintf(stdout,"nuttcp%s%s: v%d.%d.%d: %s\n", trans?"-t":"-r", ident,
 			vers_major, vers_minor, vers_delta, s);
+}
+
+void
+errmes( char *s )
+{
+	fprintf(stderr,"nuttcp%s%s: v%d.%d.%d: ", trans?"-t":"-r", ident,
+			vers_major, vers_minor, vers_delta);
+	perror(s);
 }
 
 void
